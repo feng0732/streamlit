@@ -491,7 +491,183 @@ elif metadata.bind is None and user_key is not None:
 
 ---
 
+## 五-C、页面切换与 Fragment 局部重跑的交界处理
+
+### 5C.1 Fragment 局部重跑时的 Widget 保留规则
+
+**核心判定函数**：[_is_stale_widget](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/session_state.py#L1325-L1339)
+
+```python
+def _is_stale_widget(metadata, active_widget_ids, fragment_ids_this_run) -> bool:
+    if not metadata:
+        return True
+
+    # 如果正在跑 fragment，但 widget 不属于这些 fragment，则不标记为过期
+    return not (
+        metadata.id in active_widget_ids
+        or (fragment_ids_this_run and metadata.fragment_id not in fragment_ids_this_run)
+    )
+```
+
+**判定逻辑真值表**（widget 是否被判定为 stale/过期）：
+
+| widget_id 在 active_widget_ids | fragment_ids_this_run 存在 | widget.fragment_id 在 fragment_ids_this_run | 是否过期 |
+|------------------------------|---------------------------|-------------------------------------------|----------|
+| ✅ 是 | 任意 | 任意 | ❌ 否（保留） |
+| ❌ 否 | ❌ 无（全脚本重跑） | 不适用 | ✅ 是（清理） |
+| ❌ 否 | ✅ 有（局部重跑） | ❌ 不在（属于其他 fragment） | ❌ 否（保留） |
+| ❌ 否 | ✅ 有（局部重跑） | ✅ 在（属于本次重跑的 fragment） | ✅ 是（清理） |
+
+**一句话总结**：Fragment 局部重跑时，**只清理本次运行的 fragment 中没有出现的 widget**，其他 fragment 和主脚本的 widget 全部保留。
+
+---
+
+**保留规则在三处的应用**：
+
+1. **WStates.remove_stale_widgets** ([session_state.py#L248-L262](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/session_state.py#L248-L262))
+   - 清理 `_new_widget_state.states` 中的过期值
+   - 保留不属于本次 fragment 的 widget 状态
+
+2. **SessionState._remove_stale_widgets** ([session_state.py#L906-L972](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/session_state.py#L906-L972))
+   - 清理 `_old_state` 中的过期 widget ID 键
+   - 对绑定 widget 执行 `bound_preserved` 值保留（同样受 `_is_stale_widget` 过滤）
+   - 注意：`bound_preserved` 只保留**已过期**的绑定 widget，未过期的（属于其他 fragment）不走这个分支
+
+3. **QueryParams.remove_stale_bindings** ([query_params.py#L779-L830](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/query_params.py#L779-L830))
+   ```python
+   if fragment_ids_this_run and widget_metadata:
+       metadata = widget_metadata.get(widget_id)
+       if metadata and metadata.fragment_id not in fragment_ids_this_run:
+           continue  # 不属于本次 fragment，保留
+   stale_widget_ids.append(widget_id)  # 属于本次 fragment 但没出现，清理
+   ```
+
+### 5C.2 多页切换时地址参数按页面归属过滤
+
+**触发时机**：[script_runner.py#L595-L608](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/scriptrunner/script_runner.py#L595-L608)
+
+页面切换时，`script_runner.py` 在 `on_script_finished` **之前**调用：
+
+```python
+main_script_hash = self._pages_manager.main_script_hash
+valid_script_hashes = {main_script_hash, page_script_hash}
+with self._session_state.query_params() as qp:
+    qp.populate_from_query_string(rerun_data.query_string, valid_script_hashes)
+    qp.set_initial_query_params_from_current()
+```
+
+**过滤规则**：[populate_from_query_string](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/query_params.py#L723-L777)
+
+```python
+for key, val in parsed_query_params.items():
+    binding = self._bindings_by_param.get(key)
+    should_keep = True
+
+    if (valid_script_hashes is not None
+        and binding is not None
+        and binding.script_hash not in valid_script_hashes):
+        # 属于其他页面的绑定参数 → 过滤掉
+        stale_widget_ids.append(binding.widget_id)
+        should_keep = False
+
+    if should_keep:
+        # 保留并写入 _query_params
+```
+
+**过滤逻辑**：
+
+| 参数类型 | valid_script_hashes 条件 | 是否保留 |
+|---------|------------------------|----------|
+| 无绑定（自由参数） | 任意 | ✅ 保留 |
+| 有绑定，且 binding.script_hash 在 valid_script_hashes | binding.script_hash ∈ {main, new_page} | ✅ 保留 |
+| 有绑定，且 binding.script_hash 不在 valid_script_hashes | binding.script_hash ∉ {main, new_page} | ❌ 过滤 |
+
+**关键细节**：
+- `valid_script_hashes = {main_script_hash, page_script_hash}` → 保留主脚本和**新页面**的绑定参数
+- **旧页面**的绑定参数会被过滤掉（binding.script_hash 是旧页面的 hash）
+- 被过滤的参数不仅从 `_query_params` 中移除，还会调用 `unbind_widget` 清理绑定关系
+- 过滤完成后调用 `set_initial_query_params_from_current()`，确保 widget 播种用的 `_initial_query_params` 也是过滤后的，防止旧页面参数污染新页面的同 key widget
+
+### 5C.3 两种清理场景的对比
+
+| 维度 | Fragment 局部重跑 | MPA 页面切换 |
+|------|-------------------|-------------|
+| 触发时机 | 脚本运行结束，on_script_finished 内 | 脚本运行结束**之前**，在 script_runner.py 中先执行 |
+| 判定依据 | fragment_id 归属 + 是否在 active_widget_ids | script_hash 归属（属于哪个页面） |
+| 未绑定参数 | 不涉及（只清理 widget 状态和绑定） | 全部保留 |
+| 跨上下文参数 | 属于其他 fragment 的绑定参数保留 | 属于其他页面的绑定参数过滤 |
+| 后续步骤 | on_script_finished 正常清理 | 过滤后才调用 on_script_finished |
+
+---
+
 ## 六、ID 解析与辅助函数
+
+### 6.0 user_key=None 的完整含义
+
+**代码位置**：[utils.py#L109-L110](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/elements/lib/utils.py#L109-L110)、[common.py#L225-L234](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/common.py#L225-L234)
+
+#### 产生场景
+
+```python
+# 场景 1：不写 key 参数 → 经 to_key 转为 None
+st.button("Click")
+
+# 场景 2：显式写 key=None → 经 to_key 转为 None
+st.button("Click", key=None)
+
+# 两者完全等价
+def to_key(key: Key | None) -> str | None:
+    return None if key is None else str(key)
+```
+
+#### 在 ID 生成中的表现
+
+```python
+def _compute_element_id(element_type, user_key=None, **kwargs):
+    h = util.create_fast_hasher()
+    h.update(element_type.encode("utf-8"))
+    if user_key:  # user_key=None → 跳过
+        h.update(user_key.encode("utf-8"))
+    ...
+    return f"$$ID-{h.hexdigest()}-{user_key}"
+```
+
+- 哈希计算**不包含** user_key（因为 `if user_key:` 为 False）
+- 最终 ID 格式：`$$ID-<hash>-None`（后缀是字符串 "None"）
+
+#### 在 ID 解析中的表现
+
+```python
+def user_key_from_element_id(element_id: str) -> str | None:
+    user_key = element_id.split("-", maxsplit=2)[-1]
+    return None if user_key == "None" else user_key
+```
+
+- 解析到后缀是字符串 `"None"` 时，返回 **Python None**
+- 这是一个已知缺陷（代码注释中有 TODO）：如果用户真的传 `key="None"`（字符串），会被误判为没有 user_key
+
+#### 对系统行为的影响
+
+| 功能 | user_key=None | user_key="mykey" |
+|------|---------------|------------------|
+| ID 格式 | `$$ID-hash-None` | `$$ID-hash-mykey` |
+| user_key 去重检测 | 跳过（`if user_key:` 为 False） | 检测，重复则抛 StreamlitDuplicateElementKey |
+| key↔id 映射（KeyIdMapper） | 不建立映射 | 建立双向映射 |
+| bind="query-params" | ❌ 不允许（要求 user_key is not None） | ✅ 允许 |
+| session_state 访问 | 只能通过 widget_id 访问 | 可通过 user_key 访问 |
+| bound_preserved 值保留 | ❌ 不保留（需要 key in wid_key_map） | ✅ 保留 |
+
+#### 与空字符串 key 的区别
+
+`key=""` 会触发 `require_valid_user_key` 校验，直接抛异常：
+
+```python
+def require_valid_user_key(key: str) -> None:
+    if key == "":
+        raise StreamlitAPIException("The `key` argument must be non-empty.")
+```
+
+因此 `key=None` 是合法的（表示"无用户自定义 key"），而 `key=""` 是非法的。
 
 ### 6.1 user_key_from_element_id
 
@@ -573,18 +749,24 @@ with st.form("my_form"):
 | ID 计算入口 | [utils.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/elements/lib/utils.py) | L181-L262 |
 | 核心哈希算法 | [utils.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/elements/lib/utils.py) | L149-L178 |
 | 重复检测逻辑 | [utils.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/elements/lib/utils.py) | L113-L146 |
+| user_key 类型转换 (to_key) | [utils.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/elements/lib/utils.py) | L109-L110 |
 | 原子检测集合 | [thread_safe_set.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/scriptrunner_utils/thread_safe_set.py) | L39-L44 |
 | 上下文重置（清空集合） | [script_run_context.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/scriptrunner_utils/script_run_context.py) | L268-L270 |
+| 同页 rerun URL 参数填充 | [script_run_context.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/scriptrunner_utils/script_run_context.py) | L297-L307 |
 | user_key 重复异常 | [errors.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/errors.py) | L141-L151 |
 | element_id 重复异常 | [errors.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/errors.py) | L125-L138 |
 | ID 解析辅助函数 | [common.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/common.py) | L225-L246 |
+| user_key 合法性校验 | [common.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/common.py) | L249-L256 |
 | 绑定值保留（_remove_stale_widgets） | [session_state.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/session_state.py) | L906-L972 |
 | Widget 注册与 URL 回写 | [session_state.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/session_state.py) | L998-L1109 |
 | 查询参数绑定优先级 | [session_state.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/session_state.py) | L1111-L1146 |
 | URL 播种与自动校正 | [session_state.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/session_state.py) | L1148-L1251 |
+| Widget 过期判定核心 | [session_state.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/session_state.py) | L1325-L1339 |
+| WStates 过期 widget 清理 | [session_state.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/session_state.py) | L248-L262 |
 | 绑定关系注册与清理 | [query_params.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/query_params.py) | L465-L548 |
-| 过期绑定清理 | [query_params.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/query_params.py) | L779-L830 |
 | MPA 页面切换参数过滤 | [query_params.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/query_params.py) | L723-L777 |
+| 过期绑定清理（含 fragment 保留） | [query_params.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/query_params.py) | L779-L830 |
+| MPA 页面切换前置过滤调用 | [script_runner.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/scriptrunner/script_runner.py) | L595-L608 |
 
 ---
 
@@ -600,3 +782,6 @@ with st.form("my_form"):
 | 绑定值以 user_key 保留 | 页面切换后可恢复，不受 widget_id 变化影响 | _old_state 中 user_key 与 widget_id 混存 |
 | URL 回写三路径分支 | 精确覆盖恢复/同步/清理场景 | 代码路径复杂，理解成本高 |
 | discard_param_no_forward_msg | 避免冗余 ForwardMsg | 需要区分前端已删 vs 后端缓存过期 |
+| _is_stale_widget 双条件判定 | fragment 局部重跑时只清理相关 widget | 逻辑取反嵌套，可读性稍差 |
+| MPA 参数按 script_hash 过滤 | 页面参数天然隔离，防止跨页污染 | 过滤时机早于正常清理，时序需精确控制 |
+| user_key=None 特殊后缀 | 无需额外字段即可表示"无用户 key" | 与字面字符串 "None" 冲突，存在已知缺陷 |
