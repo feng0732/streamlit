@@ -300,9 +300,9 @@ class MemorySessionStorage(SessionStorage):
 
 ---
 
-## 4.X 两条恢复路径的深度对比
+## 4B. 两条恢复路径的深度对比
 
-### 4.X.1 路径一：普通重跑（用户交互触发）
+### 4B.1 路径一：普通重跑（用户交互触发）
 
 当用户在页面上操作 widget（如拖动滑块、点击按钮）时触发。
 
@@ -417,7 +417,7 @@ on_script_will_rerun:
 
 ---
 
-### 4.X.2 路径二：断线重连（WebSocket 重连）
+### 4B.2 路径二：断线重连（WebSocket 重连）
 
 当用户网络短暂中断或浏览器标签页休眠后恢复时触发。
 
@@ -513,7 +513,7 @@ on_script_will_rerun(latest_widget_states)  ← 与普通重跑完全相同的�
 
 ---
 
-### 4.X.3 两条路径的对比总结
+### 4B.3 两条路径的对比总结
 
 | 维度 | 普通重跑 | 断线重连 |
 |------|---------|---------|
@@ -528,6 +528,364 @@ on_script_will_rerun(latest_widget_states)  ← 与普通重跑完全相同的�
 | **时间窗口** | 即时 | 需在 TTLCache TTL（默认 2 分钟）内重连 |
 
 **共同连接点**：两条路径最终都汇聚到 `on_script_will_rerun()` 这个统一的状态恢复入口，保证了状态处理逻辑的一致性。
+
+---
+
+### 4B.4 连接点深度剖析：前端如何保存旧会话标识
+
+断线重连的第一步是前端在重连时告诉服务端"我之前有个会话"。这涉及 session_id 在前端的存储和跨连接传递。
+
+#### 前端 SessionInfo 的 last/current 双缓冲机制
+
+[SessionInfo.ts](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/frontend/lib/src/SessionInfo.ts)
+
+```typescript
+export class SessionInfo {
+  private _current?: Props    // 当前活跃会话
+  private _last?: Props       // 上一次会话（断开后保留）
+
+  public setCurrent(props?: Props): void {
+    // 新会话到来时，旧 _current 被拷贝到 _last
+    this._last = notNullOrUndefined(this._current)
+      ? { ...this._current }
+      : undefined
+    this._current = notNullOrUndefined(props) ? { ...props } : undefined
+  }
+
+  public disconnect(): void {
+    if (this._current) {
+      // 断开时，标记 isConnected=false，但数据仍保留在 _last
+      this.setCurrent({
+        ...this._current,
+        isConnected: false,
+      })
+    }
+  }
+}
+```
+
+**关键**：`sessionId` 存储在 `SessionInfo.current.sessionId` 中，断开后调用 `disconnect()` 会将 `isConnected` 设为 `false` 并将其移到 `_last`，但 `sessionId` 仍然保留。
+
+[App.tsx#L565](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/frontend/app/src/App.tsx#L565)
+
+```typescript
+// ConnectionManager 构造时传入 getLastSessionId 回调
+getLastSessionId: () => this.sessionInfo.last?.sessionId,
+```
+
+#### session_id 如何嵌入 WebSocket 连接请求
+
+[WebsocketConnection.tsx#L504-L515](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/frontend/connection/src/WebsocketConnection.tsx#L504-L515)
+
+```typescript
+private async getSessionTokens(): Promise<Array<string>> {
+  const hostAuthToken = await this.args.claimHostAuthToken()
+  const xsrfCookie = getCookie("_streamlit_xsrf")
+  this.args.resetHostAuthToken()
+
+  // ★ 核心：从 SessionInfo.last 取出上一次的 sessionId
+  const lastSessionId = this.args.getLastSessionId()
+
+  return [
+    // 第一个元素：认证 token 或 XSRF cookie 或占位符
+    hostAuthToken ?? xsrfCookie ?? "PLACEHOLDER_AUTH_TOKEN",
+    // 第二个元素（可选）：上一次的 sessionId，仅重连时存在
+    ...(lastSessionId ? [lastSessionId] : []),
+  ]
+}
+```
+
+[WebsocketConnection.tsx#L543-L544](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/frontend/connection/src/WebsocketConnection.tsx#L543-L544)
+
+```typescript
+// 将 session tokens 嵌入 Sec-WebSocket-Protocol 头
+const sessionTokens = await this.getSessionTokens()
+this.websocket = new WebSocket(uri, ["streamlit", ...sessionTokens])
+```
+
+**请求格式**：`Sec-WebSocket-Protocol: streamlit, <auth_token>, <session_id>`
+
+- 首次连接：`["streamlit", "PLACEHOLDER_AUTH_TOKEN"]` → 无第三个元素
+- 重连时：`["streamlit", "auth_token", "old_session_id"]` → 第三个元素是旧 session_id
+
+#### 后端如何解析
+
+[starlette_websocket.py#L64-L88](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/web/server/starlette/starlette_websocket.py#L64-L88)
+
+```python
+def _parse_subprotocols(headers: Headers) -> tuple[str|None, str|None, str|None]:
+    raw = headers.get("sec-websocket-protocol")
+    entries = [value.strip() for value in raw.split(",")]
+    selected = entries[0] if entries and entries[0] else None       # "streamlit"
+    xsrf_token = entries[1] if len(entries) >= 2 and entries[1] else None  # auth
+    existing_session = entries[2] if len(entries) >= 3 and entries[2] else None  # ★
+    return selected, xsrf_token, existing_session
+```
+
+**完整数据流**：
+
+```
+SessionInfo.last.sessionId (前端内存)
+    ↓ getLastSessionId() 回调
+    ↓ WebsocketConnection.getSessionTokens()
+    ↓ WebSocket(uri, ["streamlit", token, sessionId])
+    ↓ HTTP Sec-WebSocket-Protocol 头
+    ↓ _parse_subprotocols(headers)
+    ↓ existing_session_id
+    ↓ runtime.connect_session(existing_session_id=...)
+    ↓ SessionStorage.get(existing_session_id)
+    ↓ 恢复 AppSession（含 SessionState）
+```
+
+---
+
+### 4B.5 连接点深度剖析：重连后前端如何补发第一次重跑
+
+重连建立后，前端必须主动向服务端发送第一次 rerun 请求，否则服务端不知道该重新执行脚本。
+
+#### 触发入口：handleConnectionStateChanged
+
+[App.tsx#L862-L903](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/frontend/app/src/App.tsx#L862-L903)
+
+```typescript
+handleConnectionStateChanged = (newState: ConnectionState): void => {
+  if (newState === ConnectionState.CONNECTED) {
+    // ★ 重连成功后的核心判断逻辑
+
+    // 我们在以下情况请求 rerun：
+    //   1. 这是首次建立连接（没有 last session）
+    //   2. 上次脚本运行被断开中断（scriptRunState === RUNNING）
+    //   3. host 显式请求了重连（scriptRunState === RERUN_REQUESTED）
+    //   4. 脚本使用了 fragments（需要重新初始化）
+
+    const lastRunWasInterrupted =
+      this.state.scriptRunState === ScriptRunState.RUNNING
+    const wasRerunRequested =
+      this.state.scriptRunState === ScriptRunState.RERUN_REQUESTED
+
+    if (
+      !this.sessionInfo.last ||             // 条件1: 首次连接
+      lastRunWasInterrupted ||               // 条件2: 运行被中断
+      wasRerunRequested ||                   // 条件3: 显式请求重连
+      this.state.fragmentIdsThisRun.length > 0 ||  // 条件4a: 有 fragment
+      this.state.autoReruns.length > 0       // 条件4b: 有自动 rerun
+    ) {
+      LOG.info("Requesting a script run.")
+      // ★ 发送 rerun：携带当前所有 widget 状态
+      this.widgetMgr.sendUpdateWidgetsMessage(undefined)
+      this.setState({ dialog: null })
+    } else {
+      // 无需 rerun，仅关闭连接错误弹窗
+      this.setState({ dialog: null })
+    }
+  } else {
+    // 断开连接时
+    if (this.sessionInfo.isSet) {
+      this.sessionInfo.disconnect()  // ← 保存 sessionId 到 _last
+    }
+  }
+}
+```
+
+#### sendUpdateWidgetsMessage 携带的状态
+
+[WidgetStateManager.ts#L831-L841](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/frontend/lib/src/WidgetStateManager.ts#L831-L841)
+
+```typescript
+public sendUpdateWidgetsMessage(
+  fragmentId: string | undefined,
+  isAutoRerun: boolean | undefined = undefined
+): void {
+  // ★ 收集当前所有 widget 状态，构造 BackMsg.rerun_script
+  this.props.sendRerunBackMsg(
+    this.widgetStates.createWidgetStatesMsg(),  // 所有 widget 的当前值
+    fragmentId,
+    undefined,    // pageScriptHash
+    isAutoRerun
+  )
+}
+```
+
+[App.tsx#L1994-L2007](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/frontend/app/src/App.tsx#L1994-L2007)
+
+```typescript
+this.sendBackMsg(
+  new BackMsg({
+    rerunScript: {
+      queryString,             // 当前 URL 查询参数
+      widgetStates,            // ★ 前端所有 widget 的当前值（Protobuf）
+      pageScriptHash,          // 当前页面哈希
+      pageName,                // 页面名称
+      fragmentId,              // fragment ID（如有）
+      isAutoRerun,             // 是否自动 rerun
+      cachedMessageHashes,     // 消息缓存哈希
+      contextInfo,             // 时区、语言等上下文
+    },
+  })
+)
+```
+
+#### 完整补发时序
+
+```
+WebSocket 断开
+    ↓ sessionInfo.disconnect() → _last = { sessionId: "abc", isConnected: false }
+    ↓
+    ⏳ 网络恢复
+    ↓
+WebsocketConnection 重新建立连接
+    ↓ Sec-WebSocket-Protocol: "streamlit, token, abc"  ← 传递旧 sessionId
+    ↓ 服务端恢复 AppSession → 返回 NewSession 消息
+    ↓
+前端收到 NewSession → handleNewSession()
+    ↓ sessionInfo.setCurrent() → _current = 新会话, _last = 旧会话
+    ↓
+ConnectionManager 状态变为 CONNECTED
+    ↓ handleConnectionStateChanged(CONNECTED)
+    ↓ 判断条件 → 需要补发 rerun
+    ↓ widgetMgr.sendUpdateWidgetsMessage(undefined)
+    ↓ sendRerunBackMsg(widgetStates=createWidgetStatesMsg())
+    ↓
+BackMsg { rerunScript: { widgetStates: {...}, queryString: "...", ... } }
+    ↓
+服务端 AppSession.handle_backmsg()
+    ↓ _handle_rerun_script_request()
+    ↓ request_rerun(client_state)  ← client_state 包含前端所有 widget 状态
+    ↓
+ScriptRunner._run_script_loop()
+    ↓ on_script_will_rerun(latest_widget_states)  ← 恢复点！
+```
+
+**关键理解**：
+- 前端重连后自动补发 rerun 的决策逻辑在 `handleConnectionStateChanged` 中
+- 补发的 rerun 消息携带**前端当前所有 widget 状态**，确保服务端状态与前端一致
+- 如果不需要 rerun（如只是短暂断开且脚本已完成），前端只关闭错误弹窗
+
+---
+
+### 4B.6 连接点深度剖析：源码热更新时复用上一份 ClientState
+
+当用户修改了 Python 源码并开启了 `runOnSave` 时，Streamlit 会自动触发重跑。关键在于重跑时复用了上一份 `_client_state`，其中包含上一次的所有 widget 值。
+
+#### 热更新触发入口
+
+[app_session.py#L538-L550](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/runtime/app_session.py#L538-L550)
+
+```python
+def _on_source_file_changed(self, filepath: str | None = None) -> None:
+    """源文件变化时调用。清除缓存并根据设置触发 rerun。"""
+    self._script_cache.clear()  # 清除脚本字节码缓存
+
+    if filepath is not None and not self._should_rerun_on_file_change(filepath):
+        return  # 变化的文件不是当前页面，跳过
+
+    if self._run_on_save:
+        # ★ 核心：传入 self._client_state 复用上一次的完整客户端状态
+        self.request_rerun(self._client_state)
+    else:
+        # 未开启 runOnSave，仅通知前端文件已变化
+        self._enqueue_forward_msg(self._create_file_change_message())
+```
+
+#### _client_state 是什么
+
+[app_session.py#L174](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/runtime/app_session.py#L174)
+
+```python
+# 在 AppSession.__init__ 中初始化
+self._client_state = ClientState()  # 空 ClientState
+```
+
+`_client_state` 是一个 Protobuf 对象，包含以下关键字段：
+
+```
+ClientState {
+  widget_states: WidgetStates    ← 前端所有 widget 的当前值
+  query_string: string           ← 当前 URL 查询参数
+  page_script_hash: string       ← 当前页面脚本哈希
+  page_name: string              ← 当前页面名称
+  fragment_id: string            ← fragment ID（如有）
+  is_auto_rerun: bool            ← 是否自动 rerun
+  cached_message_hashes: ...     ← 消息缓存哈希
+  context_info: ContextInfo      ← 时区、语言等
+}
+```
+
+#### _client_state 的更新时机
+
+`_client_state` 在两个地方被更新：
+
+1. **前端发送 rerun 请求时**，`request_rerun(client_state)` 更新 `_client_state` 的部分字段：
+
+[app_session.py#L450-L451](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/runtime/app_session.py#L450-L451)
+
+```python
+if client_state.HasField("context_info"):
+    self._client_state.context_info.CopyFrom(client_state.context_info)
+```
+
+2. **ScriptRunner SHUTDOWN 事件时**，完整替换 `_client_state`：
+
+[app_session.py#L752](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/runtime/app_session.py#L752)
+
+```python
+elif event == ScriptRunnerEvent.SHUTDOWN:
+    # ...
+    self._client_state = client_state  # ★ 完整替换为最新的 client_state
+```
+
+#### 热更新路径与普通重跑的对比
+
+| 维度 | 普通重跑 | 源码热更新 |
+|------|---------|-----------|
+| **触发** | 前端 `BackMsg.rerun_script` | 服务端 `_on_source_file_changed` |
+| **ClientState 来源** | 前端实时构造（含最新 widget 值） | 服务端缓存的 `self._client_state` |
+| **Widget 状态** | 前端当前所有 widget 值（经过用户交互） | **上一次前端发来的** widget 值 |
+| **request_rerun 入参** | `client_state`（来自前端） | `self._client_state`（来自缓存） |
+| **后续路径** | `on_script_will_rerun()` | 同左 |
+| **_compact_state 行为** | 相同 | 相同 |
+
+#### 热更新时的完整数据流
+
+```
+源码文件变化
+    ↓ LocalSourcesWatcher 检测到变化
+    ↓ _on_source_file_changed(filepath)
+    ↓ _script_cache.clear()
+    ↓ _should_rerun_on_file_change(filepath) → True
+    ↓ self._run_on_save → True
+    ↓
+request_rerun(self._client_state)  ★ 复用缓存的 ClientState
+    ↓
+    ├─ 分支A: 复用现有 ScriptRunner
+    │   request_rerun(rerun_data)
+    │   ↓ rerun_data = RerunData(
+    │       widget_states=self._client_state.widget_states,  ← 缓存的 widget 值
+    │       query_string=self._client_state.query_string,    ← 缓存的 URL 参数
+    │       page_script_hash=self._client_state.page_script_hash,
+    │       ...
+    │   )
+    │
+    └─ 分支B: 新建 ScriptRunner
+        _create_scriptrunner(initial_rerun_data=rerun_data)
+        ↓ 同样使用缓存的 widget_states
+
+    ↓
+ScriptRunner._run_script_loop()
+    ↓
+on_script_will_rerun(rerun_data.widget_states)  ← 用缓存的 widget 值恢复状态
+    ├─ _compact_state()       合并旧状态
+    ├─ set_widgets_from_proto() 加载缓存的 widget 值
+    └─ _call_callbacks()      执行值变化回调
+    ↓
+用户脚本执行（使用上一次的 widget 状态 + 新代码）
+```
+
+**关键理解**：
+- 热更新复用的 `_client_state` 是**上一次前端发来的 widget 状态快照**
+- 如果用户在两次前端交互之间修改了源码，热更新会使用**最近一次前端发送的** widget 值，而非实时值
+- 这意味着用户修改源码后自动 rerun 时，所有 widget 保持上次的值，用户不会丢失交互状态
+- 如果未开启 `runOnSave`，前端仅收到一个 `script_changed_on_disk` 通知，由用户决定是否手动 rerun
 
 ---
 
