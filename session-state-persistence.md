@@ -155,80 +155,385 @@ _old_state / _new_session_state / _new_widget_state
 
 ## 4. 序列化保存机制
 
-### 4.1 序列化检查
+### 4.1 序列化检查详解
 
-使用 Python `pickle` 作为序列化标准，在脚本运行完成后检查可序列化性：
+序列化检查分为两个层面：**预检机制**和**实际保存时的隐式序列化**。
+
+#### 4.1.1 预检机制：maybe_check_serializable
+
+使用 Python `pickle` 作为序列化标准，**仅在配置开启时执行可序列化性验证**，不做实际持久化：
 
 [session_state.py#L1292-L1318](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/runtime/state/session_state.py#L1292-L1318)
 
 ```python
 def _check_serializable(self) -> None:
+    """验证 session_state 中所有值是否可 pickle 序列化。"""
     for k in self:
         try:
-            pickle.dumps(self[k])  # 尝试 pickle 序列化
+            pickle.dumps(self[k])  # 仅尝试序列化，结果被丢弃
         except Exception as e:
+            err_msg = (
+                f"Cannot serialize the value (of type `{type(self[k])}`) of '{k}' in "
+                "st.session_state. Streamlit has been configured to use "
+                "[pickle](https://docs.python.org/3/library/pickle.html) to "
+                "serialize session_state values..."
+            )
             raise UnserializableSessionStateError(err_msg) from e
 
 def maybe_check_serializable(self) -> None:
+    """仅当 runner.enforceSerializableSessionState 配置为 True 时执行检查。"""
     if config.get_option("runner.enforceSerializableSessionState"):
         self._check_serializable()
 ```
 
-**调用时机**：脚本执行完成后
+**关键点**：
+- 这是一个**防御性检查**，不是实际的持久化操作
+- 配置开关 `runner.enforceSerializableSessionState` 默认为关闭
+- 检查遍历 SessionState 的所有 key（包括 `_old_state`、`_new_session_state`、`_new_widget_state`）
+- 通过 `self[k]` 触发完整查找链，确保 widget state 也被检查
 
-[script_runner.py#L802](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/runtime/scriptrunner/script_runner.py#L802)
+#### 4.1.2 调用时机：脚本执行完成后
+
+[script_runner.py#L798-L804](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/runtime/scriptrunner/script_runner.py#L798-L804)
 
 ```python
-self._session_state.maybe_check_serializable()
+# 用户脚本执行完毕后
+self._fragment_storage.clear(
+    new_fragment_ids=ctx.new_fragment_ids.snapshot()
+)
+
+self._session_state.maybe_check_serializable()  # ← 在此调用
+# check for control requests, e.g. rerun requests have arrived
+self._maybe_handle_execution_control_request()
 ```
 
-### 4.2 会话断开时的持久化
+**时间线位置**：在 `exec_func_with_error_handling(code_to_exec, ctx)` 执行用户脚本之后，在 `_on_script_finished` 之前。
 
-当 WebSocket 连接断开时，会话被保存到 `SessionStorage`：
+### 4.2 会话断开时的实际保存过程
 
-[websocket_session_manager.py#L170-L189](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/runtime/websocket_session_manager.py#L170-L189)
+当 WebSocket 连接断开时，整个 `AppSession` 对象（包含 `SessionState`）被保存到 `SessionStorage`。
+
+#### 4.2.1 断开触发点
+
+[starlette_websocket.py#L455-L460](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/web/server/starlette/starlette_websocket.py#L455-L460)
+
+```python
+while True:
+    try:
+        data = await websocket.receive_bytes()
+    except WebSocketDisconnect:
+        break  # ← 捕获断开异常，跳出消息循环
+```
+
+连接断开后的清理：
+
+[starlette_websocket.py#L515-L525](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/web/server/starlette/starlette_websocket.py#L515-L525)
+
+```python
+finally:
+    if session_id is not None:
+        try:
+            runtime.disconnect_session(session_id)  # ← 触发会话保存
+        except Exception:
+            _LOGGER.exception("Error disconnecting session")
+```
+
+#### 4.2.2 保存执行流程
+
+[runtime.py#L485-L507](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/runtime/runtime.py#L485-L507) → [websocket_session_manager.py#L170-L189](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/runtime/websocket_session_manager.py#L170-L189)
 
 ```python
 def disconnect_session(self, session_id: str) -> None:
     if session_id in self._active_session_info_by_id:
         active_session_info = self._active_session_info_by_id[session_id]
         session = active_session_info.session
-        
+
+        # 步骤1: 停止正在运行的脚本
         session.request_script_stop()
+
+        # 步骤2: 断开文件监听器（释放监听资源）
         session.disconnect_file_watchers()
+        # [app_session.py#L248-L261] 关闭 LocalSourcesWatcher, config listener, secrets listener
+
+        # 步骤3: 清除会话级缓存（释放内存）
         session.clear_session_caches()
-        
-        # 保存到 SessionStorage（包含完整的 SessionState）
+        # [app_session.py#L263-L270] clear_session_data_cache + clear_session_resource_cache
+
+        # 步骤4: 保存到 SessionStorage（核心！整个 AppSession 对象被存入）
         self._session_storage.save(
             SessionInfo(
-                client=None,
-                session=session,              # 整个 AppSession 被保存
+                client=None,                    # 断开后 client 置空
+                session=session,                 # 包含完整 SessionState 的引用
                 script_run_count=active_session_info.script_run_count,
             )
         )
+
+        # 步骤5: 从活跃表移除
         del self._active_session_info_by_id[session_id]
 ```
 
-### 4.3 内存存储实现
-
-`MemorySessionStorage` 使用带 TTL 的缓存：
+#### 4.2.3 实际存储：内存引用而非序列化
 
 [memory_session_storage.py](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/runtime/memory_session_storage.py)
 
 ```python
 class MemorySessionStorage(SessionStorage):
     def __init__(self, maxsize: int = 128, ttl_seconds: int = 2 * 60) -> None:
+        # 使用 TTLCache，默认最多存 128 个会话，TTL 2 分钟
         self._cache: MutableMapping[str, SessionInfo] = TTLCache(
-            maxsize=maxsize, ttl=ttl_seconds  # 默认 2 分钟 TTL
+            maxsize=maxsize, ttl=ttl_seconds
         )
-    
+
     def save(self, session_info: SessionInfo) -> None:
-        self._cache[session_info.session.id] = session_info  # key = session_id
+        # key = session_id, value = SessionInfo 对象的直接引用
+        # ⚠️ 注意：这里没有做 pickle 序列化，只是 Python 对象的内存引用
+        self._cache[session_info.session.id] = session_info
+
+    def get(self, session_id: str) -> SessionInfo | None:
+        return self._cache.get(session_id, None)
 ```
 
-### 4.4 Widget 状态的 Proto 序列化
+**关键理解**：
+- `MemorySessionStorage` 存储的是 Python 对象的**直接内存引用**，不是序列化后的字节
+- `maybe_check_serializable` 的 pickle 检查是为**未来可能的持久化实现**做预检（如写入磁盘或跨进程传输）
+- 2 分钟 TTL 后会话对象会被自动清理，Python GC 回收内存
 
-Widget 状态可以序列化为 Protobuf 格式用于前后端通信：
+---
+
+## 4.X 两条恢复路径的深度对比
+
+### 4.X.1 路径一：普通重跑（用户交互触发）
+
+当用户在页面上操作 widget（如拖动滑块、点击按钮）时触发。
+
+#### 完整调用链
+
+```
+前端 widget 交互
+    ↓ WebSocket 发送 BackMsg
+    ↓ [starlette_websocket.py#L471-L480] 解析 BackMsg protobuf
+    ↓ [runtime.py#L509-L533] runtime.handle_backmsg()
+    ↓ [app_session.py#L338-L371] AppSession.handle_backmsg()
+    ↓   msg_type == "rerun_script"
+    ↓ [app_session.py#L916-L928] _handle_rerun_script_request()
+    ↓ [app_session.py#L406-L488] request_rerun(client_state)
+    ↓
+    ├─ 分支A: 复用现有 ScriptRunner
+    │   [app_session.py#L481] self._scriptrunner.request_rerun(rerun_data)
+    │   ↓
+    │   ScriptRunner._run_script_loop 下一次迭代
+    │
+    └─ 分支B: 新建 ScriptRunner (fastReruns 或首次运行)
+        [app_session.py#L488] self._create_scriptrunner(rerun_data)
+        ↓
+        [script_runner.py#L174-L249] 新建 ScriptRunner
+        ↓   session_state = AppSession._session_state (同一个对象引用!)
+        ↓   包装为 SafeSessionState
+        ↓
+        ScriptRunner.start() → _run_script_loop()
+```
+
+#### 状态恢复的连接点：on_script_will_rerun
+
+不论分支 A 还是 B，最终都会进入 `_run_script_loop`，在每次脚本执行前调用：
+
+[script_runner.py#L707-L711](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/runtime/scriptrunner/script_runner.py#L707-L711)
+
+```python
+# Run callbacks for widgets whose values have changed.
+if rerun_data.widget_states is not None:
+    self._session_state.on_script_will_rerun(
+        rerun_data.widget_states
+    )
+```
+
+[session_state.py#L641-L651](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/runtime/state/session_state.py#L641-L651)
+
+```python
+def on_script_will_rerun(self, latest_widget_states: WidgetStatesProto) -> None:
+    """Called by ScriptRunner before its script re-runs."""
+    # 1. 重置触发器（按钮点击状态等临时状态）
+    self._reset_triggers()
+
+    # 2. ★ 状态压缩：上一轮的新状态 → _old_state（持久化层）
+    self._compact_state()
+
+    # 3. 加载前端传来的最新 widget 状态（Protobuf 格式，存入 _new_widget_state）
+    self.set_widgets_from_proto(latest_widget_states)
+
+    # 4. 调用值变化的 widget 回调
+    self._call_callbacks()
+```
+
+#### _compact_state 的详细过程
+
+[session_state.py#L448-L461](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/runtime/state/session_state.py#L448-L461)
+
+```python
+def _compact_state(self) -> None:
+    # 遍历所有 key（_old_state ∪ _new_widget_state ∪ _new_session_state）
+    for key_or_wid in self:
+        try:
+            # self[key_or_wid] 触发完整查找链：
+            #   _new_session_state → _new_widget_state → _old_state
+            # 对于 widget_state，会触发懒加载反序列化
+            self._old_state[key_or_wid] = self[key_or_wid]
+        except KeyError:
+            # widget 缺少 metadata 时忽略（如重连后的残留状态）
+            pass
+
+    # 清空，准备接收新一轮数据
+    self._new_session_state.clear()
+    self._new_widget_state.clear()
+```
+
+**状态流转**：
+```
+运行前:
+  _old_state:       {slider_1: 5, "counter": 3}        ← 历史值
+  _new_widget_state: {}                                   ← 空
+  _new_session_state: {}                                  ← 空
+
+用户交互（拖动滑块到 8）→ 前端发送 widget_states
+
+on_script_will_rerun:
+  _compact_state() → _old_state 保持不变（没有新值可合并）
+  set_widgets_from_proto({slider_1: 8}) → _new_widget_state: {slider_1: Serialized(8)}
+
+脚本执行中:
+  用户代码 st.slider(..., key="slider_1")
+    → register_widget() → self[widget_id]
+    → WStates.__getitem__ → 反序列化 Serialized(8) → Value(8)
+  用户代码 st.session_state.counter = 4
+    → SessionState.__setitem__ → _new_session_state: {"counter": 4}
+
+运行结束 → 下次 on_script_will_rerun:
+  _compact_state():
+    _old_state["slider_1"] = 8   ← 从 _new_widget_state 合并
+    _old_state["counter"] = 4    ← 从 _new_session_state 合并
+    _new_widget_state.clear()
+    _new_session_state.clear()
+```
+
+---
+
+### 4.X.2 路径二：断线重连（WebSocket 重连）
+
+当用户网络短暂中断或浏览器标签页休眠后恢复时触发。
+
+#### 完整调用链
+
+```
+WebSocket 连接断开
+    ↓ [starlette_websocket.py] WebSocketDisconnect → runtime.disconnect_session()
+    ↓ [websocket_session_manager.py#L170-L189] 保存到 MemorySessionStorage
+    ↓ SessionInfo(AppSession) 存入 TTLCache (TTL 2分钟)
+    ↓
+    ⏳ 时间窗口：2 分钟内用户重新连接
+    ↓
+前端发起新 WebSocket 连接
+    ↓ Sec-WebSocket-Protocol 头携带 existing_session_id
+    ↓   格式: "streamlit, <xsrf_token>, <session_id>"
+    ↓
+[starlette_websocket.py#L64-L88] _parse_subprotocols()
+    ↓ 解析 headers["sec-websocket-protocol"]
+    ↓ 返回 (subprotocol, xsrf_token, existing_session_id)
+    ↓
+[starlette_websocket.py#L449-L453] runtime.connect_session()
+    ↓ existing_session_id=existing_session_id
+    ↓
+[runtime.py#L376-L437] Runtime.connect_session()
+    ↓
+[websocket_session_manager.py#L100-L168] WebsocketSessionManager.connect_session()
+    ↓
+    ├─ 检查 existing_session_id 是否在 _active_session_info_by_id 中
+    │   （如果是，说明会话还活跃，忽略重连请求，创建新会话）
+    │
+    └─ 从 SessionStorage 查找
+        session_info = self._session_storage.get(existing_session_id)
+        ↓
+        找到 → 恢复会话 ★
+        未找到 → 创建新 AppSession
+```
+
+#### 恢复会话的关键步骤
+
+[websocket_session_manager.py#L126-L140](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/runtime/websocket_session_manager.py#L126-L140)
+
+```python
+if isinstance(session_info, SessionInfo):
+    existing_session = session_info.session  # 取出保存的 AppSession
+
+    # ★ 恢复步骤1: 重新注册文件监听器（之前被 disconnect_file_watchers 关闭了）
+    existing_session.register_file_watchers()
+    # [app_session.py#L223-L246] 重新创建 LocalSourcesWatcher, config listener, secrets listener
+
+    # ★ 恢复步骤2: 重新加入活跃会话表，关联新的 WebSocket client
+    self._active_session_info_by_id[existing_session.id] = ActiveSessionInfo(
+        client,                  # 新 WebSocket 连接
+        existing_session,        # 原来的 AppSession（含原来的 SessionState！）
+        session_info.script_run_count,
+    )
+
+    # ★ 恢复步骤3: 从存储中删除（避免重复使用）
+    self._session_storage.delete(existing_session.id)
+
+    with self._stats_lock:
+        self._reconnect_count += 1
+        self._session_connect_times[existing_session.id] = time.monotonic()
+    return existing_session.id
+```
+
+**SessionState 的连续性**：由于 `MemorySessionStorage` 保存的是对象引用，恢复后 `existing_session._session_state` 就是断开前的同一个 `SessionState` 对象，所有 `_old_state`、`_key_id_mapper`、`query_params` 等数据完整保留。
+
+#### 重连后首次脚本运行的连接点
+
+重连后，前端会立即发送 `rerun_script` BackMsg，携带最新的 widget 状态：
+
+```
+重连成功 → 返回 session_id 给前端
+    ↓
+前端发送 BackMsg { rerun_script: ClientState { widget_states: {...} } }
+    ↓
+AppSession.handle_backmsg() → request_rerun()
+    ↓
+_create_scriptrunner(rerun_data)
+    ↓   session_state = existing_session._session_state  ← 原来的对象！
+    ↓
+ScriptRunner._run_script_loop()
+    ↓
+on_script_will_rerun(latest_widget_states)  ← 与普通重跑完全相同的入口！
+    ├─ _reset_triggers()
+    ├─ _compact_state()        ← 合并断开前留下的状态
+    ├─ set_widgets_from_proto(latest_widget_states)  ← 加载前端最新值
+    └─ _call_callbacks()
+    ↓
+用户脚本执行 → 一切恢复正常
+```
+
+---
+
+### 4.X.3 两条路径的对比总结
+
+| 维度 | 普通重跑 | 断线重连 |
+|------|---------|---------|
+| **触发方式** | 用户交互 widget → BackMsg.rerun_script | WebSocket 断开 → 重新连接 → existing_session_id |
+| **AppSession** | 复用同一个实例 | 从 SessionStorage 恢复原来的实例 |
+| **SessionState** | 始终是同一个对象 | 恢复后也是原来的对象（内存引用未变） |
+| **ScriptRunner** | 复用或新建 | 必定新建（原 ScriptRunner 线程已终止） |
+| **状态恢复入口** | `on_script_will_rerun()` | 同左，也是 `on_script_will_rerun()` |
+| **_old_state 内容** | 上一次压缩的结果 | 断开前最后一次压缩的结果 |
+| **_new_widget_state** | 空 → 加载前端最新状态 | 可能残留断开前的值 → _compact_state 合并 → 加载前端最新 |
+| **额外操作** | 无 | 重新注册文件监听器、重新关联 client |
+| **时间窗口** | 即时 | 需在 TTLCache TTL（默认 2 分钟）内重连 |
+
+**共同连接点**：两条路径最终都汇聚到 `on_script_will_rerun()` 这个统一的状态恢复入口，保证了状态处理逻辑的一致性。
+
+---
+
+### 4.3 Widget 状态的 Proto 序列化（前后端通信）
+
+Widget 状态的 Protobuf 序列化用于**前后端通信**，与会话级持久化是不同层面的机制：
 
 [session_state.py#L264-L310](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/runtime/state/session_state.py#L264-L310)
 
@@ -237,115 +542,36 @@ def get_serialized(self, k: str) -> WidgetStateProto | None:
     item = self.states.get(k)
     if item is None:
         return None
-    
+
     if isinstance(item, Serialized):
         return item.value  # 已经是序列化格式
-    
+
     # Value -> Serialized 转换
     metadata = self.widget_metadata.get(k)
     widget = WidgetStateProto()
     widget.id = k
-    
+
     field = metadata.value_type
     serialized = metadata.serializer(item.value)
-    
+
     # 根据类型设置到 proto 字段
     if is_array_value_field_name(field):
         arr = getattr(widget, field)
         arr.data.extend(serialized)
     elif field in {"json_value", "json_trigger_value"}:
         setattr(widget, field, json.dumps(serialized))
+    elif field == "file_uploader_state_value":
+        widget.file_uploader_state_value.CopyFrom(serialized)
     # ... 其他类型处理
-    
+
     return widget
 ```
 
 ---
 
-## 5. 状态恢复时机
+## 5. 状态恢复时机（补充：运行后清理与反序列化）
 
-### 5.1 会话重连时的完整恢复
-
-当客户端重新连接并提供 `existing_session_id` 时，从 `SessionStorage` 恢复完整会话：
-
-[websocket_session_manager.py#L100-L140](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/runtime/websocket_session_manager.py#L100-L140)
-
-```python
-def connect_session(
-    self,
-    client: SessionClient,
-    script_data: ScriptData,
-    user_info: UserInfoType,
-    existing_session_id: str | None = None,
-    session_id_override: str | None = None,
-) -> str:
-    # 尝试从存储中恢复
-    session_info = (
-        existing_session_id
-        and existing_session_id not in self._active_session_info_by_id
-        and self._session_storage.get(existing_session_id)
-    )
-    
-    if isinstance(session_info, SessionInfo):
-        existing_session = session_info.session
-        existing_session.register_file_watchers()  # 重新注册文件监听器
-        
-        # 重新加入活跃会话表
-        self._active_session_info_by_id[existing_session.id] = ActiveSessionInfo(
-            client,
-            existing_session,
-            session_info.script_run_count,
-        )
-        self._session_storage.delete(existing_session.id)  # 从存储移除
-        return existing_session.id
-    
-    # 未找到则创建新会话
-    session = AppSession(...)
-```
-
-### 5.2 脚本重运行前的状态压缩
-
-每次脚本重运行前，调用 `on_script_will_rerun` 进行状态压缩：
-
-[session_state.py#L641-L651](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/runtime/state/session_state.py#L641-L651)
-
-```python
-def on_script_will_rerun(self, latest_widget_states: WidgetStatesProto) -> None:
-    self._reset_triggers()               # 重置触发器状态
-    self._compact_state()                # 压缩：新状态 -> 旧状态
-    self.set_widgets_from_proto(latest_widget_states)  # 加载前端最新 widget 状态
-    self._call_callbacks()               # 调用值变化的回调
-```
-
-**状态压缩逻辑** `_compact_state`：
-
-[session_state.py#L448-L461](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/runtime/state/session_state.py#L448-L461)
-
-```python
-def _compact_state(self) -> None:
-    # 将 _new_session_state 和 _new_widget_state 合并到 _old_state
-    for key_or_wid in self:
-        try:
-            self._old_state[key_or_wid] = self[key_or_wid]
-        except KeyError:
-            pass
-    # 清空新状态，准备接收下一轮运行的数据
-    self._new_session_state.clear()
-    self._new_widget_state.clear()
-```
-
-**调用时机**：脚本运行循环开始时
-
-[script_runner.py#L708-L711](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/runtime/scriptrunner/script_runner.py#L708-L711)
-
-```python
-if rerun_data.widget_states is not None:
-    self._session_state.on_script_will_rerun(
-        rerun_data.widget_states
-    )
-```
-
-### 5.3 脚本运行完成后的状态清理
+### 5.1 脚本运行完成后的状态清理
 
 脚本运行完成后，调用 `on_script_finished` 清理过期 widget：
 
@@ -376,9 +602,9 @@ if not premature_stop:
     self._session_state.on_script_finished(ctx.widget_ids_this_run.snapshot())
 ```
 
-### 5.4 前端 Widget 状态的反序列化
+### 5.2 前端 Widget 状态的反序列化（懒加载）
 
-从前端接收 Protobuf 状态后反序列化为 Python 对象：
+从前端接收 Protobuf 状态后反序列化为 Python 对象，采用**懒加载**策略：首次访问时才反序列化并缓存结果。
 
 [session_state.py#L151-L203](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/runtime/state/session_state.py#L151-L203)
 
@@ -386,19 +612,19 @@ if not premature_stop:
 def __getitem__(self, k: str) -> Any:
     wstate = self.states.get(k)
     if isinstance(wstate, Value):
-        return wstate.value  # 已反序列化
-    
-    # Serialized -> Value 转换（懒加载）
+        return wstate.value  # 已反序列化，直接返回
+
+    # Serialized(Protobuf) -> Value(Python对象) 懒加载转换
     metadata = self.widget_metadata.get(k)
     value_field_name = wstate.value.WhichOneof("value")
     value = wstate.value.__getattribute__(value_field_name)
-    
+
     # 特殊类型处理
     if is_array_value_field_name(value_field_name):
         value = value.data
     elif value_field_name == "json_value":
         value = json.loads(value)
-    
+
     deserialized = metadata.deserializer(value)
     self.states[k] = Value(deserialized)  # 缓存反序列化结果
     return deserialized
@@ -406,42 +632,91 @@ def __getitem__(self, k: str) -> Any:
 
 ---
 
-## 6. 完整生命周期时序
+## 6. 完整生命周期时序（含两条路径）
 
 ```
-客户端连接
-    ↓
-AppSession 初始化 → 创建 SessionState (空)
-    ↓
-首次脚本运行
-    ↓
-┌─────────────────────────────────────────────────┐
-│ 脚本执行循环                                    │
-│    ↓                                            │
-│ on_script_will_rerun()                          │
-│   ├─ _reset_triggers()                          │
-│   ├─ _compact_state()    新状态 → _old_state    │
-│   ├─ set_widgets_from_proto()  前端状态加载      │
-│   └─ _call_callbacks()      值变化回调执行       │
-│    ↓                                            │
-│ 用户脚本执行 → 注册 widget → 访问/修改 state    │
-│    ↓                                            │
-│ maybe_check_serializable()  序列化检查          │
-│    ↓                                            │
-│ _on_script_finished()                           │
-│   └─ on_script_finished()  清理 stale widget    │
-└─────────────────────────────────────────────────┘
-    ↓
-WebSocket 断开
-    ↓
-disconnect_session() → 保存到 MemorySessionStorage (TTL 2分钟)
-    ↓
-客户端重连（带 existing_session_id）
-    ↓
-connect_session() → 从 SessionStorage 恢复完整 SessionState
-    ↓
-继续脚本运行循环
+                           新客户端连接
+                                ↓
+                    AppSession 初始化 → 创建 SessionState (空)
+                                ↓
+                          首次脚本运行
+                                ↓
+        ┌───────────────────────────────────────────────────────┐
+        │                                                       │
+        │            ═══ 路径A: 普通重跑 ═══                    │
+        │                                                       │
+        │  用户交互 widget → BackMsg.rerun_script              │
+        │        ↓                                              │
+        │  AppSession.request_rerun(client_state)              │
+        │        ↓                                              │
+        │  ScriptRunner._run_script_loop()                     │
+        │        ↓                                              │
+        │  on_script_will_rerun(latest_widget_states) ★        │
+        │    ├─ _reset_triggers()                               │
+        │    ├─ _compact_state()     新状态 → _old_state       │
+        │    ├─ set_widgets_from_proto() 前端最新状态加载        │
+        │    └─ _call_callbacks()       值变化回调执行          │
+        │        ↓                                              │
+        │  用户脚本执行 → 注册 widget → 访问/修改 state        │
+        │        ↓                                              │
+        │  maybe_check_serializable()  序列化预检              │
+        │        ↓                                              │
+        │  _on_script_finished()                                │
+        │    └─ on_script_finished()  清理 stale widget        │
+        │                                                       │
+        └───────────────────────────────────────────────────────┘
+                                ↓
+                    WebSocket 连接断开
+                                ↓
+                    runtime.disconnect_session()
+                                ↓
+        ┌───────────────────────────────────────────────────────┐
+        │  websocket_session_manager.disconnect_session()       │
+        │    ├─ session.request_script_stop()                   │
+        │    ├─ session.disconnect_file_watchers()              │
+        │    ├─ session.clear_session_caches()                  │
+        │    └─ _session_storage.save(SessionInfo)              │
+        │         ↓ TTLCache, key=session_id, TTL=2分钟         │
+        │         内存引用（非序列化）                           │
+        └───────────────────────────────────────────────────────┘
+                                ↓
+                    ⏳ 时间窗口：2 分钟内
+                                ↓
+                           客户端重连
+                                ↓
+        ┌───────────────────────────────────────────────────────┐
+        │                                                       │
+        │            ═══ 路径B: 断线重连 ═══                    │
+        │                                                       │
+        │  Sec-WebSocket-Protocol: "streamlit, token, session_id"
+        │        ↓                                              │
+        │  _parse_subprotocols() → existing_session_id         │
+        │        ↓                                              │
+        │  runtime.connect_session(existing_session_id=...)    │
+        │        ↓                                              │
+        │  websocket_session_manager.connect_session()         │
+        │    └─ session_info = _session_storage.get(id)        │
+        │         ↓ 找到？                                      │
+        │         ├─ 是 → 恢复会话 ★                            │
+        │         │    ├─ existing_session.register_file_watchers()
+        │         │    ├─ _active_session_info_by_id[id] =     │
+        │         │    │    ActiveSessionInfo(新client, 原AppSession)
+        │         │    └─ _session_storage.delete(id)           │
+        │         └─ 否 → 创建新 AppSession + SessionState      │
+        │                                                       │
+        └───────────────────────────────────────────────────────┘
+                                ↓
+                   前端发送 rerun_script BackMsg
+                                ↓
+                   进入路径A → on_script_will_rerun() ★
+                   （两条路径汇聚到同一个状态恢复入口）
 ```
+
+**关键汇聚点 `★`**：
+- `on_script_will_rerun()` 是两条路径共同的状态恢复入口
+- 断线重连后，SessionState 对象本身已完整恢复（通过内存引用）
+- `_compact_state()` 将断开前残留的 `_new_widget_state`/`_new_session_state` 合并到 `_old_state`
+- `set_widgets_from_proto()` 用前端最新 widget 状态覆盖，保证前后端一致
 
 ---
 
