@@ -647,6 +647,190 @@ def clear_all(self):
         shutil.rmtree(cache_path)  # 暴力删除整个缓存目录
 ```
 
+### 6.9 存储管理器的选择：正常运行 vs Raw Mode
+
+`DataCaches.get_storage_manager()` 是存储层选择的核心调度点：
+
+源码位置：[cache_data_api.py#L367-L373](file:///d:/fz/0601/solo-dogfeeding/code/216-streamlit/lib/streamlit/runtime/caching/cache_data_api.py#L367-L373)
+
+```python
+def get_storage_manager(self) -> CacheStorageManager:
+    if runtime.exists():
+        return runtime.get_instance().cache_storage_manager
+    # When running in "raw mode", we can't access the CacheStorageManager,
+    # so we're falling back to InMemoryCache.
+    _LOGGER.warning("No runtime found, using MemoryCacheStorageManager")
+    return MemoryCacheStorageManager()
+```
+
+**两种运行模式的存储层对比**：
+
+| 模式 | runtime.exists() | 存储管理器 | 持久化层 | 实际效果 |
+|-----|-----------------|-----------|---------|---------|
+| **正常运行**<br>(`streamlit run app.py`) | ✅ True | `LocalDiskCacheStorageManager` | `LocalDiskCacheStorage` | persist="disk" 时真正落盘，<br>persist=None 时 DummyCacheStorage |
+| **Raw Mode**<br>(`python app.py` 直接运行) | ❌ False | `MemoryCacheStorageManager` | `DummyCacheStorage` | 永远只用内存，persist 参数<br>被忽略，重启全部丢失 |
+
+**Raw Mode 的持久化层是空壳**：
+
+源码位置：[dummy_cache_storage.py#L42-L60](file:///d:/fz/0601/solo-dogfeeding/code/216-streamlit/lib/streamlit/runtime/caching/storage/dummy_cache_storage.py#L42-L60)
+
+```python
+class DummyCacheStorage(CacheStorage):
+    def get(self, key):
+        raise CacheStorageKeyNotFoundError("Key not found in dummy cache")
+    def set(self, key, value):
+        pass    # 静默丢弃
+    def delete(self, key):
+        pass
+    def clear(self):
+        pass
+```
+
+所以 raw mode 下即使你写了 `@st.cache_data(persist="disk")`，也只是内存缓存，不会写任何磁盘文件。
+
+### 6.10 disk 模式下 session 级隔离的缺失
+
+这是一个非常重要的设计缺陷/特性：**`scope="session"` + `persist="disk"` 组合在磁盘层完全没有隔离！**
+
+**根本原因 1：`CacheStorageContext` 没有 session_id 字段**
+
+源码位置：[cache_storage_protocol.py#L77-L111](file:///d:/fz/0601/solo-dogfeeding/code/216-streamlit/lib/streamlit/runtime/caching/storage/cache_storage_protocol.py#L77-L111)
+
+```python
+@dataclass(frozen=True)
+class CacheStorageContext:
+    function_key: str
+    function_display_name: str
+    ttl_seconds: float | None = None
+    max_entries: int | None = None
+    persist: Literal["disk"] | None = None
+    # ❗ 没有 session_id 字段！
+```
+
+创建 Context 时也没有传 session_id：
+
+源码位置：[cache_data_api.py#L351-L365](file:///d:/fz/0601/solo-dogfeeding/code/216-streamlit/lib/streamlit/runtime/caching/cache_data_api.py#L351-L365)
+
+```python
+def create_cache_storage_context(self, function_key, function_name, persist, ttl_seconds, max_entries):
+    return CacheStorageContext(
+        function_key=function_key,
+        function_display_name=function_name,
+        ttl_seconds=ttl_seconds,
+        max_entries=max_entries,
+        persist=persist,
+        # ❗ 完全忽略 session_id！
+    )
+```
+
+**根本原因 2：磁盘文件名不含 session_id**
+
+源码位置：[local_disk_cache_storage.py#L208-L213](file:///d:/fz/0601/solo-dogfeeding/code/216-streamlit/lib/streamlit/runtime/caching/storage/local_disk_cache_storage.py#L208-L213)
+
+```python
+def _get_cache_file_path(self, value_key):
+    cache_dir = get_cache_folder_path()
+    return os.path.join(
+        cache_dir, f"{self.function_key}-{value_key}.memo"
+        # ❗ 只有 function_key + value_key，没有 session_id
+    )
+```
+
+**实际发生的场景**：
+
+```python
+# app.py
+@st.cache_data(scope="session", persist="disk")
+def load_user_profile(user_id):
+    print(f"Loading profile for user {user_id}")
+    return fetch_from_db(user_id)
+```
+
+| 时间 | 用户A（session_id=abc） | 用户B（session_id=xyz） |
+|-----|-----------------------|-----------------------|
+| T0 | 调用 `load_user_profile(123)` → 执行函数 → 磁盘写入 `{func_key}-{val_key}.memo` | |
+| T1 | | 调用 `load_user_profile(123)` → 内存 miss → 磁盘**命中** → 直接返回 A 的数据！ |
+| T2 | 刷新页面 → 内存命中，正常 | 再次调用 → 内存命中，拿到的还是同一份数据 |
+
+**内存层是隔离的，但磁盘层是共享的**：
+- `_function_caches` 字典：`{"abc": {func_key: cacheA}, "xyz": {func_key: cacheB}}` ✅ 隔离
+- cacheA 和 cacheB 的 `storage` 指向**同一个磁盘目录**，文件名完全一样 ❌ 共享
+
+### 6.11 session 断开清理对其他会话的影响
+
+更严重的问题：**一个 session 断开清理磁盘缓存，会误伤其他 session！**
+
+**清理调用链**：
+
+```
+AppSession.disconnect()
+  └─► AppSession.clear_session_caches()
+       ├─► cache_data.clear_session_cache(session_id)
+       │    └─► DataCaches.clear_session(session_id)
+       │         ├─► 从 _function_caches 移除该 session_id 的 dict  ✅ 只影响自己
+       │         └─► 对每个 cache 调用 cache.clear()
+       │              └─► DataCache.clear()
+       │                   └─► InMemoryCacheStorageWrapper.clear()
+       │                        ├─► 清内存层 _mem_cache.clear()  ✅ 只清自己的
+       │                        └─► 清磁盘层 _persist_storage.clear()
+       │                             └─► LocalDiskCacheStorage.clear()
+       │                                  └─► 删除所有 function_key-*.memo 文件
+       │                                      ❗ 其他 session 的磁盘文件也被删了！
+       │
+       └─► cache_resource.clear_session_cache(session_id)
+            └─► ResourceCaches.clear_session(session_id)
+                 └─► ResourceCache.clear() → 只清内存，没有磁盘层
+```
+
+**LocalDiskCacheStorage.clear() 的实现**：
+
+源码位置：[local_disk_cache_storage.py#L193-L203](file:///d:/fz/0601/solo-dogfeeding/code/216-streamlit/lib/streamlit/runtime/caching/storage/local_disk_cache_storage.py#L193-L203)
+
+```python
+def clear(self):
+    cache_dir = get_cache_folder_path()
+    if os.path.isdir(cache_dir):
+        # 删除所有以 function_key 开头的文件，不区分 session！
+        for file_name in os.listdir(cache_dir):
+            if self._is_cache_file(file_name):  # startswith(f"{function_key}-")
+                os.remove(os.path.join(cache_dir, file_name))
+```
+
+**真实场景**：
+1. 用户 A 连接，调用 `load_user_profile(123)` → 磁盘写入文件
+2. 用户 B 连接，调用 `load_user_profile(123)` → 磁盘命中，回填内存
+3. 用户 A 断开连接 → `clear_session()` 被调用 → 删除磁盘上 `function_key-*.memo`
+4. 用户 B 刷新页面 → 内存可能还在（如果没过期），正常
+5. 用户 B 过了 TTL 时间后再调用 → 内存 miss → 磁盘也 miss（被 A 删了）→ 重新执行函数
+
+**cache_resource 没有这个问题**，因为它只有内存层：
+```python
+# cache_resource_api.py
+def clear_session(self, session_id):
+    with self._caches_lock:
+        session_caches = self._function_caches.get(session_id)
+        if session_caches is not None:
+            del self._function_caches[session_id]
+    if session_caches is not None:
+        for cache in session_caches.values():
+            cache.clear()  # ResourceCache.clear() 只清内存 TTLCache，没有磁盘层
+```
+
+### 6.12 scope + persist 组合的实际效果矩阵
+
+| 组合 | 内存层隔离 | 磁盘层隔离 | 实际效果 |
+|-----|-----------|-----------|---------|
+| `scope="global"` `persist=None` | 不隔离（共享） | 无磁盘层 | 正常，全局共享 |
+| `scope="global"` `persist="disk"` | 不隔离（共享） | 不隔离（共享） | 正常，全局持久化 |
+| `scope="session"` `persist=None` | ✅ 按 session 隔离 | 无磁盘层 | 正常，会话级内存缓存 |
+| `scope="session"` `persist="disk"` | ✅ 按 session 隔离 | ❌ 完全不隔离 | **有坑！** 磁盘数据跨 session 共享，<br>一个 session 断开会删除所有 session 的磁盘文件 |
+
+**最佳实践**：
+- 需要会话级隔离 + 持久化：不要用 `persist="disk"`，或者自己实现带 session_id 的存储层
+- 可以用 `scope="session"` + `persist=None`（纯内存，安全隔离）
+- 或者用 `scope="global"` + `persist="disk"`（全局共享，没问题）
+- 避免 `scope="session"` + `persist="disk"` 这个组合
+
 ---
 
 ## 七、cache_data vs cache_resource 协作对比总结
@@ -723,6 +907,18 @@ cache_resource:
 
 8. **「函数源码改了，磁盘上的旧缓存文件会自动清理吗？」**  
    ❌ 不会。源码变更会产生新的 function_key，旧 function_key 对应的所有 .memo 文件变成孤儿文件永远留在磁盘上。只有 `st.cache_data.clear()`（它会 rmtree 整个 cache 目录）才能清理掉。
+
+9. **「直接 `python app.py` 运行和 `streamlit run app.py` 运行，缓存行为有区别吗？」**  
+   ✅ 有很大区别。`streamlit run` 会启动 runtime，使用 `LocalDiskCacheStorageManager`，persist="disk" 会真正落盘。直接 `python app.py` 是 raw mode，`runtime.exists()` 返回 False，回退到 `MemoryCacheStorageManager`，持久化层是永远 miss 的 `DummyCacheStorage`，所有缓存只在内存里，重启就丢。
+
+10. **「`scope=\"session\" persist=\"disk\"` 能实现会话级别的持久化隔离吗？」**  
+    ❌ 完全不能。`CacheStorageContext` 没有 session_id 字段，磁盘文件名也不含 session_id，不同 session 用相同参数调用会读写**同一个磁盘文件**。更严重的是，一个 session 断开清理缓存时会删除该 function_key 的**所有**磁盘文件，误伤其他还在连接的 session。
+
+11. **「session A 断开清理缓存，会影响 session B 吗？」**  
+    分情况：`cache_resource` 不会（只有内存层，每个 session 独立）。但 `cache_data(persist="disk")` 会！因为 `LocalDiskCacheStorage.clear()` 删除所有以 function_key 开头的 .memo 文件，不区分 session。session A 断开 → 删磁盘文件 → session B 过会儿内存过期 → 磁盘 miss → 重新计算。
+
+12. **「那 `scope=\"session\"` 到底隔离了什么？」**  
+    只隔离了内存层的 `_function_caches` 字典（key 是 session_id），存储层（不管是内存包装层的 TTLCache 还是磁盘层）是每个缓存实例独立的。但对于 `persist="disk"`，磁盘是共享的，所以隔离不完整。对于 `persist=None`，每个 session 有独立的 `InMemoryCacheStorageWrapper` 实例，持久化层是 DummyCacheStorage，此时隔离是完整的。
 
 ---
 
