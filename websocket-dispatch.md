@@ -651,3 +651,286 @@ AppSession.handle_backmsg(msg)  [业务逻辑层]
    - **uvicorn 层**：TCP、TLS、WebSocket 协议帧解析、心跳管理、事件循环
    - **Starlette 层**：路由、中间件、WebSocket 握手、Origin 校验、`receive_bytes`/`send_bytes` API
    - **业务逻辑层**：Protobuf 编解码、消息分发、会话管理、脚本执行、ForwardMsg 队列
+
+---
+
+## 十、st.App 与外部 ASGI 宿主的 WebSocket 处理边界
+
+### 10.1 四种运行模式
+
+`config._server_mode` 标识 Streamlit 当前的运行模式，决定了 Runtime 生命周期由谁管理：
+
+**关键文件**：[config.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/config.py#L65-L73)
+
+| `_server_mode` | 设置位置 | 含义 | 谁管理 Runtime |
+|-----------------|---------|------|---------------|
+| `"starlette-managed"` | [bootstrap.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/web/bootstrap.py#L379) `run()` | `streamlit run app.py`（传统脚本模式） | `Server` → `UvicornServer` |
+| `"starlette-app"` | [bootstrap.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/web/bootstrap.py#L349) `run_asgi_app()` | `streamlit run app.py`（检测到 `st.App` 实例） | `UvicornRunner` + `st.App._combined_lifespan` |
+| `"asgi-server"` | [starlette_app.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/web/server/starlette/starlette_app.py#L605-L607) | `uvicorn app:app`（独立运行） | `st.App._combined_lifespan` |
+| `"asgi-mounted"` | [starlette_app.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/web/server/starlette/starlette_app.py#L604) / [starlette_app.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/web/server/starlette/starlette_app.py#L765) | 挂载到 FastAPI/Django 等 | 宿主框架 lifespan 或 auto-start |
+
+### 10.2 默认启动流程（传统脚本模式）
+
+```
+streamlit run app.py
+    │
+    ├─ 脚本中无 st.App 实例
+    │
+    ▼
+[bootstrap.py]  run()
+    ├─ config._server_mode = "starlette-managed"
+    ├─ 创建 Server(main_script_path, is_hello)
+    │     └─ Server.__init__: 创建 Runtime（含 WebSocketSessionManager）
+    └─ asyncio.run(run_server())
+          ├─ await server.start()
+          │     └─ UvicornServer(runtime).start()
+          │           ├─ create_starlette_app(runtime)  ← lifespan 管理 Runtime
+          │           └─ uvicorn.Server.main_loop()
+          ├─ _on_server_start(server)  ← 打印 URL、打开浏览器
+          ├─ _set_up_signal_handler(server)  ← SIGTERM/SIGINT
+          └─ await server.stopped
+
+Runtime 生命周期:
+  startup → create_starlette_app 内部 lifespan → await runtime.start()
+  shutdown → create_starlette_app 内部 lifespan → runtime.stop()
+```
+
+**关键点**：Runtime 的 start/stop 由 `create_starlette_app()` 内部的 `_lifespan` 管理，不需要 `st.App` 类参与。
+
+### 10.3 st.App 独立运行（streamlit run 检测到 st.App 实例）
+
+```
+streamlit run app.py  （app.py 中有 app = st.App("main.py")）
+    │
+    ▼
+[cli.py]  检测到 st.App 实例 → 调用 bootstrap.run_asgi_app()
+    │
+    ▼
+[bootstrap.py]  run_asgi_app()
+    ├─ config._server_mode = "starlette-app"
+    └─ UvicornRunner(app_import_string).run()  ← 阻塞式 uvicorn
+          │
+          ▼
+st.App.__call__()  ← ASGI 入口
+    └─ _build_starlette_app()
+          ├─ create_streamlit_routes(runtime)  ← 注册 WebSocket 路由
+          ├─ create_streamlit_middleware()
+          └─ lifespan = _combined_lifespan  ← 内部管理 Runtime start/stop
+
+Runtime 生命周期:
+  startup → _combined_lifespan → await runtime.start()
+  shutdown → _combined_lifespan finally → runtime.stop()
+```
+
+### 10.4 st.App 独立运行（外部 uvicorn 直接启动）
+
+```
+uvicorn app:app  （app = st.App("main.py")）
+    │
+    ▼
+st.App.__call__()  ← ASGI 入口
+    ├─ _build_starlette_app()
+    │     ├─ lifespan = _combined_lifespan  ← 内部管理
+    │     └─ _external_lifespan = False
+    └─ await starlette_app(scope, receive, send)
+
+_combined_lifespan 内部:
+  ├─ config._server_mode is None → 设为 "asgi-server"
+  ├─ prepare_streamlit_environment()
+  └─ await self._runtime.start() / self._runtime.stop()
+```
+
+### 10.5 st.App 挂载到外部框架（FastAPI/Django 等）
+
+这是最复杂的场景，涉及 **lifespan 传递问题** 和 **Runtime 自动启动** 两个关键边界。
+
+#### 场景 A：正确使用 `app.lifespan()`
+
+```python
+from fastapi import FastAPI
+import streamlit as st
+
+streamlit_app = st.App("dashboard.py")
+app = FastAPI(lifespan=streamlit_app.lifespan())
+app.mount("/dashboard", streamlit_app)
+```
+
+```
+FastAPI 启动 → lifespan 协议触发
+    │
+    ▼
+st.App._combined_lifespan()  ← 由 FastAPI 的 lifespan 调用
+    ├─ _external_lifespan = True  ← lifespan() 方法设置
+    ├─ config._server_mode → "asgi-mounted"
+    ├─ prepare_streamlit_environment()
+    ├─ await self._runtime.start()
+    ├─ 执行用户的 user_lifespan（如有）
+    └─ yield → FastAPI 运行 → finally: runtime.stop()
+
+WebSocket 请求到达:
+  FastAPI → Mount("/dashboard") → st.App.__call__()
+    └─ runtime 已经启动 → 直接转发到 _starlette_app
+```
+
+**关键文件**：[starlette_app.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/web/server/starlette/starlette_app.py#L485-L515)
+
+> **注意**：`_build_starlette_app()` 中，当 `_external_lifespan = True` 时，内部 Starlette 应用的 lifespan 设为 `None`，因为生命周期由宿主框架管理。
+
+#### 场景 B：直接 mount，未使用 `app.lifespan()`
+
+```python
+from fastapi import FastAPI
+import streamlit as st
+
+streamlit_app = st.App("dashboard.py")
+app = FastAPI()
+app.mount("/dashboard", streamlit_app)  # 没有传 lifespan
+```
+
+**问题**：ASGI 规范中，`lifespan` 事件只发送给根应用（FastAPI），**不会传递给 mounted 子应用**。因此 Streamlit 的 Runtime 不会通过 lifespan 启动。
+
+**解决方案**：[st.App.__call__()](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/web/server/starlette/starlette_app.py#L691-L726) 中的 **auto-start 机制**：
+
+```python
+async def __call__(self, scope, receive, send):
+    if self._starlette_app is None:
+        self._starlette_app = self._build_starlette_app()
+
+    # 关键：检测 Runtime 未启动，在第一个请求到达时自动启动
+    if (
+        scope["type"] in {"http", "websocket"}
+        and self._runtime is not None
+        and self._runtime.state == RuntimeState.INITIAL
+    ):
+        async with self._startup_lock:  # 防止并发启动
+            if self._runtime.state == RuntimeState.INITIAL and not self._auto_started:
+                await self._auto_start_runtime()
+
+    await self._starlette_app(scope, receive, send)
+```
+
+**auto-start 的行为**：
+1. 设置 `config._server_mode = "asgi-mounted"`
+2. 调用 `prepare_streamlit_environment()`
+3. 调用 `await self._runtime.start()`
+4. 注册 `atexit` 清理回调
+5. 如果用户提供了 `lifespan` 但没用 `app.lifespan()`，输出警告
+
+### 10.6 WebSocket 处理在各运行模式下的差异
+
+| 环节 | `starlette-managed` | `starlette-app` | `asgi-server` | `asgi-mounted` |
+|------|---------------------|-----------------|---------------|----------------|
+| **WebSocket 路由注册** | `create_starlette_app()` 内部 | `st.App._build_starlette_app()` | 同左 | 同左 |
+| **WebSocket 端点处理** | `_websocket_endpoint` 闭包 | 同左 | 同左 | 同左 |
+| **Runtime 生命周期** | Starlette lifespan | `_combined_lifespan` | `_combined_lifespan` | 宿主 lifespan 或 auto-start |
+| **SessionMiddleware** | `create_streamlit_middleware()` | 同左 | 同左 | 同左 |
+| **Cookie 路径** | `/` | `/` | `/` | 可能带 basePath 前缀 |
+| **Origin 校验** | `_is_origin_allowed()` | 同左 | 同左 | 同左（需宿主正确代理 Host/Origin） |
+| **XSRF 校验** | `_parse_subprotocols()` | 同左 | 同左 | 同左 |
+| **Base URL 前缀** | `config.server.baseUrlPath` | 同左 | 同左 | 取决于 mount 路径 |
+
+### 10.7 挂载场景下 WebSocket 的注意事项
+
+1. **路径映射**：挂载到 `/dashboard` 时，WebSocket 路由为 `/dashboard/_stcore/stream`。Streamlit 内部路由通过 `base_url` 配置自动处理，但宿主框架必须正确转发 WebSocket Upgrade 请求到子应用。
+
+2. **Lifespan 不传递**：ASGI 规范中 `lifespan` scope 只发给根应用。`st.App` 通过 `__call__` 中的 auto-start 机制补偿，但用户应优先使用 `app.lifespan()` 显式传递。
+
+3. **Cookie 路径冲突**：挂载到非根路径时，认证 Cookie 需要设置正确的 `path`。[starlette_auth_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/web/server/starlette/starlette_auth_routes.py#L252-L260) 中 `_delete_cookie_at_current_and_legacy_paths()` 负责清理旧 Tornado 遗留的根路径 Cookie。
+
+4. **反向代理**：在宿主框架前面再加 Nginx 等反向代理时，需确保：
+   - WebSocket Upgrade 头正确传递
+   - `Host` / `Origin` 头不被代理覆盖
+   - `X-Forwarded-For` / `X-Forwarded-Proto` 正确设置
+
+---
+
+## 十一、Tornado 历史命名残留分析
+
+### 11.1 代码库中的 Tornado 残留
+
+全局搜索 `tornado` 关键字，仅出现在以下位置（均为注释或兼容性代码，无实际 Tornado 依赖）：
+
+#### (1) Cookie 签名兼容 — `websocket_mask()` 函数
+
+**关键文件**：[starlette_app_utils.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/web/server/starlette/starlette_app_utils.py#L92-L117)
+
+```python
+def websocket_mask(mask: bytes, data: bytes) -> bytes:
+    """Mask or unmask data for WebSocket transmission per RFC 6455."""
+```
+
+**历史背景**：Tornado 使用 `tornado.web.websocket_mask` 对 XSRF token 做 XOR 掩码。Starlette 迁移后，这个函数被复制到 `starlette_app_utils.py` 中保持相同的掩码算法，确保新旧 Cookie 格式兼容。
+
+**使用场景**：
+- `generate_xsrf_token_string()` 生成 V2 XSRF token 时对 token 做 XOR 掩码
+- `decode_xsrf_token_string()` 解码 V2 token 时做反向 XOR
+
+#### (2) XSRF Token V1 兼容
+
+**关键文件**：[starlette_app_utils.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/web/server/starlette/starlette_app_utils.py#L261-L272)
+
+```python
+# V1 tokens:
+# TODO(lukasmasuch): This is likely unused in Streamlit since only V2 tokens
+# are used. We might be able to just remove this part.
+token = binascii.a2b_hex(value.encode("ascii"))
+```
+
+V1 token 是 Tornado 时代的格式（无掩码、无时间戳），当前仍保留解码逻辑以兼容可能的旧 Cookie，但注释标注可能移除。
+
+#### (3) 认证 Cookie 路径迁移
+
+**关键文件**：[starlette_auth_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/web/server/starlette/starlette_auth_routes.py#L262-L304)
+
+```python
+def _delete_legacy_root_auth_cookies(response: Response) -> None:
+    """Delete legacy root-path auth cookies when auth is scoped to a base path."""
+    # Legacy Tornado auth cookies were never chunked, so deleting the base
+    # cookie name at the root path is sufficient here.
+
+def _clear_auth_cookie(response: Response, request: Request) -> None:
+    """Clear the auth cookies...
+    Also delete legacy root-path auth cookies left behind by the
+    pre-Starlette Tornado auth implementation.
+    """
+```
+
+**历史背景**：Tornado 时代认证 Cookie 统一设置在根路径 `/`。Starlette 迁移后，当配置了 `server.baseUrlPath` 时 Cookie 路径变为 `/basePath/`。为避免用户从 Tornado 版本升级后残留旧 Cookie 无法清除，Starlette 版本在设置新 Cookie 时会同时删除根路径的旧 Cookie。
+
+#### (4) 静态文件符号链接 — `follow_symlink`
+
+**关键文件**：[starlette_static_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/web/server/starlette/starlette_static_routes.py#L66-L69)
+
+```python
+# follow_symlink=True restores Tornado parity for Bazel/Nix-style deployments
+# where the static directory may contain or be a symlink.
+super().__init__(directory=directory, html=True, follow_symlink=True)
+```
+
+Tornado 默认跟随符号链接，而 Starlette 的 `StaticFiles` 默认不跟随。此处显式开启以保持行为一致。
+
+#### (5) Issue 引用中的 Tornado
+
+**关键文件**：[product-spec.md](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/specs/2025-12-23-st-app/product-spec.md#L55-L65)
+
+st.App 设计文档中引用了旧 Tornado 时代的 Issue（如 #8661 "Expose Tornado instance"、#9916 "Tornado HTTPServer extra arguments"）。这些 Issue 的需求已被 st.App 的 ASGI 方案替代，不再需要暴露 Tornado 实例。
+
+### 11.2 Cookie 签名机制的 Tornado → Starlette 迁移对照
+
+| 机制 | Tornado 时代 | Starlette 时代 |
+|------|-------------|---------------|
+| **Cookie 签名** | `tornado.web.create_signed_value()` | `itsdangerous.URLSafeTimedSerializer` |
+| **Cookie 验签** | `tornado.web.decode_signed_value()` | `itsdangerous` 反序列化 |
+| **XSRF 生成** | `tornado.web.XSRFTokenHandler` | `generate_xsrf_token_string()` + `websocket_mask()` |
+| **XSRF 验证** | `tornado.web.check_xsrf_cookie()` | `validate_xsrf_token()` + `decode_xsrf_token_string()` |
+| **掩码算法** | `tornado.websocket.websocket_mask` | 本地复制的 `websocket_mask()` |
+| **Cookie 分块** | 不支持 | `set_cookie_with_chunks()` / `get_cookie_with_chunks()` |
+| **Cookie 路径** | 始终 `/` | 基于 `server.baseUrlPath` 动态计算 |
+
+> **核心原因**：Tornado 有自带的签名 Cookie API（`create_signed_value` / `decode_signed_value`），Starlette 没有。迁移时选用 `itsdangerous` 库重新实现，但保留了相同的 XOR 掩码 XSRF token 格式（V2）以保证浏览器中旧 Cookie 仍可验证。
+
+### 11.3 为什么不完全清除 Tornado 残留
+
+1. **Cookie 兼容性**：用户从 Tornado 版本升级后，浏览器中可能仍有旧格式的认证 Cookie 和 XSRF token。如果移除 V1 解码逻辑，这些用户会被强制登出。
+2. **XSRF 掩码格式锁定**：`websocket_mask()` 生成的 V2 token 格式已在前端和后端之间形成协议约定，改变格式会导致所有活跃 WebSocket 连接的 XSRF 验证失败。
+3. **渐进清理**：代码中的 `TODO` 注释表明这些残留计划逐步移除，但需要等待一个合理的时机（如大版本升级）。
