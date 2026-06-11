@@ -160,53 +160,137 @@ private scheduleFlush(fragmentId: string | undefined): void {
 
 ---
 
-#### 跨 fragment 批处理冲突的后果（对局部重跑的影响）
+#### 跨 fragment 批处理冲突：后端四阶段处理与显示不同步
 
-冲突规则总结：**"以第一个到达的 fragmentId 为准，告警后强行合并"**。这在真实场景中可能造成以下影响：
+冲突规则总结：**"以第一个到达的 fragmentId 为准，发出 LOG.warn 告警后强行合并"**。下面以典型场景逐步说明后端的处理链路，以及为什么会出现"值已改、屏未变"的不一致。
 
 ##### 场景示例
 
 假设页面有两个独立的局部 fragment：
-- **Fragment A** (`fragmentId="a-counter"`)：包含 `counter_button`
-- **Fragment B** (`fragmentId="b-form"`)：包含 `name_input`
+- **Fragment A** (`fragmentId="a-counter"`)：包含 `counter_button`（带 `on_click=incr` 回调）
+- **Fragment B** (`fragmentId="b-form"`)：包含 `name_input`（带 `on_change=validate` 回调）
 
-同一 macrotask 内两者的 widget 几乎同时触发（例如：一个 React 合成事件冒泡链中两个组件都触发了 `onChange`，或某段代码同步 `forEach` 多个组件的 `setState`），调用顺序为：
+同一 **JavaScript macrotask**（同一个 React 合成事件回调，或同一段同步 JS）内两者几乎同时触发，调用顺序为：
 ```
 scheduleFlush("a-counter")   ← 第一个到达，scheduledFragmentId = "a-counter"
 scheduleFlush("b-form")      ← 第二个到达，与已存值不同 → 触发 LOG.warn
 ```
 
-##### 实际产生的 BackMsg
+##### 阶段 0：实际产生的 BackMsg（前端发送）
 
-最终发出的 `rerun_script` 消息中：
+最终 `sendUpdateWidgetsMessage()` 发出的**单个** `rerun_script` 消息中：
 ```
-fragment_id = "a-counter"     ← 第一个到达的值
+fragment_id = "a-counter"     ← 用第一个到达者（A 的 fragmentId）
 widget_states = {
-  counter_button: {triggerValue: true},  ← Fragment A 的按钮
-  name_input:    {stringValue: "Bob"}    ← Fragment B 的输入（被"错放"）
+  counter_button: {triggerValue: true},  ← A 的按钮
+  name_input:    {stringValue: "Bob"}    ← B 的输入（"混入"同一个包）
 }
 ```
+注意：两个 widget 的状态都在包里，但 `fragment_id` 只标了一个。
 
-##### 后端实际执行路径
+---
 
-1. **接收阶段**：[AppSession.request_rerun()](file:///d:/fz/0601/solo-dogfeeding/code/213-streamlit/lib/streamlit/runtime/app_session.py#L406-L488) 收到消息
-   - `fragment_id="a-counter"` 被解析后进入 `request_rerun(rerun_data)`
-   - `widget_states` 被整体写入 session_state，**不分 fragment 归属**
+##### 阶段 1：整体接收 —— widget 状态不分归属，全部先写入
 
-2. **排队阶段**：`ScriptRequests.request_rerun(RerunData(fragment_id="a-counter"))`
-   - Fragment 队列：`["a-counter"]`（只有 A，没有 B）
-   - `widget_states` 内两个 widget 的值都被存入 session state
+消息到达后经 [AppSession.request_rerun()](file:///d:/fz/0601/solo-dogfeeding/code/213-streamlit/lib/streamlit/runtime/app_session.py#L406-L488) 构造 `RerunData`，进入 `ScriptRunner._run_script()`，最终在 `code_to_exec()` 闭包内首先执行：
 
-3. **执行阶段**：
-   - 只运行 **Fragment A** 的函数体（因为 fragment_id_queue 只有 `"a-counter"`）
-   - Fragment A 的 delta 被发送，其 widget 刷新
-   - **Fragment B 的函数体不执行**
+```python
+# ScriptRunner._run_script 中的 code_to_exec() 函数体 [L707-L711]
+if rerun_data.widget_states is not None:
+    self._session_state.on_script_will_rerun(rerun_data.widget_states)
+```
 
-4. **最终前端状态**：
-   - ✅ `counter_button` 的触发值被正确应用，Fragment A 重新渲染
-   - ⚠️ `name_input` 的**值已被存入 session_state**（下次任何 rerun 都会带上）
-   - ⚠️ 但 Fragment B 所在的 DOM 容器**没有刷新**（因为 Fragment B 的函数没有重跑）
-   - ⚠️ 可能出现"URL bar 显示了新值/调试工具看到新 state，但 Fragment B 的屏幕内容没刷新"的不一致
+[SessionState.on_script_will_rerun()](file:///d:/fz/0601/solo-dogfeeding/code/213-streamlit/lib/streamlit/runtime/state/session_state.py#L641-L651) 内部三步**不区分 fragment 归属**：
+
+```
+① _reset_triggers()        → 清除所有旧 trigger（按钮等一次性值），为新值腾位置
+② _compact_state()         → 把 _new_widget_state 合并到 _old_state，产生对比基线
+③ set_widgets_from_proto() → 遍历 widget_states 里的每一条，写入 _new_widget_state
+                             ↑ 不看 widget 属于哪个 fragment，全部照单全收
+④ _call_callbacks()        → 对所有"值发生变化"的 widget 调回调
+```
+
+**阶段 1 的关键副作用（对 B 来说已经发生了）**：
+- ✅ `name_input` 的新值 `"Bob"` 已经被永久写入 `_new_widget_state`（即使 B 不是目标 fragment）
+- ✅ 如果 `validate()` 是 `name_input` 的 `on_change` 回调，它**也会被完整调用**
+  - 执行位置：[_call_callbacks()](file:///d:/fz/0601/solo-dogfeeding/code/213-streamlit/lib/streamlit/runtime/state/session_state.py#L653-L692) 遍历所有变化的 widget
+  - fragment 感知：回调在 [_execute_widget_callback()](file:///d:/fz/0601/solo-dogfeeding/code/213-streamlit/lib/streamlit/runtime/state/session_state.py#L720-L735) 中被 `ThreadState.scoped(in_fragment_callback=True)` 临时包裹，上下文标记为"在 B 的 fragment 回调内"（但实际整个 script thread 都在执行）
+  - 所以 B 的回调如果做了 `st.session_state.x = value` 之类的副作用，也已全局生效
+
+---
+
+##### 阶段 2：函数体选择 —— 只按 `fragment_ids_this_run` 执行
+
+回调全部跑完后才真正执行用户代码，此时 [ScriptRunner._run_script()](file:///d:/fz/0601/solo-dogfeeding/code/213-streamlit/lib/streamlit/runtime/scriptrunner/script_runner.py#L613-L800) 做关键分支：
+
+```python
+# [L613-L617]：只从 RerunData.fragment_id 生成队列，B 不在其中
+fragment_ids_this_run = self._fragment_storage.order_fragment_ids(
+    rerun_data.fragment_id_queue    # queue = ["a-counter"]
+)
+
+# [L715-L775]：只遍历队列中的 id，逐个取 wrapped_fragment 执行
+if fragment_ids_this_run:
+    for fragment_id in fragment_ids_this_run:     # 只会遍历 "a-counter"
+        wrapped_fragment = self._fragment_storage.lookup(fragment_id)
+        try:
+            wrapped_fragment()    ← 只执行 A 的函数体，B 完全跳过
+        except Exception:
+            pass   ← 异常已在 fragment 内部渲染，不影响其他
+else:
+    exec(code, module.__dict__)   ← full-app 执行路径（这次不走）
+```
+
+**阶段 2 的关键差异（为什么"只执行 A"）**：
+- `widget_states` 是"整个页面共享"的 session state，所有 widget 一视同仁先写
+- `fragment_ids_this_run` 是"这次要重跑哪些局部"的**调度指令**，由前端传的 `fragment_id` 决定
+- 两者是**独立**的两套机制：写入状态 ≠ 刷新对应区域的渲染
+
+---
+
+##### 阶段 3：stale 判断 —— 非目标 fragment 的 widget state 被故意保留
+
+脚本执行完进入 [SessionState.on_script_finished(widget_ids_this_run)](file:///d:/fz/0601/solo-dogfeeding/code/213-streamlit/lib/streamlit/runtime/state/session_state.py#L866-L946)，这一步**不是"清掉所有没出现过的 widget"**，而是要结合 fragment 语境判断：
+
+```python
+# 实际判断函数 [_is_stale_widget()](file:///d:/fz/0601/solo-dogfeeding/code/213-streamlit/lib/streamlit/runtime/state/session_state.py#L1325-L1339)
+def _is_stale_widget(metadata, active_widget_ids, fragment_ids_this_run):
+    # 一个 widget 只有在以下条件都不满足时才被视为 stale（会被删除）：
+    #   ① id 在本次运行期间真正被访问过（widget_ids_this_run）← A 中出现的 widget
+    #   ② 或者：本次是 fragment 局部重跑，且该 widget 不属于本次的任何目标 fragment
+    #           → B 的 widget 命中此条！保留！
+    return not (
+        metadata.id in active_widget_ids
+        or (fragment_ids_this_run and metadata.fragment_id not in fragment_ids_this_run)
+    )
+```
+
+**对场景的影响**：
+- `counter_button`（A 内）：本次 `wrapped_fragment()` 执行时访问过 → 非 stale → 正常保留
+- `name_input`（B 内）：B 没执行，所以没在 `active_widget_ids` 里出现；但因为它是 fragment 局部重跑，且 B 不在目标 fragment 列表中 → 条件② 命中 → **也被保留**
+- 结果：**两个 widget 的 state 都完好地留在 session 里**，不会因"本轮没跑 B"而被清掉
+
+---
+
+##### 阶段 4：显示不同步的根本原因 —— "值在后端，DOM 未更新"
+
+综合以上三个阶段：
+
+| 层面 | Fragment A（目标） | Fragment B（非目标） |
+|------|--------------------|----------------------|
+| widget state 是否写入 | ✅ 已写入 `_new_widget_state` | ✅ **也已写入**（因为阶段 1 不分归属） |
+| 回调是否执行 | ✅ `incr` 已执行 | ✅ **`validate` 也执行了**（因为阶段 1 遍历所有变化） |
+| 函数体是否执行 | ✅ `wrapped_fragment()` 被调用 | ❌ 完全跳过 |
+| 新 delta 是否产生 | ✅ A 函数体里的所有 `st.foo()` 都 enqueue 了 delta | ❌ 没有任何 delta 产生（函数体没跑） |
+| ForwardMsg 中的 fragment_id | ✅ delta 带 `fragment_id="a-counter"` | ❌ 无 |
+| 前端 DOM 容器是否刷新 | ✅ 浏览器收到对应 fragment 的 delta，重绘 A 的区域 | ❌ **B 的容器收到 0 条 delta**，完全不刷新 |
+
+**最终用户观察到的现象**：
+1. 屏幕上 **A 的计数器数字立即变化**（一切正常）
+2. 屏幕上 **B 的输入框仍显示旧值**（例如仍为空字符串）
+3. 但如果此时打开 Streamlit 调试面板看 `st.session_state`，或任何带 query param binding 的 URL bar，**B 的新值已经存在**
+4. 更隐蔽：B 的 `validate()` 回调如果做了写外部库、发请求、弹 toast 等副作用，这些都已经真实发生了，但用户看不到对应"视觉反馈"
+5. 直到下一次 **full-app rerun**（或用户手动触发 Fragment B 内的任何交互），B 的函数体才会重新执行，此时从 session state 读出 `"Bob"` 并渲染，**旧值会突然"跳"到新值**
 
 ##### 什么情况会触发此冲突？
 
@@ -215,8 +299,9 @@ widget_states = {
 - 在顶层 `useEffect` 中对多个 fragment 的 widget 批量 `setValue`
 - 复杂 React 事件链中，跨 fragment 的组件都在同一个合成事件回调里修改状态
 - 测试脚本使用 Playwright/Cypress 同步地 `fill()` 多个位于不同 fragment 的输入框
+- 一个高阶组件的 `onClick` 回调同时通过回调 props 修改了多个子 fragment 的内部状态
 
-##### 告警信号
+##### 告警信号与修复建议
 
 冲突发生时在浏览器 console 会看到类似日志：
 ```
@@ -225,7 +310,36 @@ a single batch of widget updates. Proceeding with flushing updates using
 fragmentId 'a-counter' for this batch.
 ```
 
-**这是排查"局部重跑没触发"类 bug 的首选信号** —— 如果看到这条 warning，基本可以判定用户交互在同一宏任务内跨多个 fragment 触发了状态变更，需要在组件层面加微任务拆分（`queueMicrotask`/`await 0`）把变更分散到不同 macrotask。
+**这是排查"局部重跑没触发 + 状态与显示不一致"类 bug 的首选信号**。
+
+**修复方式（重要：不要用微任务拆分！）**：
+
+因为 `scheduleFlush` 的批处理是基于 **`setTimeout(fn, 0)` 的 macrotask 排期**的，**同一个 macrotask 内的所有 `scheduleFlush` 调用无论插入多少个微任务都会被合并到同一个 flush**里：
+- ❌ **错误做法**：在组件间加 `queueMicrotask(() => setValue(...))` 或 `await Promise.resolve(0)` —— 这些仍在同一个 macrotask 内，`flushScheduled=true` 已经被设置，后续调用直接 early return，不会产生第二个 flush。
+
+- ✅ **正确做法**：确保跨 fragment 的状态变更分散到**不同的 macrotask**：
+  ```typescript
+  // 正确：Fragment A 的变更在当前 macrotask
+  widgetStateManager.setTriggerValue(idA, true);
+
+  // Fragment B 的变更放到下一个 macrotask
+  setTimeout(() => {
+    widgetStateManager.setStringValue(idB, "Bob");
+  }, 0);
+  ```
+  这样会触发**两次独立的 flush → 两个独立的 BackMsg.rerun_script → 两个独立的 fragment rerun**，每个都带自己正确的 `fragment_id`，A 和 B 的函数体都会被执行，UI 和状态保持一致。
+
+如果是 Playwright/Cypress 测试脚本：
+  ```typescript
+  // ❌ 同步 fill，可能合并
+  await page.locator('#inputA').fill('x')  // 同步
+  await page.locator('#inputB').fill('y')  // 可能在同一 macrotask 链
+
+  // ✅ 插入事件循环边界（中间加一次 force waitForResponse/networkidle 或显式 wait）
+  await page.locator('#inputA').fill('x');
+  await page.waitForResponse('**/stream**');  // 等 A 的这次 stream 响应结束
+  await page.locator('#inputB').fill('y');
+  ```
 
 #### 前端发送 BackMsg
 
