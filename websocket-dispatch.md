@@ -1,10 +1,137 @@
 # Streamlit WebSocket 消息分发完整链路
 
-本文档梳理 Streamlit 中基于 Tornado/Starlette 的 WebSocket 消息分发处理路径，涵盖连接建立、消息编解码、广播分发和前端消费四大环节。
+> **重要澄清**：当前 Streamlit 版本已**完全移除 Tornado**，所有 Web 服务和 WebSocket 处理均基于 **Starlette（Web 框架）+ uvicorn（ASGI 服务器）**。本文档中所有提及 Tornado 的地方均为历史遗留描述，实际技术栈如下所述。
 
 ---
 
-## 一、总体架构概览
+## 一、服务端技术栈澄清
+
+### 1.1 Tornado 的历史与现状
+
+**代码搜索结论**：
+- 代码库中**不存在任何 Tornado 相关 import**（`import tornado` / `from tornado` 等）
+- 不存在 `tornado_websocket.py` 或 `tornado_server.py` 等文件
+- `config.py` 中没有 Tornado 相关配置项（如 `server.backend`）
+- 路径 `lib/streamlit/web/server/` 下仅存在 `starlette/` 子目录，无 `tornado/` 目录
+
+**结论**：Tornado 作为早期 Streamlit 使用的 Web 服务器，已被完整移除，当前代码库 100% 使用 Starlette + uvicorn 技术栈。
+
+### 1.2 当前技术栈分层
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                 Streamlit Runtime / AppSession               │
+│  (WebSocket 消息分发、会话管理、脚本执行、ForwardMsg 队列)     │
+└───────────────────────────────┬──────────────────────────────┘
+                                │
+                                ▼
+┌──────────────────────────────────────────────────────────────┐
+│                     Starlette (Web Framework)                │
+│  - WebSocket 路由注册（WebSocketRoute）                       │
+│  - WebSocket 连接握手（accept/receive_bytes/send_bytes）     │
+│  - HTTP 路由与中间件（认证、Session、GZip、安全检查）          │
+│  - WebSocket 端点处理函数（_websocket_endpoint）              │
+└───────────────────────────────┬──────────────────────────────┘
+                                │
+                                ▼
+┌──────────────────────────────────────────────────────────────┐
+│                      uvicorn (ASGI Server)                   │
+│  - TCP 套接字绑定与监听                                       │
+│  - HTTP/1.1、WebSocket 协议解析（websockets-sansio 实现）    │
+│  - WebSocket 心跳（ping/pong）管理                           │
+│  - 事件循环调度（基于 asyncio）                               │
+│  - SSL/TLS 终止                                              │
+└───────────────────────────────┬──────────────────────────────┘
+                                │
+                                ▼
+                        操作系统 TCP/IP 栈
+```
+
+**关键文件与代码证据**：
+- 服务器启动入口：[server.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/web/server/server.py#L51-L95)
+  ```python
+  # Server.__init__: 不直接创建 Tornado，而是在 start() 中创建 UvicornServer
+  self._starlette_server: UvicornServer | None = None
+  ```
+
+- UvicornServer 包装：[starlette_server.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/web/server/starlette/starlette_server.py#L291-L485)
+  ```python
+  class UvicornServer:
+      async def start(self) -> None:
+          app = create_starlette_app(self._runtime)
+          self._server = uvicorn.Server(uvicorn_config)
+          # 手动绑定 socket，通过 startup(sockets=[socket]) 启动
+  ```
+
+- Starlette 应用创建：[starlette_app.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/web/server/starlette/starlette_app.py#L208-L245)
+  ```python
+  def create_starlette_app(runtime: Runtime) -> Starlette:
+      routes = create_streamlit_routes(runtime)  # 包含 WebSocket 路由
+      middleware = create_streamlit_middleware()
+      return Starlette(routes=routes, middleware=middleware, lifespan=_lifespan)
+  ```
+
+- WebSocket 路由注册：[starlette_websocket.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/web/server/starlette/starlette_websocket.py#L527-L555)
+  ```python
+  def create_websocket_routes(runtime: Runtime, base_url: str | None) -> list[BaseRoute]:
+      return [WebSocketRoute(path, create_websocket_handler(runtime))]
+  ```
+
+### 1.3 各环节框架归属对照表
+
+| 处理环节 | 负责组件 | 框架归属 |
+|---------|---------|---------|
+| **连接接收**（TCP 握手、协议解析） | uvicorn | ASGI 服务器 |
+| **WebSocket 握手**（Upgrade、Origin 校验） | `_websocket_endpoint` | Starlette |
+| **消息接收**（二进制帧接收） | `websocket.receive_bytes()` | Starlette (封装 uvicorn) |
+| **消息解码**（Protobuf ParseFromString） | Streamlit 自定义代码 | 业务逻辑层 |
+| **消息分发**（Runtime -> AppSession） | `Runtime.handle_backmsg()` | 业务逻辑层 |
+| **消息入队**（ForwardMsgQueue） | `AppSession._enqueue_forward_msg()` | 业务逻辑层 |
+| **消息广播**（Runtime flush loop） | `Runtime._loop_coroutine()` | 业务逻辑层 |
+| **消息编码**（Protobuf SerializeToString） | `serialize_forward_msg()` | 业务逻辑层 |
+| **消息发送**（二进制帧发送） | `StarletteSessionClient.write_forward_msg()` | Starlette 桥接层 |
+
+### 1.4 服务端启动完整调用链
+
+```
+streamlit run 命令
+    │
+    ▼
+[cli.py]  main() -> _main_run()
+    │
+    ▼
+[bootstrap.py]  run()  [L362-L428]
+    ├─ 设置 config._server_mode = "starlette-managed"
+    └─ 创建 Server(main_script_path, is_hello)
+        │
+        ▼
+[server.py]  Server.__init__  [L51-L76]
+    └─ 创建 Runtime（包含 WebSocketSessionManager）
+        │
+        ▼
+[bootstrap.py]  run_server() 协程  [L384-L400]
+    └─ await server.start()
+        │
+        ▼
+[server.py]  Server.start()  [L84-L95]
+    └─ self._starlette_server = UvicornServer(self._runtime)
+       await self._starlette_server.start()
+           │
+           ▼
+[starlette_server.py]  UvicornServer.start()  [L329-L473]
+    ├─ create_starlette_app(runtime)  ← 注册所有路由（含 WebSocket）
+    ├─ 手动绑定 TCP socket（支持端口重试、IPv6 双栈）
+    ├─ 创建 uvicorn.Config（配置 ws_protocol, ws_max_size, ping_interval 等）
+    ├─ 创建 uvicorn.Server
+    └─ 启动后台任务 serve_with_signal()
+           │
+           ├─ await server.startup(sockets=[socket])  ← uvicorn 启动
+           └─ await server.main_loop()  ← 进入 uvicorn 事件循环
+```
+
+---
+
+## 二、总体架构概览
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -18,13 +145,19 @@
                                     │ WebSocket (binary protobuf)
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                        Starlette Server                              │
+│                     uvicorn (ASGI Server)                           │
+│  TCP 监听 / TLS / WebSocket 协议帧解析 / 心跳管理                    │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Starlette (Web Framework)                        │
 │  ┌────────────────────┐  ┌───────────────┐  ┌───────────────────┐  │
 │  │_websocket_endpoint │  │StarletteSess..│  │ WebsocketSession..│  │
 │  │ (accept/receive)   │─▶│ write_forward..│─▶│ connect/disconnect │  │
 │  │ receive_bytes      │  │  _sender task  │  │                   │  │
 │  └────────────────────┘  └───────────────┘  └───────────────────┘  │
-└─────────────────────────────────────────────────────────────────────┘
+└───────────────────────────────┬─────────────────────────────────────┘
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -44,9 +177,9 @@
 
 ---
 
-## 二、连接建立链路
+## 三、连接建立链路
 
-### 2.1 前端连接发起
+### 3.1 前端连接发起
 
 前端从 `App` 组件启动，经由 `ConnectionManager` 到 `WebsocketConnection` 建立 WebSocket。
 
@@ -78,26 +211,28 @@ this.websocket = new WebSocket(uri, ["streamlit", ...sessionTokens])
 this.websocket.binaryType = "arraybuffer"
 ```
 
-### 2.2 后端连接接受
+### 3.2 后端连接接受（Starlette 层）
 
 **关键文件：**
-- [starlette_app.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/web/server/starlette/starlette_app.py#L62)
-- [starlette_websocket.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/web/server/starlette/starlette_websocket.py#L359-L555)
+- [starlette_app.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/web/server/starlette/starlette_app.py#L139-L141)
+- [starlette_websocket.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/web/server/starlette/starlette_websocket.py#L359-L524)
 
-路由注册：
-- `create_websocket_routes()` 在 Starlette 应用中注册 WebSocket 路由
-- 路径为 `/{base_url}/_stcore/stream`
+**路由注册过程**：
+1. `create_starlette_app(runtime)` 调用 `create_streamlit_routes(runtime)`
+2. `create_streamlit_routes()` 调用 `create_websocket_routes(runtime, base_url)`
+3. `create_websocket_routes()` 创建 `WebSocketRoute`，路径为 `/{base_url}/_stcore/stream`
+4. `create_websocket_handler(runtime)` 返回闭包 `_websocket_endpoint` 作为处理函数
 
-`_websocket_endpoint` 处理流程：
+**`_websocket_endpoint` 处理流程（Starlette 层）**：
 1. **Origin 校验**：`_is_origin_allowed()` 防止跨站 WebSocket 劫持
 2. **Subprotocol 解析**：`_parse_subprotocols()` 从 `Sec-WebSocket-Protocol` 提取 (streamlit, xsrf_token, existing_session_id)
-3. **接受连接**：`websocket.accept(subprotocol=subprotocol)`
+3. **接受连接**：`websocket.accept(subprotocol=subprotocol)` —— Starlette 封装 uvicorn 完成 WebSocket 握手
 4. **创建 StarletteSessionClient**：包装 WebSocket，提供同步写入接口
 5. **用户认证**：XSRF token 验证 + Cookie 解析 + 可信 Header 提取
 6. **注册会话**：`runtime.connect_session()` → `WebsocketSessionManager.connect_session()`
-7. **进入消息循环**：`while True: websocket.receive_bytes()`
+7. **进入消息循环**：`while True: await websocket.receive_bytes()` —— Starlette 封装 uvicorn 接收二进制帧
 
-### 2.3 会话管理器
+### 3.3 会话管理器
 
 **关键文件：**
 - [websocket_session_manager.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/runtime/websocket_session_manager.py#L59-L169)
@@ -109,9 +244,11 @@ this.websocket.binaryType = "arraybuffer"
 
 ---
 
-## 三、消息编解码（Protobuf）
+## 四、消息编解码（Protobuf）
 
-### 3.1 消息协议定义
+> **框架归属说明**：Protobuf 编解码属于 Streamlit 业务逻辑层，与底层 Web 框架（Starlette/uvicorn）无关。但二进制数据的收发由 Starlette 封装 uvicorn 完成。
+
+### 4.1 消息协议定义
 
 **关键文件：**
 - [ForwardMsg.proto](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/proto/streamlit/proto/ForwardMsg.proto#L36-L160)
@@ -140,7 +277,7 @@ this.websocket.binaryType = "arraybuffer"
 | `file_urls_request` | 文件上传/下载 URL 请求 |
 | `backend_operation_request` | 无脚本重跑的后端操作 |
 
-### 3.2 后端编码
+### 4.2 后端编码（业务逻辑层）
 
 **关键文件：**
 - [runtime_util.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/runtime/runtime_util.py#L72-L96)
@@ -149,20 +286,24 @@ this.websocket.binaryType = "arraybuffer"
 1. 调用 `msg.SerializeToString()` 序列化为二进制
 2. 检查是否超过 `server.maxMessageSize`（默认 200MB）
 3. 若超限，替换为 `MessageSizeError` 异常消息
-4. 返回最终二进制 bytes
+4. 返回最终二进制 bytes → 后续由 Starlette 层的 `send_bytes()` 发送
 
-### 3.3 后端解码
+### 4.3 后端解码（Starlette 层 + 业务逻辑层）
 
 **关键文件：**
-- [starlette_websocket.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/web/server/starlette/starlette_websocket.py#L471-L480)
+- [starlette_websocket.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/web/server/starlette/starlette_websocket.py#L457-L480)
 
-```python
-back_msg = BackMsg()
-back_msg.ParseFromString(data)  # 从二进制解析 BackMsg
-msg_type = back_msg.WhichOneof("type")  # 确定具体消息类型
+```
+uvicorn 接收 WebSocket 二进制帧 → Starlette websocket.receive_bytes() 返回 bytes
+  ▼
+BackMsg.ParseFromString(data)  # 业务逻辑层：从二进制解析 BackMsg
+  ▼
+back_msg.WhichOneof("type")  # 确定具体消息类型
 ```
 
-### 3.4 前端编码
+> **框架边界**：`receive_bytes()` 是 Starlette 对 uvicorn WebSocket 协议解析的封装，`ParseFromString()` 是纯业务逻辑。
+
+### 4.4 前端编码
 
 **关键文件：**
 - [WebsocketConnection.tsx](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/frontend/connection/src/WebsocketConnection.tsx#L665-L679)
@@ -170,17 +311,17 @@ msg_type = back_msg.WhichOneof("type")  # 确定具体消息类型
 ```typescript
 sendMessage(obj: IBackMsg): void {
   const msg = BackMsg.create(obj)
-  const buffer = BackMsg.encode(msg).finish()
+  const buffer = BackMsg.encode(msg).finish()  // Protobuf 编码
   const encodedMessage = new Uint8Array(
     buffer.buffer as ArrayBuffer,
     buffer.byteOffset,
     buffer.byteLength
   )
-  this.websocket.send(encodedMessage)
+  this.websocket.send(encodedMessage)  // 浏览器原生 WebSocket API 发送
 }
 ```
 
-### 3.5 前端解码 & 消息缓存
+### 4.5 前端解码 & 消息缓存
 
 **关键文件：**
 - [WebsocketConnection.tsx](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/frontend/connection/src/WebsocketConnection.tsx#L699-L723)
@@ -212,9 +353,11 @@ ForwardMsgCache 工作原理：
 
 ---
 
-## 四、后端消息广播分发（ForwardMsg 下行链路）
+## 五、后端消息广播分发（ForwardMsg 下行链路）
 
-### 4.1 消息产生：从 DeltaGenerator 到 ForwardMsg
+> **框架归属说明**：消息产生、入队、flush 调度均属于 Streamlit Runtime 业务逻辑层，最终通过 Starlette 桥接层发送到 WebSocket。
+
+### 5.1 消息产生：从 DeltaGenerator 到 ForwardMsg
 
 **关键文件：**
 - [delta_generator.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/delta_generator.py#L473-L572)
@@ -235,7 +378,7 @@ self._enqueue("button", button_proto)  # DeltaGenerator._enqueue
 _enqueue_message(msg)  # from scriptrunner_utils
 ```
 
-### 4.2 ScriptRunContext：Hash 计算与缓存引用
+### 5.2 ScriptRunContext：Hash 计算与缓存引用
 
 **关键文件：**
 - [script_run_context.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/runtime/scriptrunner_utils/script_run_context.py#L312-L327)
@@ -248,7 +391,7 @@ _enqueue_message(msg)  # from scriptrunner_utils
    - 创建引用消息 `create_reference_msg(msg)`，只发送 hash，不发实际内容
 4. 调用 `self._enqueue(msg)` → 实际绑定到 `AppSession._enqueue_forward_msg`
 
-### 4.3 AppSession：入队 ForwardMsgQueue
+### 5.3 AppSession：入队 ForwardMsgQueue
 
 **关键文件：**
 - [app_session.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/runtime/app_session.py#L318-L337)
@@ -266,12 +409,12 @@ _enqueue_message(msg)  # from scriptrunner_utils
   - 如 `st.empty()` → `st.markdown()` 同路径时，跳过前者直接用后者
 - 特殊规则：`add_block` 类型永不合并（避免子节点引用失效）
 
-### 4.4 Runtime 主循环：Flush & Dispatch
+### 5.4 Runtime 主循环：Flush & Dispatch
 
 **关键文件：**
 - [runtime.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/runtime/runtime.py#L624-L699)
 
-Runtime 的 `_loop_coroutine()` 是消息分发的心脏：
+Runtime 的 `_loop_coroutine()` 是消息分发的心脏（运行在 uvicorn 事件循环中）：
 
 ```python
 while not async_objs.must_stop.is_set():
@@ -296,35 +439,35 @@ while not async_objs.must_stop.is_set():
     await asyncio.wait([must_stop.wait(), need_send_data.wait()], ...)
 ```
 
-### 4.5 StarletteSessionClient：同步→异步桥接
+### 5.5 StarletteSessionClient：业务逻辑 → Starlette 桥接
 
 **关键文件：**
 - [starlette_websocket.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/web/server/starlette/starlette_websocket.py#L265-L357)
 
-由于 Runtime 运行在 asyncio 事件循环中，而消息产生可能来自脚本线程，需要桥接：
+> **设计背景**：Runtime 与 WebSocket 连接同属一个 asyncio 事件循环，但为了抽象解耦，通过 `SessionClient` 接口隔离。`StarletteSessionClient` 是该接口的 Starlette 实现。
 
 ```
-Runtime._send_message()
+Runtime._send_message()  [业务逻辑层]
   ▼
-StarletteSessionClient.write_forward_msg(msg)
-  ├─ serialize_forward_msg(msg) → bytes
+StarletteSessionClient.write_forward_msg(msg)  [Starlette 桥接层]
+  ├─ serialize_forward_msg(msg) → bytes  [编码]
   └─ self._send_queue.put_nowait(payload)  # asyncio.Queue（有界）
          │
-         ▼  后台 _sender() 协程
-      await self._websocket.send_bytes(payload)
+         ▼  后台 _sender() 协程（同事件循环）
+      await self._websocket.send_bytes(payload)  [Starlette → uvicorn]
 ```
 
 - `_send_queue` 限制最大积压量（`WEBSOCKET_MAX_SEND_QUEUE_SIZE`），防止客户端消费过慢导致内存泄漏
 - 队列满或 WebSocket 断开时抛出 `SessionClientDisconnectedError`，触发会话断开
 
-### 4.6 ScriptRunner 事件 → ForwardMsg
+### 5.6 ScriptRunner 事件 → ForwardMsg
 
 除了 UI Delta，ScriptRunner 执行状态变化也会产生 ForwardMsg：
 
 **关键文件：**
 - [app_session.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/runtime/app_session.py#L569-L767)
 
-`AppSession._on_scriptrunner_event()` 从脚本线程通过 `call_soon_threadsafe` 切到事件循环线程：
+`AppSession._on_scriptrunner_event()` 从脚本线程通过 `call_soon_threadsafe` 切到 uvicorn 事件循环线程：
 
 | ScriptRunnerEvent | 产生的 ForwardMsg |
 |-------------------|-------------------|
@@ -337,16 +480,16 @@ StarletteSessionClient.write_forward_msg(msg)
 
 ---
 
-## 五、前端消息消费链路
+## 六、前端消息消费链路
 
-### 5.1 ConnectionManager 到 App
+### 6.1 ConnectionManager 到 App
 
 **关键文件：**
 - [ConnectionManager.ts](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/frontend/connection/src/ConnectionManager.ts#L89-L336)
 - [App.tsx](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/frontend/app/src/App.tsx#L968-L1042)
 
 ```
-WebsocketConnection.handleMessage()
+WebsocketConnection.handleMessage()  [浏览器 WebSocket onmessage 事件]
   ├─ ForwardMsg.decode()     // Protobuf 解码
   ├─ ForwardMsgCache 处理    // 缓存 / ref_hash 解引用
   └─ 保序队列 onMessage()
@@ -356,7 +499,7 @@ ConnectionManager.props.onMessage
 App.handleMessage(msgProto)
 ```
 
-### 5.2 App.handleMessage 消息分发
+### 6.2 App.handleMessage 消息分发
 
 **关键文件：**
 - [App.tsx](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/frontend/app/src/App.tsx#L968-L1042)
@@ -376,7 +519,7 @@ App.handleMessage(msgProto)
 | `backendOperationResponse` | `backendOperationClient.onResponse` | 延迟文件下载等后端操作 |
 | `authRedirect` | - | 重定向到认证 URL |
 
-### 5.3 Delta 渲染树更新
+### 6.3 Delta 渲染树更新
 
 `handleDeltaMsg` 将 Delta 应用到 `AppRoot`（不可变渲染树），最终触发 React 重渲染：
 - `delta_path` 定位 UI 树中的节点位置
@@ -384,9 +527,9 @@ App.handleMessage(msgProto)
 
 ---
 
-## 六、前端→后端 BackMsg 上行链路
+## 七、前端→后端 BackMsg 上行链路
 
-### 6.1 触发来源
+### 7.1 触发来源
 
 常见触发场景：
 - 用户点击按钮 / 修改组件值 → `WidgetStateManager.sendRerunBackMsg()`
@@ -394,7 +537,7 @@ App.handleMessage(msgProto)
 - 文件上传 → `FileUploadClient` 请求 URL
 - 心跳定时发送 → `ConnectionManager.onHeartbeatSent()`
 
-### 6.2 编码与发送
+### 7.2 编码与发送
 
 ```
 WidgetStateManager / App 等
@@ -405,25 +548,25 @@ ConnectionManager.sendMessage()
   ▼
 WebsocketConnection.sendMessage()
   ├─ BackMsg.encode(msg).finish()  // Protobuf 编码
-  └─ websocket.send(Uint8Array)    // 二进制发送
+  └─ websocket.send(Uint8Array)    // 浏览器原生 WebSocket API 发送
 ```
 
-### 6.3 后端接收与处理
+### 7.3 后端接收与处理
 
 **关键文件：**
 - [starlette_websocket.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/web/server/starlette/starlette_websocket.py#L455-L510)
 - [app_session.py](file:///d:/fz/0601/solo-dogfeeding/code/215-streamlit/lib/streamlit/runtime/app_session.py#L338-L376)
 
 ```
-websocket.receive_bytes()
+uvicorn 解析 WebSocket 帧 → Starlette websocket.receive_bytes()  [Starlette 层]
   ▼
-BackMsg.ParseFromString(data)
+BackMsg.ParseFromString(data)  [业务逻辑层]
   ▼
 back_msg.WhichOneof("type")  // 确定类型
   ▼
-runtime.handle_backmsg(session_id, back_msg)
+runtime.handle_backmsg(session_id, back_msg)  [业务逻辑层]
   ▼
-AppSession.handle_backmsg(msg)
+AppSession.handle_backmsg(msg)  [业务逻辑层]
 ```
 
 | BackMsg 类型 | AppSession 处理函数 | 效果 |
@@ -439,57 +582,60 @@ AppSession.handle_backmsg(msg)
 
 ---
 
-## 七、完整时序图（以用户点击按钮触发重跑为例）
+## 八、完整时序图（以用户点击按钮触发重跑为例）
+
+> **框架标注**：每条消息链路都明确标注经过的框架层。
 
 ```
-  Browser (Frontend)                          Starlette/Runtime (Backend)
-        │                                               │
-        │  用户点击 st.button                           │
-        │                                               │
-        │ WidgetStateManager.sendRerunBackMsg()         │
-        │   └─ BackMsg{rerun_script: ClientState}       │
-        │                                               │
-        │──── WebSocket binary (BackMsg) ──────────────▶│
-        │                                               │
-        │                                   _websocket_endpoint.receive_bytes()
-        │                                   BackMsg.ParseFromString()
-        │                                   runtime.handle_backmsg()
-        │                                   AppSession.handle_backmsg()
-        │                                     └─ request_rerun(client_state)
-        │                                        ScriptRunner 启动（新线程）
-        │                                               │
-        │                                               │  执行用户脚本
-        │                                               │  st.write(...) → DeltaGenerator._enqueue
-        │                                               │  enqueue_message → ScriptRunContext.enqueue
-        │                                               │    (hash 计算 / ref_hash 优化)
-        │                                               │  AppSession._enqueue_forward_msg()
-        │                                               │    ForwardMsgQueue.enqueue()
-        │                                               │    (消息合并优化)
-        │                                               │  ScriptRunner 事件 → _on_scriptrunner_event
-        │                                               │
-        │                                   Runtime._loop_coroutine():
-        │                                     flush_browser_queue()
-        │                                     for msg: _send_message()
-        │                                               │
-        │◀──── WebSocket binary (ForwardMsg) ──────────│
-        │                                               │
-        │ WebsocketConnection.handleMessage()          │
-        │   ForwardMsg.decode()                        │
-        │   ForwardMsgCache (ref_hash 解引用)          │
-        │   保序队列 → onMessage                       │
-        │                                               │
-        │ App.handleMessage():                          │
-        │   ├─ newSession → 初始化配置                  │
-        │   ├─ delta → AppRoot 增量更新                 │
-        │   └─ script_finished → 标记运行结束           │
-        │                                               │
-        │ React 重渲染 UI                               │
-        ▼                                               ▼
+  Browser (Frontend)         uvicorn/Starlette (Backend)       Runtime (Backend)
+        │                            │                               │
+        │  用户点击 st.button        │                               │
+        │                            │                               │
+        │ WidgetStateManager         │                               │
+        │   sendRerunBackMsg()       │                               │
+        │   BackMsg Protobuf 编码    │                               │
+        │                            │                               │
+        │── WebSocket binary ───────▶│                               │
+        │                            │                               │
+        │                            │ uvicorn 解析 WebSocket 帧     │
+        │                            │ websocket.receive_bytes()     │
+        │                            │ BackMsg.ParseFromString()     │
+        │                            │ runtime.handle_backmsg() ────▶│
+        │                            │                               │ AppSession.handle_backmsg()
+        │                            │                               │ request_rerun()
+        │                            │                               │ ScriptRunner 启动（新线程）
+        │                            │                               │
+        │                            │                               │ 执行用户脚本
+        │                            │                               │ st.write(...) → DeltaGenerator
+        │                            │                               │ ScriptRunContext.enqueue
+        │                            │                               │ AppSession._enqueue_forward_msg
+        │                            │                               │ ForwardMsgQueue.enqueue
+        │                            │                               │
+        │                            │     Runtime._loop_coroutine   │
+        │                            │     flush_browser_queue() ◀───│
+        │                            │     _send_message()            │
+        │                            │                               │
+        │◀── WebSocket binary ──────│  StarletteSessionClient       │
+        │                            │    write_forward_msg()        │
+        │                            │    serialize + send_bytes()   │
+        │                            │                               │
+        │ WebsocketConnection        │                               │
+        │   handleMessage()          │                               │
+        │   ForwardMsg.decode()      │                               │
+        │   ForwardMsgCache          │                               │
+        │   保序派发                 │                               │
+        │                            │                               │
+        │ App.handleMessage()        │                               │
+        │   dispatchProto            │                               │
+        │   Delta 更新 AppRoot        │                               │
+        │                            │                               │
+        │ React 重渲染 UI            │                               │
+        ▼                            ▼                               ▼
 ```
 
 ---
 
-## 八、关键设计要点
+## 九、关键设计要点
 
 1. **全双工二进制协议**：严格使用 WebSocket binary frame + Protobuf，拒绝 text frame
 2. **Subprotocol 复用**：利用 `Sec-WebSocket-Protocol` 传递 XSRF token 和 session ID（浏览器 API 限制）
@@ -499,5 +645,9 @@ AppSession.handle_backmsg(msg)
    - 后端 `ForwardMsgQueue` 合并同 `delta_path` 的冗余 Delta
    - 前后端 `ref_hash` 机制避免重复发送相同内容
 6. **背压保护**：发送队列有界，客户端消费过慢会触发断开
-7. **线程安全**：ScriptRunner 线程通过 `event_loop.call_soon_threadsafe()` 切回事件循环操作 AppSession
+7. **线程安全**：ScriptRunner 线程通过 `event_loop.call_soon_threadsafe()` 切回 uvicorn 事件循环操作 AppSession
 8. **会话生命周期**：区分 active（WebSocket 已连接）和 inactive（断开暂存于 SessionStorage），支持短时间重连恢复
+9. **框架分层清晰**：
+   - **uvicorn 层**：TCP、TLS、WebSocket 协议帧解析、心跳管理、事件循环
+   - **Starlette 层**：路由、中间件、WebSocket 握手、Origin 校验、`receive_bytes`/`send_bytes` API
+   - **业务逻辑层**：Protobuf 编解码、消息分发、会话管理、脚本执行、ForwardMsg 队列
