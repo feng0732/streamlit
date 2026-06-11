@@ -115,6 +115,243 @@ if dg and not ignore_command_kwargs:
 
 ---
 
+## 二-B、页面归属过滤的关键前提：script_hash 的来源与传递
+
+### 2B.1 为什么需要 script_hash
+
+页面归属过滤（populate_from_query_string）能够按页面保留/过滤 URL 参数的核心前提是：**每个绑定 widget 在注册时都携带了它所属页面的 script_hash**。这个 hash 是后续判断"这个参数属于哪个页面"的唯一依据。
+
+### 2B.2 script_hash 的完整传递链路
+
+```
+ThreadState.active_script_hash
+    ↑ 设置时机
+    │
+    ├─ 初始值：ScriptRunContext.reset()         [script_run_context.py#L274-L276]
+    │   ThreadState.initialize(
+    │       active_script_hash=pages_manager.main_script_hash
+    │   )
+    │
+    ├─ MPA v2 (pages 目录)：Page.run()          [page.py#L484-L490]
+    │   with ctx.run_with_active_hash(self._script_hash):
+    │       exec(code, module.__dict__)
+    │       # 执行期间 ThreadState.active_script_hash = 当前页面的 hash
+    │
+    └─ Fragment：fragment 包装函数执行时        [fragment.py#L405-L409]
+        ctx.run_with_active_hash(initialized_active_script_hash)
+        # 恢复 fragment 定义时捕获的 hash，保证跨 rerun 一致性
+```
+
+**各设置点详解**：
+
+1. **reset() 初始化**：每次脚本运行开始时，`ThreadState.active_script_hash` 先设为 `main_script_hash`（主入口脚本的 hash）。这是 SPA 和主区域默认值。
+
+2. **Page.run() 中切换**：MPA v2 架构下，当 `st.Page("foo.py").run()` 被调用时，通过 `run_with_active_hash` 临时切换为该页面对应的 `_script_hash`：
+   ```python
+   @property
+   def _script_hash(self) -> str:
+       return calc_hash(self._url_path)  # 根据页面 URL 路径生成哈希
+   ```
+
+3. **Fragment 执行时固定**：Fragment 在第一次定义时捕获当前的 `active_script_hash`，后续每次重跑都通过 `run_with_active_hash` 恢复该值，保证 widget ID 稳定（不受 fragment rerun 时页面变化影响）。
+
+### 2B.3 widget 注册时的 script_hash 捕获
+
+**代码位置**：[_handle_query_param_binding](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/session_state.py#L1126-L1133)
+
+```python
+def _handle_query_param_binding(self, metadata, user_key, widget_id):
+    ctx = get_script_run_ctx()
+    script_hash = ThreadState.get().active_script_hash if ctx is not None else ""
+    self.query_params.bind_widget(
+        param_key=user_key,
+        widget_id=widget_id,
+        value_type=metadata.value_type,
+        script_hash=script_hash,   # ← 关键：此时 ThreadState 正处于页面上下文
+    )
+```
+
+**关键时序**：`bind_widget` 发生在 widget `register_widget` 调用链中，而 `register_widget` 是用户代码执行 `st.text_input(...)` 时同步调用的。因此 ThreadState 中的 `active_script_hash` **恰好就是该 widget 所属页面的 hash**。
+
+| 场景 | ThreadState.active_script_hash 此时的值 |
+|------|----------------------------------------|
+| 主区域 widget（非 Page） | main_script_hash |
+| `st.Page("page1.py")` 内的 widget | page1 的 _script_hash（calc_hash(url_path)） |
+| Fragment 内的 widget | Fragment 定义时捕获的 hash |
+
+### 2B.4 ID 命名空间中的 active_script_hash
+
+**代码位置**：[compute_and_register_element_id](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/elements/lib/utils.py#L249-L257)
+
+```python
+kwargs_to_use["active_script_hash"] = ThreadState.get().active_script_hash
+if dg and not ignore_command_kwargs:
+    kwargs_to_use["form_id"] = current_form_id(dg)
+    kwargs_to_use["active_dg_root_container"] = dg._active_dg._root_container
+```
+
+`active_script_hash` 是 widget ID 哈希计算的**必选输入**（即使 `ignore_command_kwargs=True` 也始终包含），这保证了：
+- 不同页面的相同 widget → ID 不同 → 不会产生 ID 冲突
+- 同一页面的相同 widget → ID 稳定 → 跨 rerun 能找到历史值
+
+### 2B.5 script_hash 对页面归属过滤的影响
+
+回到页面切换时的过滤逻辑：
+```python
+valid_script_hashes = {main_script_hash, page_script_hash}
+if binding.script_hash not in valid_script_hashes:
+    # 过滤掉 + 清理 binding
+```
+
+由于 binding 中的 `script_hash` 是 widget 注册时从 ThreadState 捕获的，所以：
+- 主页面 widget 的 binding → `script_hash = main_script_hash`
+- 新页面 widget 的 binding → `script_hash = page_script_hash`
+- 旧页面 widget 的 binding → `script_hash = 旧页面的 _script_hash`（不在 valid 集合中，被过滤）
+
+**前提条件总结**：`populate_from_query_string` 的页面归属过滤**只有在 widget 曾经在对应页面执行过并注册了 binding 之后**才生效。如果跳转的新页面是首次加载（还没有任何 widget 执行），则 `_bindings_by_param` 中还没有该页面的 binding，过滤逻辑无法识别哪些参数属于这个新页面——此时所有有绑定的参数都会被当作"其他页面的参数"过滤掉。
+
+---
+
+## 四-B、key="None" 字符串与 key=None 的差异及其影响
+
+### 4B.1 两种写法的差异产生点
+
+**代码位置**：[to_key](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/elements/lib/utils.py#L109-L110)
+
+```python
+def to_key(key: Key | None) -> str | None:
+    return None if key is None else str(key)
+```
+
+**代码位置**：[check_widget_policies](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/elements/lib/policies.py#L185-L186)
+
+```python
+if key is not None:
+    require_valid_user_key(key)
+```
+
+| 写法 | to_key 转换结果 | require_valid_user_key 是否执行 |
+|------|-----------------|--------------------------------|
+| 不写 key 参数 | `None` | ❌ 不执行 |
+| `key=None` | `None` | ❌ 不执行 |
+| `key="None"` | `"None"`（字符串） | ✅ 执行（校验通过） |
+| `key=""` | `""`（空串） | ✅ 执行（抛异常：key must be non-empty） |
+
+### 4B.2 ID 生成中的差异
+
+**代码位置**：[_compute_element_id](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/elements/lib/utils.py#L149-L178)
+
+```python
+def _compute_element_id(element_type, user_key=None, **kwargs):
+    h = util.create_fast_hasher()
+    h.update(element_type.encode("utf-8"))
+    if user_key:                        # ← Python 真值判断
+        h.update(user_key.encode("utf-8"))
+    for k, v in kwargs.items():
+        h.update(str(k).encode("utf-8"))
+        h.update(str(v).encode("utf-8"))
+    return f"$$ID-{h.hexdigest()}-{user_key}"
+```
+
+**两个关键点**：
+1. `if user_key:` 是 Python 真值判断。`None` 为假，空字符串 `""` 为假，**`"None"` 字符串为真**
+2. 后缀是直接 `f"-{user_key}"`，Python 的 f-string 会把 `None` 转为字符串 `"None"`
+
+| user_key | `if user_key:` 结果 | hash 中是否包含 user_key | 最终 ID 后缀 |
+|----------|-------------------|-------------------------|-------------|
+| `None` | False | ❌ 不包含 | `-None` |
+| `"None"`（字符串） | True | ✅ 包含（字节串） | `-None` |
+| `"mykey"` | True | ✅ 包含 | `-mykey` |
+
+**重要发现**：`key=None` 和 `key="None"` 产生的 ID **格式完全相同**（都是 `$$ID-<hash>-None`），但 hash 内容不同！因为 `"None"` 字符串参与了哈希计算而 `None` 没有。所以它们的 ID 实际上是**不同的**。
+
+### 4B.3 ID 解析中的混淆 bug
+
+**代码位置**：[user_key_from_element_id](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/common.py#L225-L234)
+
+```python
+def user_key_from_element_id(element_id: str) -> str | None:
+    user_key: str | None = element_id.split("-", maxsplit=2)[-1]
+    return None if user_key == "None" else user_key
+```
+
+这个函数**无法区分**：
+- `key=None` 产生的 ID：`$$ID-hash1-None` → 解析为 `None` ✅ 正确
+- `key="None"` 产生的 ID：`$$ID-hash2-None` → 解析为 `None` ❌ 错误！应该返回 `"None"`
+
+#### bug 连锁影响 1：去重检测失效
+
+**代码位置**：[_register_element_id](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/elements/lib/utils.py#L113-L146)
+
+```python
+def _register_element_id(ctx, element_type, element_id) -> None:
+    user_key = user_key_from_element_id(element_id)
+    if user_key and not ctx.widget_user_keys_this_run.check_and_add(user_key):
+        raise StreamlitDuplicateElementKey(user_key)
+    if not ctx.widget_ids_this_run.check_and_add(element_id):
+        raise StreamlitDuplicateElementId(element_type)
+```
+
+对于 `key="None"` 的 widget：
+- `user_key_from_element_id` 返回的是 `None`（而不是字符串 `"None"`）
+- 所以 `if user_key:` 条件为假，**跳过了 user_key 去重检测**
+- 但 widget_id 仍然不同（hash 不同），所以 element_id 检测不会抛异常
+- 实际后果：`key="None"` 的 widget 表现得**完全像没有 user_key**，只是 ID hash 略有不同
+
+#### bug 连锁影响 2：query params 绑定异常
+
+**代码位置**：[register_widget](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/session_state.py#L1012-L1033)
+
+```python
+if user_key is not None:
+    self._set_key_widget_mapping(widget_id, user_key)
+
+if metadata.bind == "query-params" and user_key is not None:
+    url_value_seeded = self._handle_query_param_binding(...)
+elif metadata.bind is None and user_key is not None:
+    self._query_param_bound_widget_ids.discard(widget_id)
+    self.query_params.unbind_and_clear_param(widget_id)
+```
+
+对于 `key="None"` 的 widget：
+- `register_widget` 收到的 `user_key` 是**来自调用方传的参数**（即通过 `to_key` 转换后的值），不是通过 `user_key_from_element_id` 解析的
+- `to_key("None")` 返回的是字符串 `"None"`，**而不是 Python None**
+- 所以 `user_key is not None` → True → **会正常建立 key↔id 映射和 query params 绑定**
+- 绑定到 URL 的参数名是 `None`（字符串，即 `?None=xxx`）
+
+但在 `_remove_stale_widgets` 的 bound_preserved 阶段：
+```python
+bound_preserved[user_key] = self._getitem(key, user_key)
+# ...
+self._old_state.update(bound_preserved)
+```
+这里 user_key 是通过 `wid_key_map[key]` 取出来的，是注册时传入的正确值。
+
+而在解析 element_id 时（例如在其他需要反向推导 user_key 的场景），`user_key_from_element_id("$$ID-xxx-None")` 返回 None，可能导致某些代码路径判断"该 widget 没有 user_key"而跳过绑定值处理。
+
+### 4B.4 去重与参数绑定影响汇总表
+
+| 场景 | `key=None` (Python None) | `key="None"` (字符串) |
+|------|-------------------------|----------------------|
+| **ID 生成** | hash 不含 user_key，后缀 `-None` | hash 含 `"None"` 字符串，后缀 `-None` |
+| **widget_id 是否相同** | 不同 | 不同（因为 hash 输入不同） |
+| **user_key 去重检测** | 跳过（`user_key=None`，if 条件假） | ❌ 被跳过！（因为 `user_key_from_element_id` 误解析为 `None`） |
+| **key↔id 映射建立** | ❌ 不建立（register_widget 收到 `user_key=None`） | ✅ 建立（register_widget 收到 `user_key="None"`） |
+| **bind="query-params"** | ❌ 不允许（`user_key is None`） | ✅ 允许，参数名 `"None"` |
+| **bound_preserved 保留** | ❌ 不保留 | ✅ 保留（通过 `wid_key_map` 取到正确 user_key） |
+| **session_state 访问** | 只能通过 widget_id | 可通过 `st.session_state["None"]` 访问 |
+| **user_key_from_element_id 解析** | 返回 `None` ✅ 正确 | 返回 `None` ❌ 错误 |
+
+### 4B.5 核心结论
+
+1. **页面归属过滤的正确性依赖于 widget 注册时的 ThreadState.active_script_hash**。这个值通过三层机制（reset 初始化 → Page.run() 切换 → Fragment 固定）保证在 widget 执行 `register_widget` 时恰好是其所属页面的 hash，从而使 binding 中的 script_hash 正确。
+
+2. **`key="None"` 是一个边缘缺陷场景**：虽然 `to_key` 层能正确保留字符串，但 `user_key_from_element_id` 的解析逻辑会把它混淆为 `key=None`，导致 user_key 去重检测被跳过。不过由于 register_widget 接收的 user_key 来自调用参数而非 element_id 反向解析，所以 key↔id 映射、query params 绑定等功能仍然正常工作——只有 `_register_element_id` 内的 user_key 去重检测会漏掉。
+
+3. **`key=""` 与 `key=None` 有本质区别**：`key=""` 会触发 `require_valid_user_key` 直接抛异常，而 `key=None` 是合法的"无自定义 key"状态。
+
+---
+
 ## 四、重复检测 (Duplicate Detection)
 
 ### 4.1 检测机制：_register_element_id
@@ -742,35 +979,45 @@ with st.form("my_form"):
 
 ---
 
-## 八、关键代码索引表
+## 十、关键代码索引表
 
 | 功能模块 | 文件 | 行号 |
 |---------|------|------|
 | ID 计算入口 | [utils.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/elements/lib/utils.py) | L181-L262 |
 | 核心哈希算法 | [utils.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/elements/lib/utils.py) | L149-L178 |
-| 重复检测逻辑 | [utils.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/elements/lib/utils.py) | L113-L146 |
 | user_key 类型转换 (to_key) | [utils.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/elements/lib/utils.py) | L109-L110 |
+| 重复检测逻辑 | [utils.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/elements/lib/utils.py) | L113-L146 |
+| widget policy 校验 (key 合法性) | [policies.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/elements/lib/policies.py) | L185-L186 |
 | 原子检测集合 | [thread_safe_set.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/scriptrunner_utils/thread_safe_set.py) | L39-L44 |
-| 上下文重置（清空集合） | [script_run_context.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/scriptrunner_utils/script_run_context.py) | L268-L270 |
+| ThreadState.active_script_hash 字段定义 | [script_run_context.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/scriptrunner_utils/script_run_context.py) | L84 |
+| ThreadState 类定义 (ContextVar 封装) | [script_run_context.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/scriptrunner_utils/script_run_context.py) | L116-L174 |
+| reset() 中 hash 初始化 | [script_run_context.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/scriptrunner_utils/script_run_context.py) | L274-L276 |
+| run_with_active_hash 上下文 | [script_run_context.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/scriptrunner_utils/script_run_context.py) | L241-L243 |
 | 同页 rerun URL 参数填充 | [script_run_context.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/scriptrunner_utils/script_run_context.py) | L297-L307 |
+| 清空检测集合 | [script_run_context.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/scriptrunner_utils/script_run_context.py) | L268-L270 |
+| MPA Page.run() 中切换 active_hash | [page.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/navigation/page.py) | L484-L490 |
+| Page._script_hash 计算 | [page.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/navigation/page.py) | L497-L498 |
+| Fragment 执行时固定 active_hash | [fragment.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/fragment.py) | L405-L409 |
 | user_key 重复异常 | [errors.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/errors.py) | L141-L151 |
 | element_id 重复异常 | [errors.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/errors.py) | L125-L138 |
 | ID 解析辅助函数 | [common.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/common.py) | L225-L246 |
 | user_key 合法性校验 | [common.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/common.py) | L249-L256 |
+| widget 注册时 script_hash 捕获 | [session_state.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/session_state.py) | L1126-L1133 |
 | 绑定值保留（_remove_stale_widgets） | [session_state.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/session_state.py) | L906-L972 |
 | Widget 注册与 URL 回写 | [session_state.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/session_state.py) | L998-L1109 |
 | 查询参数绑定优先级 | [session_state.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/session_state.py) | L1111-L1146 |
 | URL 播种与自动校正 | [session_state.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/session_state.py) | L1148-L1251 |
 | Widget 过期判定核心 | [session_state.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/session_state.py) | L1325-L1339 |
 | WStates 过期 widget 清理 | [session_state.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/session_state.py) | L248-L262 |
-| 绑定关系注册与清理 | [query_params.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/query_params.py) | L465-L548 |
+| 绑定关系注册 bind_widget | [query_params.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/query_params.py) | L465-L513 |
+| 绑定关系解除 unbind_widget | [query_params.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/query_params.py) | L515-L526 |
 | MPA 页面切换参数过滤 | [query_params.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/query_params.py) | L723-L777 |
 | 过期绑定清理（含 fragment 保留） | [query_params.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/query_params.py) | L779-L830 |
 | MPA 页面切换前置过滤调用 | [script_runner.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/scriptrunner/script_runner.py) | L595-L608 |
 
 ---
 
-## 九、设计权衡总结
+## 十一、设计权衡总结
 
 | 设计决策 | 优点 | 缺点 |
 |---------|------|------|
@@ -785,3 +1032,6 @@ with st.form("my_form"):
 | _is_stale_widget 双条件判定 | fragment 局部重跑时只清理相关 widget | 逻辑取反嵌套，可读性稍差 |
 | MPA 参数按 script_hash 过滤 | 页面参数天然隔离，防止跨页污染 | 过滤时机早于正常清理，时序需精确控制 |
 | user_key=None 特殊后缀 | 无需额外字段即可表示"无用户 key" | 与字面字符串 "None" 冲突，存在已知缺陷 |
+| ThreadState ContextVar 传 active_hash | 三层机制保证 widget 注册时 hash 正确 | 调用链较长，理解时需追溯多个上下文切换点 |
+| widget 注册时同步捕获 script_hash | 时序天然正确，无需额外传参 | 依赖 ThreadState 隐式上下文，出错难以排查 |
+| 双路径 user_key（调用参数 vs ID 反向解析） | 注册路径不依赖解析，绑定功能受 bug 影响小 | 两者不一致时产生边缘缺陷（key="None" 去重失效） |
