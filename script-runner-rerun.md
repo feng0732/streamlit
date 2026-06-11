@@ -214,8 +214,94 @@ if rerun_data.widget_states is not None:
 - ✅ `name_input` 的新值 `"Bob"` 已经被永久写入 `_new_widget_state`（即使 B 不是目标 fragment）
 - ✅ 如果 `validate()` 是 `name_input` 的 `on_change` 回调，它**也会被完整调用**
   - 执行位置：[_call_callbacks()](file:///d:/fz/0601/solo-dogfeeding/code/213-streamlit/lib/streamlit/runtime/state/session_state.py#L653-L692) 遍历所有变化的 widget
-  - fragment 感知：回调在 [_execute_widget_callback()](file:///d:/fz/0601/solo-dogfeeding/code/213-streamlit/lib/streamlit/runtime/state/session_state.py#L720-L735) 中被 `ThreadState.scoped(in_fragment_callback=True)` 临时包裹，上下文标记为"在 B 的 fragment 回调内"（但实际整个 script thread 都在执行）
-  - 所以 B 的回调如果做了 `st.session_state.x = value` 之类的副作用，也已全局生效
+  - fragment 感知：回调在 [_execute_widget_callback()](file:///d:/fz/0601/solo-dogfeeding/code/213-streamlit/lib/streamlit/runtime/state/session_state.py#L693-L735) 中被 `ThreadState.scoped(in_fragment_callback=True)` 临时包裹
+  - ⚠️ 注意：**只设置了 `in_fragment_callback=True`，没有设置 `fragment_id`**！
+  - 所以 `ThreadState.get().fragment_id is None` → 回调内产生的 delta **没有** fragment 归属标签
+  - B 的回调如果做了 `st.session_state.x = value` 之类的副作用，也已全局生效
+
+---
+
+###### 阶段 1.5：回调输出边界 —— st.toast / st.error / st.write 会不会直接显示？
+
+这是最容易误解的点。答案是：**会产生消息，但行为和位置都不对**。以下结合代码逐层说明：
+
+**回调执行时的 ThreadState 快照**：
+
+| 字段 | 值 | 原因 |
+|------|---|------|
+| `active_script_hash` | `main.py` 的哈希 | `ctx.reset()` 时 `ThreadState.initialize()` 设置 |
+| `fragment_id` | **`None`** | `_execute_widget_callback` 只设置了 `in_fragment_callback`，没有设置 `fragment_id` |
+| `in_fragment_callback` | `True` | `ThreadState.scoped(in_fragment_callback=True)` 临时注入 |
+| `delta_path` | `None` | reset 后还没进入任何 fragment 执行 |
+| `is_parallel_worker` | `False` | 主线程执行 |
+
+**`st.toast()` / `st.error()` / `st.write()` 的调用链**：
+
+```
+用户回调中调用 st.error("Invalid name")
+        │
+        ▼
+DeltaGenerator._enqueue("alert", alert_proto)
+        │
+        ├─ ① 检查：_maybe_print_fragment_callback_warning()
+        │   → 检测到 in_fragment_callback=True
+        │   → 发出 CLI 警告："displaying elements is not officially supported
+        │      because those elements will replace the existing elements
+        │      at the top of your app."
+        │
+        ├─ ② 构造 ForwardMsg
+        │   msg.delta.new_element.alert = alert_proto
+        │   msg.metadata.delta_path = dg._cursor.delta_path
+        │   ← 此时 cursor 是 reset 后的初始值，路径指向页面顶部
+        │
+        └─ ③ enqueue_message(msg)
+            │
+            ├─ 读取 ts.fragment_id → 是 None
+            ├─ 因此 msg.delta.fragment_id 保持为空（不打标签）
+            │  [enqueue_message() 中代码：](file:///d:/fz/0601/solo-dogfeeding/code/213-streamlit/lib/streamlit/runtime/scriptrunner_utils/script_run_context.py#L474-L479)
+            │  if ts.fragment_id and msg.WhichOneof("type") == "delta":
+            │      msg.delta.fragment_id = ts.fragment_id
+            │
+            └─ ctx.enqueue(msg) → 进入 ForwardMsgQueue
+```
+
+**关键结论：回调产生的 delta 有三个特征**：
+1. ✅ **会被正常发送到前端** —— 它们进入 ForwardMsgQueue，随这次 script run 的所有消息一起 flush
+2. ❌ **没有 fragment_id 标签** —— 前端会把它们当作 full-app 的全局 delta
+3. ❌ **delta_path 指向页面顶部** —— 因为回调在 `wrapped_fragment()` 之前执行，cursor 还没恢复到 fragment 的位置
+
+---
+
+**各类回调输出的实际表现（按 API 分）**：
+
+| API | 类型 | 是否产生消息 | 显示位置 | 效果 |
+|-----|------|-------------|---------|------|
+| `st.toast()` | 全局通知 | ✅ 产生 toast delta | 页面右上角（全局） | **正常显示** ✅ —— toast 本来就是全局的，不依赖 fragment 容器 |
+| `st.error()` / `st.warning()` / `st.info()` / `st.success()` | Alert 元素 | ✅ 产生 alert delta | **页面顶部**（替换顶部元素） | **位置错乱** ❌ —— 本该在 Fragment B 内显示，结果跑到了页面最顶端 |
+| `st.write()` / `st.markdown()` / `st.dataframe()` 等 | 内容元素 | ✅ 产生对应 delta | **页面顶部**（替换/追加） | **位置错乱** ❌ —— 写出的内容出现在错误的位置 |
+| `st.rerun()` | 控制流 | — | — | 被捕获为 `RerunException`，转为 `st.warning("Calling st.rerun() within a callback is a no-op.")` 警告，写在顶部 |
+| `st.sidebar.write()` | 侧边栏 | ✅ 产生 delta | 侧边栏 | 正常？但 fragment 内写 sidebar 本来就报错，见 `_enqueue` 中的检查 |
+
+---
+
+**哪些显示内容必须等目标 fragment 函数体重跑？**
+
+答案：**所有需要出现在正确 fragment 容器内的显示内容**，都必须等 `wrapped_fragment()` 执行。原因是：
+
+只有在 `wrapped_fragment()` 内部，才会同时满足两个条件：
+1. `ThreadState.scoped(fragment_id=fragment_id)` → delta 打上正确的 `fragment_id` 标签
+2. `ctx.cursors = deepcopy(cursors_snapshot)` + `context_dg_stack.set(deepcopy(dg_stack_snapshot))` → cursor/路径恢复到该 fragment 声明时的位置，delta_path 正确指向 fragment 容器内
+
+这两个条件缺一不可：
+- 只有 fragment_id 但路径不对 → 前端收到带 fragment_id 的 delta 但找不到对应位置
+- 只有路径对但没 fragment_id → 前端当作全局 delta，不会局部刷新
+
+**只有目标 fragment 函数体内的输出才能正确地**：
+- 被打上 `fragment_id="a-counter"` 标签
+- 具有正确的 delta_path（指向 Fragment A 的容器内部）
+- 前端收到后精准更新 Fragment A 的 DOM 容器
+
+非目标 fragment 的函数体根本不执行（阶段 2），所以它们内部的任何显示内容都不会更新。
 
 ---
 
@@ -367,24 +453,40 @@ useUpdateUiValue(value, uiValue, setUiValue, dirty)
 | widget state 是否写入 | ✅ 已写入 | ✅ **也已写入** | ✅ **也已写入** | （不涉及 widget） |
 | 回调是否执行 | ✅ `incr` 已执行 | ✅ **`validate` 也执行了** | ✅ 回调也执行 | （不涉及回调） |
 | 函数体是否执行 | ✅ `wrapped_fragment()` | ❌ 完全跳过 | ❌ 完全跳过 | ❌ 完全跳过 |
-| 新 delta 是否产生 | ✅ 所有 `st.foo()` | ❌ 0 条 | ❌ 0 条 | ❌ 0 条 |
+| 新 delta 是否产生 | ✅ 所有 `st.foo()` 带 fragment_id 标签 | ⚠️ **只有回调里的**（无 fragment_id、路径错） | ⚠️ **只有回调里的**（无 fragment_id、路径错） | ❌ 0 条 |
 | 控件自身显示 | ✅ 正常 | ✅ **显示新输入值**（本地 uiValue 驱动） | ✅ **显示勾选状态**（本地 value 驱动） | ❌ **仍显示旧内容** |
-| 后端派生内容（toast/提示/图表） | ✅ 全部显示 | ❌ **不显示** | ❌ **不显示** | ❌ **不显示** |
+| 回调中的 `st.toast()` | ✅ 正常显示（全局） | ✅ **也会显示**（toast 是全局的，不需要 fragment 容器） | ✅ **也会显示** | （不涉及） |
+| 回调中的 `st.error()` / `st.success()` | ✅ 正常显示在 A 内 | ❌ **显示在页面顶部**（位置错乱，不在 B 容器内） | ❌ **显示在页面顶部** | （不涉及） |
+| 函数体内的派生内容（提示/图表/业务展示） | ✅ 全部正确显示 | ❌ **不更新**（函数体没跑） | ❌ **不更新**（函数体没跑） | ❌ **不更新** |
 | `st.session_state` 调试面板 | ✅ 一致 | ✅ 值已更新 | ✅ 值已更新 | ✅ 值已更新 |
+
+> **关键澄清**：
+> - 回调内的 `st.toast()` **会显示**，因为 toast 是全局浮动通知，不依赖 fragment 容器
+> - 回调内的 `st.error()` / `st.write()` **也会产生 delta**，但位置不对（跑到页面顶部）
+> - Fragment B 函数体内部的所有展示内容（比如 `if valid: st.success(...)`）**不会更新**，因为 B 的函数体根本没执行 |
 
 ---
 
 ###### 4.5 最终用户体验的完整图景
 
-回到最初的场景（A 是计数器 button，B 是带 validate 的 name_input），用户实际会观察到：
+回到最初的场景（A 是计数器 button，B 是带 `on_change=validate` 的 name_input），用户实际会观察到：
 
-1. ✅ **计数器数字立即 +1**（Fragment A 完全正常）
-2. ✅ **名字输入框中显示 "Bob"**（TextInput 的 uiValue 已更新，不是旧值）
-3. ✅ URL bar 或调试面板中 `st.session_state.name` 已经是 `"Bob"`
-4. ❌ 但 `validate()` 内 `st.toast(f"Hello {name}")` 没弹出来
-5. ❌ `validate()` 内 `st.session_state.name_valid = True` 已经变了，但 Fragment B 内 `if name_valid: st.success("✅ Valid name")` 仍是红色的 `❌ Invalid name` 提示（上一次的残留）
-6. ✅ 更隐蔽：如果 `validate()` 调了 `requests.post("/api/save", json={"name": name})`，后端数据库已经存了 `"Bob"`，但 UI 上没有任何保存成功的反馈
-7. 直到下一次 full-app rerun 或用户在 Fragment B 内点击任何东西 → B 的函数体重新执行 → 突然从旧提示跳变到新提示，toast 也补弹
+1. ✅ **计数器数字立即 +1**（Fragment A 完全正常，函数体重跑，所有内容正确更新）
+2. ✅ **名字输入框中显示 "Bob"**（TextInput 的 uiValue 已更新，不是旧值——本地 React 状态驱动）
+3. ✅ **右上角弹出了 "Hello Bob" 的 toast**（`validate()` 回调里的 `st.toast()` 被执行，toast 是全局的，正常显示）
+4. ⚠️ 但页面**顶部**多出一个绿色的 "✅ Valid name" 提示框（`validate()` 回调里的 `st.success()` 被执行，但 cursor 指向页面顶部，所以跑到了页面最上面）
+5. ❌ 而 **Fragment B 内**的 `if name_valid: st.success("Valid") else: st.error("Invalid")` 仍是红色的 `❌ Invalid name` 提示（上一次的残留，因为 B 的函数体没执行）
+6. ✅ URL bar 或调试面板中 `st.session_state.name` 已经是 `"Bob"`，`name_valid` 也是 `True`
+7. ✅ 更隐蔽：如果 `validate()` 调了 `requests.post("/api/save", json={"name": name})`，后端数据库已经存了 `"Bob"`
+8. 直到下一次 full-app rerun 或用户在 Fragment B 内点击任何东西 → B 的函数体重新执行 → B 容器内的错误提示突然变成成功提示，页面顶部那个"错位的"成功提示仍然在（直到下次 full-app rerun 被清理掉）
+
+**这是最坑的 bug 模式**：
+- 控件本身看起来是对的（输入值变了）
+- 全局反馈也有了（toast 弹了）
+- 但 fragment 内部的业务 UI 没更新（该显示成功的还显示错误）
+- 页面顶部还莫名其妙多出一个元素
+- 调试看 session_state 又是对的
+- 极易让开发者误以为是"前端渲染 bug"或"缓存问题"，实际上是回调输出 + 局部重跑的边界问题
 
 ---
 
