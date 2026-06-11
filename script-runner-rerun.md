@@ -272,25 +272,121 @@ def _is_stale_widget(metadata, active_widget_ids, fragment_ids_this_run):
 
 ---
 
-##### 阶段 4：显示不同步的根本原因 —— "值在后端，DOM 未更新"
+##### 阶段 4：显示不同步的根本原因 —— 区分"本地 UI 状态"与"后端派生内容"
 
-综合以上三个阶段：
+首先明确 Streamlit 前端控件有两套完全独立的渲染驱动：
 
-| 层面 | Fragment A（目标） | Fragment B（非目标） |
-|------|--------------------|----------------------|
-| widget state 是否写入 | ✅ 已写入 `_new_widget_state` | ✅ **也已写入**（因为阶段 1 不分归属） |
-| 回调是否执行 | ✅ `incr` 已执行 | ✅ **`validate` 也执行了**（因为阶段 1 遍历所有变化） |
-| 函数体是否执行 | ✅ `wrapped_fragment()` 被调用 | ❌ 完全跳过 |
-| 新 delta 是否产生 | ✅ A 函数体里的所有 `st.foo()` 都 enqueue 了 delta | ❌ 没有任何 delta 产生（函数体没跑） |
-| ForwardMsg 中的 fragment_id | ✅ delta 带 `fragment_id="a-counter"` | ❌ 无 |
-| 前端 DOM 容器是否刷新 | ✅ 浏览器收到对应 fragment 的 delta，重绘 A 的区域 | ❌ **B 的容器收到 0 条 delta**，完全不刷新 |
+| 渲染来源 | 存储位置 | 更新时机 | 依赖后端 delta？ |
+|----------|---------|---------|------------------|
+| **本地 UI 状态** | React 组件的 `useState()`（`uiValue`、`focused`、`showPassword` 等） | 用户交互时（onChange/onFocus 等）立即更新 | ❌ 不需要 delta |
+| **后端派生内容** | Element 树（由 ForwardMsg delta 增量构建） | 收到后端 ForwardMsg 时才更新 | ✅ 完全依赖 |
 
-**最终用户观察到的现象**：
-1. 屏幕上 **A 的计数器数字立即变化**（一切正常）
-2. 屏幕上 **B 的输入框仍显示旧值**（例如仍为空字符串）
-3. 但如果此时打开 Streamlit 调试面板看 `st.session_state`，或任何带 query param binding 的 URL bar，**B 的新值已经存在**
-4. 更隐蔽：B 的 `validate()` 回调如果做了写外部库、发请求、弹 toast 等副作用，这些都已经真实发生了，但用户看不到对应"视觉反馈"
-5. 直到下一次 **full-app rerun**（或用户手动触发 Fragment B 内的任何交互），B 的函数体才会重新执行，此时从 session state 读出 `"Bob"` 并渲染，**旧值会突然"跳"到新值**
+因此，"非目标区域一定仍显示旧值"的说法**不成立**——实际表现取决于控件本身的渲染逻辑，分三类：
+
+---
+
+###### 4.1 文本输入类（`st.text_input` / `st.number_input`）：有独立本地 UI 状态
+
+以 [TextInput.tsx](file:///d:/fz/0601/solo-dogfeeding/code/213-streamlit/frontend/lib/src/components/widgets/TextInput/TextInput.tsx) 为例，它维护两个分离的状态：
+
+```typescript
+// 状态 1：本地 UI 状态（用户正在输入但未 commit 的值）
+const [uiValue, setUiValue] = useState<string | null>(...)
+const [dirty, setDirty] = useState(false)
+
+// 状态 2：后端同步值（来自 WidgetStateManager 的确认值）
+const [value, setValueWithSource] = useBasicWidgetState<...>(...)
+
+// 双向同步规则：[useUpdateUiValue](file:///d:/fz/0601/solo-dogfeeding/code/213-streamlit/frontend/lib/src/hooks/useUpdateUiValue.ts#L28-L44)
+useUpdateUiValue(value, uiValue, setUiValue, dirty)
+// → 仅当 dirty=false（用户没有正在编辑）时，才把后端 value 同步到 uiValue
+```
+
+**commit 触发路径**（非 form 内输入框）：
+- 用户每个 keystroke → `onChange` → `setDirty(true)` + `setUiValue(newValue)` → **屏幕立即显示新值**
+- 此时**不在 form 内**（`useOnInputChange` [L79-L85](file:///d:/fz/0601/solo-dogfeeding/code/213-streamlit/frontend/lib/src/hooks/useOnInputChange.ts#L79-L85)）→ **不会**立即同步到 WidgetStateManager，不会触发 rerun
+- 用户 blur 或按 Enter → `commitWidgetValue()` → `setValueWithSource({value: uiValue, fromUi: true})` → 同步到 WidgetStateManager → `scheduleFlush`
+
+**冲突场景下 TextInput 的实际表现**（非目标 Fragment B 的 name_input）：
+| 时点 | 本地 uiValue | 后端 WidgetStateManager 值 | 屏幕显示 | 备注 |
+|------|-------------|---------------------------|---------|------|
+| 用户刚输入完，未 blur | `"Bob"` | `""`（旧值） | ✅ **显示 "Bob"** | 纯本地 uiValue 驱动，不需要 delta |
+| blur 触发 commit → 与 A 同 macrotask 合并 → 后端执行完 | `"Bob"` | `"Bob"`（阶段 1 已写入） | ✅ **仍显示 "Bob"** | uiValue 没变，dirty=false 了，也不用等后端 |
+| 后端 on_change 回调内 `st.error("Invalid name")` | `"Bob"` | `"Bob"` | ❌ **看不到错误提示** | 错误提示是后端派生内容，依赖 delta，函数体没执行就没 delta |
+
+**结论**：非目标区域的 TextInput **输入框本身的文字会更新为新值**（因为 onChange 直接写了本地 uiValue），但**所有需要后端代码执行才能产生的派生内容（错误提示、联动显示、toast 等）不会出现**。
+
+---
+
+###### 4.2 表单输入类（`st.form` 内的所有控件 + Checkbox / Button）：状态即显示
+
+**Checkbox / Toggle**（[Checkbox.tsx](file:///d:/fz/0601/solo-dogfeeding/code/213-streamlit/frontend/lib/src/components/widgets/Checkbox/Checkbox.tsx)）：
+- **没有**独立的 uiValue，直接用 `useBasicWidgetState` 返回的 `value` 渲染
+- `isSelected={value}` → 勾选状态完全由 value 驱动
+- `onChange` → `setValueWithSource({value: isSelected, fromUi: true})` → 立即 commit 到 WidgetStateManager
+- 但 value 的更新**同时发生在本地**（`useEffect` 在 `nextValueWithSource` 变化时 `setCurrentValue(nextValueWithSource.value)`）
+
+**Button**（[Button.tsx](file:///d:/fz/0601/solo-dogfeeding/code/213-streamlit/frontend/lib/src/components/widgets/Button/Button.tsx)）：
+- 完全没有本地持久状态，只触发 `setTriggerValue`
+- 按下的视觉反馈是 CSS `:active` 伪类，松开就恢复
+
+**冲突场景下表单类控件的实际表现**（非目标 Fragment B 的控件）：
+| 控件类型 | 本地状态 | 后端 state | 屏幕显示 | 派生内容 |
+|---------|---------|-----------|---------|---------|
+| 非 form 内 Checkbox | ✅ `setCurrentValue(true)` 已设，React 重渲染 | ✅ 已写入 session_state | ✅ **显示为勾选** | 如 `if st.checkbox("Show"): st.dataframe(df)` 的 dataframe → ❌ 不显示（函数体没跑） |
+| Form 内的 Checkbox（未点 Submit） | ❌ onChange 只更新本地 value，不触发 scheduleFlush | ❌ 未 commit，还在本地 | ✅ **显示为勾选** | 无（等 Submit 才会发） |
+| Form 内的 TextInput（正在输入） | ✅ uiValue="Bob" | ❌ 未 commit，只在本地 widgetMgr 的 FormState | ✅ **显示 "Bob"** | 无 |
+| 点击 Form 内 Submit → 与 A 的 button 同 macrotask 合并 | ✅ 所有 form 控件本地状态已更新 | ✅ 全部已写入 session_state | ✅ **所有控件显示新状态** | `st.success("Saved!")`、`st.write(form_data)` 等 → ❌ 不显示 |
+
+**结论**：表单类控件的**交互视觉状态（勾选、输入文字等）都会立即更新**（本地 React 状态驱动），但**表单提交后后端代码产生的任何派生内容（成功提示、计算结果、跳转等）都不会出现**。
+
+---
+
+###### 4.3 纯 delta 依赖区域（`st.write`、`st.dataframe`、图表、`st.metric` 等）：完全依赖后端
+
+这些不是"控件"，没有本地状态，渲染内容 100% 由后端 delta 决定：
+- `st.write("Hello, " + st.session_state.name)`
+- `st.line_chart(data)`
+- `st.metric("Score", score)`
+- `st.container()` 内所有由 Python 代码生成的内容
+
+**冲突场景下的表现**：
+- ❌ **一定还是旧内容**——没有 delta 就没有任何更新
+- 即使 `st.session_state.name` 已经变成 `"Bob"`（阶段 1 已写入），`st.write` 的字符串也不会变，因为那行 Python 代码根本没执行
+- 这才是最容易造成"逻辑 vs 显示不一致"的区域：
+  - 后端 `validate()` 回调已经把 `st.session_state.valid = True` 改了
+  - 但 Fragment B 内的 `if valid: st.success("Valid!") else: st.error("Invalid")` 没执行
+  - 屏幕上可能还显示着上一次的"Invalid"红色错误，而实际上 backend 已经认为合法了
+
+---
+
+###### 4.4 综合对比表（非目标 Fragment B）
+
+| 层面 | Fragment A（目标） | Fragment B 内文本输入 | Fragment B 内 checkbox | Fragment B 内 st.write/chart |
+|------|--------------------|----------------------|-----------------------|-----------------------------|
+| widget state 是否写入 | ✅ 已写入 | ✅ **也已写入** | ✅ **也已写入** | （不涉及 widget） |
+| 回调是否执行 | ✅ `incr` 已执行 | ✅ **`validate` 也执行了** | ✅ 回调也执行 | （不涉及回调） |
+| 函数体是否执行 | ✅ `wrapped_fragment()` | ❌ 完全跳过 | ❌ 完全跳过 | ❌ 完全跳过 |
+| 新 delta 是否产生 | ✅ 所有 `st.foo()` | ❌ 0 条 | ❌ 0 条 | ❌ 0 条 |
+| 控件自身显示 | ✅ 正常 | ✅ **显示新输入值**（本地 uiValue 驱动） | ✅ **显示勾选状态**（本地 value 驱动） | ❌ **仍显示旧内容** |
+| 后端派生内容（toast/提示/图表） | ✅ 全部显示 | ❌ **不显示** | ❌ **不显示** | ❌ **不显示** |
+| `st.session_state` 调试面板 | ✅ 一致 | ✅ 值已更新 | ✅ 值已更新 | ✅ 值已更新 |
+
+---
+
+###### 4.5 最终用户体验的完整图景
+
+回到最初的场景（A 是计数器 button，B 是带 validate 的 name_input），用户实际会观察到：
+
+1. ✅ **计数器数字立即 +1**（Fragment A 完全正常）
+2. ✅ **名字输入框中显示 "Bob"**（TextInput 的 uiValue 已更新，不是旧值）
+3. ✅ URL bar 或调试面板中 `st.session_state.name` 已经是 `"Bob"`
+4. ❌ 但 `validate()` 内 `st.toast(f"Hello {name}")` 没弹出来
+5. ❌ `validate()` 内 `st.session_state.name_valid = True` 已经变了，但 Fragment B 内 `if name_valid: st.success("✅ Valid name")` 仍是红色的 `❌ Invalid name` 提示（上一次的残留）
+6. ✅ 更隐蔽：如果 `validate()` 调了 `requests.post("/api/save", json={"name": name})`，后端数据库已经存了 `"Bob"`，但 UI 上没有任何保存成功的反馈
+7. 直到下一次 full-app rerun 或用户在 Fragment B 内点击任何东西 → B 的函数体重新执行 → 突然从旧提示跳变到新提示，toast 也补弹
+
+---
 
 ##### 什么情况会触发此冲突？
 
