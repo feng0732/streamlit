@@ -452,9 +452,206 @@ self._most_recent_messages = self._cached_message_stack.pop()  # 只取本层消
 
 ---
 
-## 六、cache_data vs cache_resource 协作对比总结
+## 六、cache_data 持久化缓存的失效边界深度解析
 
-### 6.1 决策速查表
+> 本章节深入 disk 模式下 TTL 为什么不生效、淘汰发生在哪一层、磁盘层和内存层各自负责什么。
+
+### 6.1 三层存储架构全景
+
+`@st.cache_data(persist="disk")` 实际上是**三层结构**，每层职责完全不同：
+
+```
+┌───────────────────────────────────────────────────────────┐
+│                      DataCache                             │
+│  （pickle 序列化/反序列化 + value 锁 + message 重放）      │
+└─────────────────────┬─────────────────────────────────────┘
+                      │
+┌─────────────────────▼─────────────────────────────────────┐
+│              InMemoryCacheStorageWrapper                  │
+│  ┌────────────────────┐      ┌────────────────────────┐  │
+│  │  内存层 (TTLCache) │◄────►│  持久化层               │  │
+│  │  - TTL 过期 ✅     │      │  (LocalDiskCacheStorage)│  │
+│  │  - LRU 淘汰 ✅     │      │  - 纯文件读写 ❌TTL     │  │
+│  │  - max_entries ✅  │      │  - 无淘汰 ❌max_entries │  │
+│  └────────────────────┘      └────────────────────────┘  │
+└───────────────────────────────────────────────────────────┘
+```
+
+各层源码位置：
+- 包装层：[in_memory_cache_storage_wrapper.py](file:///d:/fz/0601/solo-dogfeeding/code/216-streamlit/lib/streamlit/runtime/caching/storage/in_memory_cache_storage_wrapper.py)
+- 磁盘层：[local_disk_cache_storage.py](file:///d:/fz/0601/solo-dogfeeding/code/216-streamlit/lib/streamlit/runtime/caching/storage/local_disk_cache_storage.py)
+- 管理器配置：[cache_storage_manager_config.py](file:///d:/fz/0601/solo-dogfeeding/code/216-streamlit/lib/streamlit/web/cache_storage_manager_config.py)
+
+### 6.2 读路径：内存 miss → 磁盘命中 → 回填内存
+
+源码位置：[in_memory_cache_storage_wrapper.py#L91-L101](file:///d:/fz/0601/solo-dogfeeding/code/216-streamlit/lib/streamlit/runtime/caching/storage/in_memory_cache_storage_wrapper.py#L91-L101)
+
+```python
+def get(self, key):
+    try:
+        entry_bytes = self._read_from_mem_cache(key)  # 先查内存
+    except CacheStorageKeyNotFoundError:
+        entry_bytes = self._persist_storage.get(key)  # 内存 miss，查磁盘
+        self._write_to_mem_cache(key, entry_bytes)   # 磁盘命中，回填内存
+    return entry_bytes
+```
+
+**关键细节**：
+- 磁盘层的 `get` 方法**没有任何 TTL 检查**，文件存在就直接读
+- 磁盘层保存的 `_ttl_seconds` 和 `_max_entries` 属性**完全不使用**，只是摆设
+- 回填到内存层时，内存层会按照自己的 TTL 重新计时（从回填时刻开始算 TTL）
+
+### 6.3 写路径：内存+磁盘双写，不同步淘汰
+
+源码位置：[in_memory_cache_storage_wrapper.py#L103-L106](file:///d:/fz/0601/solo-dogfeeding/code/216-streamlit/lib/streamlit/runtime/caching/storage/in_memory_cache_storage_wrapper.py#L103-L106)
+
+```python
+def set(self, key, value):
+    self._write_to_mem_cache(key, value)    # 写内存（受 LRU+TTL 约束）
+    self._persist_storage.set(key, value)   # 写磁盘（无任何约束，永久保存）
+```
+
+**两层淘汰的不对称性**：
+
+| 操作 | 内存层 (TTLCache) | 磁盘层 (LocalDisk) |
+|-----|------------------|-------------------|
+| **写入** | 受 max_entries 限制，超了 LRU 淘汰 | 无限制，直接写文件 |
+| **TTL 过期** | 访问时惰性检查，过期直接删除 | 完全不检查，文件永久保留 |
+| **LRU 淘汰** | 超 max_entries 时自动淘汰最旧 | 完全不淘汰，文件只增不减 |
+| **手动 delete(key)** | 删除内存 key | **同时**删除磁盘文件 |
+| **手动 clear()** | 清空内存 | **同时**清空磁盘所有该函数的文件 |
+
+### 6.4 为什么 disk 模式下 TTL "不生效"
+
+这是最容易混淆的点。**准确说法是：TTL 只在内存层生效，在磁盘层完全不生效。**
+
+表现出来的现象：
+1. 设置 `ttl=60` 后，60 秒内再次调用 → 内存命中（很快）
+2. 60 秒后再次调用 → 内存 TTL 过期 → 去磁盘读 → 磁盘有文件 → 回填内存 → **返回旧数据**（用户以为 TTL 没生效）
+3. 重启应用后调用 → 内存空 → 磁盘有文件 → 回填内存 → **返回很久之前的旧数据**
+
+**官方其实有警告，但很容易被忽略**：
+
+源码位置：[local_disk_cache_storage.py#L105-L115](file:///d:/fz/0601/solo-dogfeeding/code/216-streamlit/lib/streamlit/runtime/caching/storage/local_disk_cache_storage.py#L105-L115)
+
+```python
+def check_context(self, context):
+    if (context.persist == "disk"
+        and context.ttl_seconds is not None
+        and not math.isinf(context.ttl_seconds)):
+        _LOGGER.warning(
+            "The cached function '%s' has a TTL that will be ignored. "
+            "Persistent cached functions currently don't support TTL.",
+            context.function_display_name,
+        )
+```
+
+这是 `check_context` 在装饰器创建时调用的，会在日志中打一条 warning，但不会抛异常，也不会阻止你设置 TTL。
+
+### 6.5 max_entries 的真实作用范围
+
+`max_entries` 同样只在内存层生效，磁盘层是无限增长的。
+
+**一个反直觉的场景**：
+
+```python
+@st.cache_data(persist="disk", max_entries=3)
+def load_data(id):
+    # 假设 id 可以取 1~100 共 100 种
+    ...
+```
+
+- 内存里最多保留 3 个结果，超过就 LRU 淘汰
+- 磁盘上会有 100 个 `.memo` 文件，**越来越多，永不删除**
+- 每次访问新 id 都会先查内存 → miss → 查磁盘 → 命中就回填内存
+- 只有调用 `load_data.clear()` 才会一次性删除磁盘上所有该函数的文件
+
+**磁盘文件的命名规则**：
+
+源码位置：[local_disk_cache_storage.py#L208-L213](file:///d:/fz/0601/solo-dogfeeding/code/216-streamlit/lib/streamlit/runtime/caching/storage/local_disk_cache_storage.py#L208-L213)
+
+```python
+def _get_cache_file_path(self, value_key):
+    cache_dir = get_cache_folder_path()  # ~/.streamlit/cache/
+    return os.path.join(
+        cache_dir, f"{self.function_key}-{value_key}.memo"
+    )
+```
+
+每个被缓存的 value 对应独立文件，文件名 = `{function_key}-{value_key}.memo`。
+
+### 6.6 磁盘层的实际能力边界
+
+LocalDiskCacheStorage 的 `get`/`set`/`delete`/`clear` 实现极其简单：
+
+| 方法 | 实际行为 | 是否检查 TTL | 是否检查 max_entries |
+|-----|---------|-------------|---------------------|
+| `get(key)` | 读文件，不存在抛错 | ❌ | ❌ |
+| `set(key,value)` | 写文件，失败清理空文件 | ❌ | ❌ |
+| `delete(key)` | `os.remove` 文件，不存在静默 | ❌ | ❌ |
+| `clear()` | 遍历目录删除所有以 function_key 开头的 .memo 文件 | ❌ | ❌ |
+| `close()` | 空实现，什么也不做 | - | - |
+
+源码为证：[local_disk_cache_storage.py#L137-L207](file:///d:/fz/0601/solo-dogfeeding/code/216-streamlit/lib/streamlit/runtime/caching/storage/local_disk_cache_storage.py#L137-L207) 中完全没有 TTL 或 LRU 相关的逻辑代码。
+
+### 6.7 非 persist 模式的存储层
+
+当 `persist=None`（默认）时，使用的是 `MemoryCacheStorageManager`，其持久化层是 `DummyCacheStorage`：
+
+源码位置：[dummy_cache_storage.py](file:///d:/fz/0601/solo-dogfeeding/code/216-streamlit/lib/streamlit/runtime/caching/storage/dummy_cache_storage.py)
+
+```python
+class DummyCacheStorage(CacheStorage):
+    def get(self, key):
+        raise CacheStorageKeyNotFoundError("Key not found in dummy cache")
+    def set(self, key, value):
+        pass
+    def delete(self, key):
+        pass
+    def clear(self):
+        pass
+```
+
+也就是说：
+- 非 disk 模式下，`InMemoryCacheStorageWrapper` 仍然存在，但 `_persist_storage` 是个永远 miss 的空壳
+- 此时 TTL 和 max_entries **完全生效**，因为只有内存层在工作
+- 内存层就是真实的唯一存储，没有磁盘回源
+
+### 6.8 持久化缓存的失效边界总结
+
+```
+┌────────────────────────────────────────────────────────────┐
+│               失效 / 淘汰发生的层级                         │
+├─────────────┬──────────────────┬───────────────────────────┤
+│   机制       │  内存层           │  磁盘层                    │
+├─────────────┼──────────────────┼───────────────────────────┤
+│ TTL 过期     │  ✅ 访问时惰性检查 │  ❌ 永久保留，永不检查      │
+│ LRU 淘汰     │  ✅ 超 max_entries  │  ❌ 只增不减，无限增长    │
+│              │      自动淘汰最旧  │                           │
+│ 手动 clear() │  ✅ 全部清空      │  ✅ 全部清空（遍历删除）    │
+│ 单条 delete  │  ✅ 删除指定 key  │  ✅ 删除对应文件           │
+│ 重启进程     │  ✅ 全部丢失      │  ✅ 全部保留（持久化本义）  │
+│ 源码变更     │  新 function_key  │  新 function_key           │
+│              │  → 新缓存空间     │  → 旧文件变孤儿，永不清理   │
+└─────────────┴──────────────────┴───────────────────────────┘
+```
+
+**特别注意**：函数源码变更导致 function_key 变化后，磁盘上旧 function_key 对应的所有 `.memo` 文件会变成**孤儿文件**，永远不会被自动清理。只有手动调用 `st.cache_data.clear()`（会调用 `clear_all()` 直接 `shutil.rmtree` 整个 cache 目录）才会清理掉。
+
+源码位置：[local_disk_cache_storage.py#L100-L103](file:///d:/fz/0601/solo-dogfeeding/code/216-streamlit/lib/streamlit/runtime/caching/storage/local_disk_cache_storage.py#L100-L103)
+
+```python
+def clear_all(self):
+    cache_path = get_cache_folder_path()
+    if os.path.isdir(cache_path):
+        shutil.rmtree(cache_path)  # 暴力删除整个缓存目录
+```
+
+---
+
+## 七、cache_data vs cache_resource 协作对比总结
+
+### 7.1 决策速查表
 
 | 使用场景 | 推荐装饰器 | 原因 |
 |---------|-----------|------|
@@ -466,7 +663,7 @@ self._most_recent_messages = self._cached_message_stack.pop()  # 只取本层消
 | 可变对象且调用者需要修改 | `@st.cache_data` | 返回副本，修改安全 |
 | 不可序列化对象 | `@st.cache_resource` | 不经过 pickle，直接内存引用 |
 
-### 6.2 存储架构差异图
+### 7.2 存储架构差异图
 
 ```
 cache_data:
@@ -501,7 +698,7 @@ cache_resource:
 └─────────────────────────────────────────────────────┘
 ```
 
-### 6.3 易混淆点澄清
+### 7.3 易混淆点澄清
 
 1. **「hash_funcs 变化会重建缓存吗？」**  
    ❌ 不会。hash_funcs 只参与 value_key 计算，不参与 function_cache 参数比较。但会导致新的 value_key（如果 hash 结果变化），所以效果类似"部分失效"。
@@ -518,9 +715,18 @@ cache_resource:
 5. **「嵌套缓存函数中，内层缓存 miss 但外层命中，内层的 st 消息会显示吗？」**  
    ✅ 会。因为缓存的是完整 CachedResult（包含所有消息），重放时按顺序全部重放，不管这些消息是本层还是内层函数产生的。
 
+6. **「persist=\"disk\" 时，TTL 还有用吗？」**  
+   ❌ 磁盘层完全没用。TTL 只在内存层（InMemoryCacheStorageWrapper 的 TTLCache）生效，磁盘上的文件永久保留永不检查 TTL。内存 TTL 过期后会从磁盘重新读回来（旧数据），给人的感觉就是 "TTL 没生效"。官方会在日志里打 warning 但不会报错。
+
+7. **「persist=\"disk\" + max_entries，磁盘上的文件也会限制数量吗？」**  
+   ❌ 不会。max_entries 只限制内存层，磁盘文件只增不减无限增长。只有调用 `clear()` 或 `st.cache_data.clear()` 才会删除磁盘文件。
+
+8. **「函数源码改了，磁盘上的旧缓存文件会自动清理吗？」**  
+   ❌ 不会。源码变更会产生新的 function_key，旧 function_key 对应的所有 .memo 文件变成孤儿文件永远留在磁盘上。只有 `st.cache_data.clear()`（它会 rmtree 整个 cache 目录）才能清理掉。
+
 ---
 
-## 七、核心协作代码路径速查
+## 八、核心协作代码路径速查
 
 | 功能 | cache_data | cache_resource |
 |-----|-----------|---------------|
