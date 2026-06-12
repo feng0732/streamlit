@@ -261,6 +261,38 @@ export function isNumericString(value: string): boolean {
 
 > **注意事项**：带单位的字符串（`"-1.2 °F"`、`"70 °F"`）会被判定为非纯数字，**format 会被忽略**，只按原始字符串显示。这是后端 `from_number` 只接受纯数字类型时才能触发格式化的前端镜像约束。
 
+#### 3.2.2.1 未传入 format 参数时的默认行为
+
+当用户调用 `st.metric()` **未指定 `format` 参数** 时（`format=None` / proto 中 `format=""` 或未设置），前端会直接使用后端传来的 **原始字符串**，不做任何数值格式化处理。
+
+关键代码逻辑在 [Metric.tsx:279-288](file:///d:/fz/0601/solo-dogfeeding/code/235-streamlit/frontend/lib/src/components/elements/Metric/Metric.tsx#L279-L288)：
+
+```typescript
+// 当 format="" 或未设置时，format 为 falsy，短路求值直接返回 metricValue
+const formattedMetricValue =
+  format && isNumericString(metricValue)
+    ? safeFormatNumber(metricValue, format)
+    : metricValue   // ← 默认路径：直接使用后端原始字符串
+
+const formattedDelta =
+  format && delta && isNumericString(delta)
+    ? safeFormatNumber(delta, format)
+    : delta         // ← 默认路径：直接使用后端原始字符串
+```
+
+**实际效果示例**：
+
+| Python 调用 | 后端 body 字符串 | 前端显示 (无 format) | 前端显示 (format="compact") |
+|------------|----------------|---------------------|----------------------------|
+| `st.metric("A", 1234567)` | `"1234567"` | `"1234567"` | `"1.2M"` |
+| `st.metric("A", 12.3456789)` | `"12.3456789"` | `"12.3456789"` | `"12.3457"` (numbro 自动精度) |
+| `st.metric("A", None)` | `"—"` | `"—"` | `"—"` |
+| `st.metric("A", "70 °F")` | `"70 °F"` | `"70 °F"` | `"70 °F"` (非数字，format 忽略) |
+
+> **重要区分**：`format` 参数的默认值 `None` ≠ `formatNumber(..., undefined)`。`formatNumber` 在 `format=undefined` 时会使用 numbro 做自动精度格式化，但 Metric 组件在 `format` 未传入时**根本不会调用 formatNumber**，直接走原始字符串分支。这是有意为之的设计：保证向后兼容，不改变老版本用户既有的显示效果。
+
+最终展示时，`formattedMetricValue` / `formattedDelta` 会被传入 `<StreamlitMarkdown>` 组件渲染（参考 [Metric.tsx:367-373](file:///d:/fz/0601/solo-dogfeeding/code/235-streamlit/frontend/lib/src/components/elements/Metric/Metric.tsx#L367-L373) 和 [Metric.tsx:396-402](file:///d:/fz/0601/solo-dogfeeding/code/235-streamlit/frontend/lib/src/components/elements/Metric/Metric.tsx#L396-L402)），支持有限的 Markdown 语法（粗体、斜体、内联代码、链接等），但禁止原始 HTML。
+
 #### 3.2.3 箭头方向映射（L290-L302）
 
 ```typescript
@@ -343,6 +375,188 @@ backgroundColor: getMetricBackgroundColor(theme, metricColor),  // 徽章背景
 
 `showBorder` 控制是否展示卡片边框与圆角。此参数同样来自 proto。
 
+### 3.5 Stale 状态机制（isStale）
+
+Stale 状态用于在脚本 **重新运行期间**（如用户点击按钮、修改输入触发 rerun），视觉上标记那些来自 **上一轮 scriptRunId**、尚未被新数据替换的元素，提示用户这些内容可能已过时。
+
+#### 3.5.1 状态计算逻辑
+
+isStale 的布尔值由 [utils.ts:isElementStale()](file:///d:/fz/0601/solo-dogfeeding/code/235-streamlit/frontend/lib/src/components/core/Block/utils.ts#L43-L70) 函数计算：
+
+```typescript
+export function isElementStale(
+  node: AppNode,
+  scriptRunState: ScriptRunState,
+  scriptRunId: string,          // 当前正在运行的 scriptRunId（来自 ScriptRunContext）
+  fragmentIdsThisRun?: string[]
+): boolean {
+  if (scriptRunState === ScriptRunState.RERUN_REQUESTED) {
+    return true                   // 只要刚请求 rerun，全部元素标记为 stale
+  }
+  if (scriptRunState === ScriptRunState.RUNNING) {
+    if (fragmentIdsThisRun?.length) {
+      // Fragment 部分 rerun：仅标记同一 fragmentId 下 scriptRunId 不同的元素
+      return Boolean(
+        node.fragmentId &&
+        fragmentIdsThisRun.includes(node.fragmentId) &&
+        node.scriptRunId !== scriptRunId
+      )
+    }
+    return node.scriptRunId !== scriptRunId   // 全量 rerun：比较元素节点 scriptRunId
+  }
+  return false                    // 未运行状态下不标记为 stale
+}
+```
+
+其中 `node.scriptRunId` 在 [ElementNode.ts](file:///d:/fz/0601/solo-dogfeeding/code/235-streamlit/frontend/lib/src/render-tree/ElementNode.ts#L33-L58) 构造函数中赋值——每个元素节点被创建时，记录其所属的后端 script run 标识。当前 `scriptRunId` 从 [ScriptRunContext](file:///d:/fz/0601/solo-dogfeeding/code/235-streamlit/frontend/lib/src/components/core/ScriptRunContext.tsx) 获取，随每次后端推送新的 ForwardMsg 更新。
+
+#### 3.5.2 状态传入路径
+
+从 `ScriptRunContext` → `ElementNodeRenderer` → `ElementContainer` → styled-components：
+
+1. [ElementNodeRenderer.tsx:1249-1250](file:///d:/fz/0601/solo-dogfeeding/code/235-streamlit/frontend/lib/src/components/core/Block/ElementNodeRenderer.tsx#L1249-L1250) 读取上下文并计算：
+   ```typescript
+   const { scriptRunState, scriptRunId, fragmentIdsThisRun } = useContext(ScriptRunContext)
+   ```
+   然后对每个元素节点调用 `isElementStale(node, state, id, fragmentIds)`，将结果以 `isStale` prop 传入 `<ElementContainer>`。
+
+2. [ElementContainer.tsx:88-89](file:///d:/fz/0601/solo-dogfeeding/code/235-streamlit/frontend/lib/src/components/core/Block/ElementContainer.tsx#L88-L89) 继续传递并加"全屏豁免"逻辑：
+   ```typescript
+   data-stale={isStale}
+   isStale={isStale && !isFullScreen}   // 全屏模式下不减淡，保持可读性
+   ```
+
+3. [styled-components.ts:116](file:///d:/fz/0601/solo-dogfeeding/code/235-streamlit/frontend/lib/src/components/core/Block/styled-components.ts#L116) 应用样式：
+   ```typescript
+   ...(isStale && elementType !== "skeleton" && STALE_STYLES)
+   ```
+   其中 `skeleton`（骨架屏元素）不参与淡化，避免骨架屏加载中被进一步淡化。
+
+#### 3.5.3 视觉效果
+
+[consts.ts:STALE_STYLES](file:///d:/fz/0601/solo-dogfeeding/code/235-streamlit/frontend/lib/src/theme/consts.ts#L19-L24)：
+
+```typescript
+export const STALE_TRANSITION_PARAMS = "1s ease-in 0.5s"
+export const STALE_STYLES = {
+  opacity: opacities.stale,   // opacities.stale = 0.33（透明度 33%）
+  transition: `opacity ${STALE_TRANSITION_PARAMS}`,
+}
+```
+
+**实际视觉行为**：
+- 脚本触发重新运行后，元素等待 **0.5 秒**（避免快速 rerun 时闪烁）
+- 随后在 **1 秒内** 通过 ease-in 缓动淡出至 **33% 不透明度**
+- 后端新数据到达后（元素 scriptRunId 与当前相等），立即恢复 100%
+- Metric 组件 **没有独立的 hideIfStale 处理**（与 balloons 等动画元素不同），只受透明度淡化影响，DOM 节点仍然存在并占空间
+
+### 3.6 Sparkline Hover 交互与高亮实现
+
+当 metric 提供 `chart_data` 时，前端使用 vega-embed 渲染 Vega-Lite 图表，并内置三层图层结构实现 **hover 最近点检测 → 高亮圆点 → 显示 tooltip** 的交互体验。核心实现位于 [Metric.tsx:getMetricChartSpec()](file:///d:/fz/0601/solo-dogfeeding/code/235-streamlit/frontend/lib/src/components/elements/Metric/Metric.tsx#L76-L251)。
+
+#### 3.6.1 Vega-Lite 三层图层架构
+
+```
+Layer 0 (chart_mark)        主视觉图层：实际线/柱/面积图
+  ├─ 线型：strokeCap:round, strokeWidth:metricStrokeWidth
+  ├─ 柱型：cornerRadius:full（圆角柱）
+  └─ 面积：面积背景 + 顶部描边双线结构
+
+Layer 1 (points)             透明点图层：用于 hover 事件捕获（视觉不可见）
+  └─ mark: { type: "point", opacity: 0 }   ← 完全透明
+
+Layer 2 (highlighted_points) 高亮图层：显示最近点（hover 时才可见）
+  ├─ mark: { type: "point", filled:true, size:65, tooltip:true }
+  └─ transform: [{ filter: { param: hover_selection, empty:false } }]
+```
+
+#### 3.6.2 Hover 选择参数（Layer 1）
+
+Layer 1 中声明了一个名为 `${baseName}_hover_selection` 的 Vega 选择参数：
+
+```typescript
+params: [{
+  name: `${baseName}_hover_selection`,
+  select: {
+    type: "point",       // 选择单个数据点
+    encodings: ["x"],    // 按 x 轴方向匹配（最近横坐标点）
+    nearest: true,       // 选择距离鼠标最近的点，而非精确命中
+    on: chartData.length > LARGE_DATASET_POINT_THRESHOLD
+      ? "mousemove{16}"  // 大数据 (>1000 点) 节流到 16ms 约 60fps
+      : "mousemove",     // 普通数据实时响应
+    clear: "mouseleave", // 鼠标离开图表时清除选择
+  },
+}]
+```
+
+**关键设计点**：
+- **`nearest: true`**：鼠标不必精准落在数据线上，只要在图表范围内，Vega 会按距离自动选择最近的 x 坐标点，大幅提升可用性
+- **大数据节流**：`mousemove{16}` 是 Vega 的事件节流语法，避免 1000+ 点时 hover 计算阻塞主线程
+- **`encodings: ["x"]`**：仅按 x（时间索引）匹配，不考虑 y 值，使垂直方向的查找更宽容
+
+#### 3.6.3 高亮圆点（Layer 2）
+
+通过 `transform` 过滤，仅渲染当前被 hover 选中的点：
+
+```typescript
+{
+  name: `${baseName}_highlighted_points`,
+  transform: [
+    { filter: { param: `${baseName}_hover_selection`, empty: false } }
+  ],
+  mark: {
+    type: "point",
+    filled: true,   // 实心圆点（非空心）
+    size: 65,       // 像素面积（约直径 9px）
+    tooltip: true,  // 启用 Vega 默认 tooltip 管线，后续被 vega-embed 覆盖
+  },
+  encoding: { /* 继承主层 x/y 编码 */ }
+}
+```
+
+- **`empty: false`**：无选择时整个 filter 返回空数组，不渲染任何圆点 → 常态下无高亮
+- **颜色继承**：高亮圆点的颜色从 `config.mark.color` 继承，即 `getMetricColor(theme, color)`，与图表主线/柱颜色一致，形成统一视觉语言
+
+#### 3.6.4 Tooltip 自定义
+
+在调用 `vega-embed` 时注入自定义 tooltip 配置 — [Metric.tsx:329-336](file:///d:/fz/0601/solo-dogfeeding/code/235-streamlit/frontend/lib/src/components/elements/Metric/Metric.tsx#L329-L336)：
+
+```typescript
+tooltip: {
+  theme: "custom",   // 套用 Streamlit 主题化 tooltip 样式
+  formatTooltip: (value: { y: number }) => `${value.y}`
+}
+```
+
+由于 sparkline 的 x 值只是 `[0, 1, 2, ...]` 的数字索引（无业务含义），`formatTooltip` 函数剥离了 x 值，仅 **展示 y 方向的原始数值**。同时 `theme: "custom"` 触发 Streamlit 自定义 tooltip 样式（边框、字体、阴影）与整体 UI 一致。
+
+#### 3.6.5 Hover 效果协同总览
+
+```
+鼠标移至图表区域
+  │
+  ▼ Vega 引擎
+Layer 1 捕获 mousemove → nearest=true 找最近 x 点
+  │
+  ├─ 更新 ${baseName}_hover_selection 参数
+  │
+  ▼
+Layer 2 transform.filter 收到参数匹配
+  │
+  ├─ 渲染 size=65 的实心圆点（与主线同色）
+  │   （视觉高亮反馈）
+  │
+  ▼ vega-embed tooltip 插件
+tooltip 命中 point 标记 → formatTooltip(y 值) → 自定义样式弹出
+  │
+  ▼
+鼠标离开图表 → Layer 1 clear:mouseleave 清空选择
+  │
+  └─ Layer 2 filter 空数组 → 圆点消失 + tooltip 关闭
+```
+
+> **与 color 系统的协同**：整个 hover 高亮（高亮圆点颜色、tooltip 文字主题、线/柱颜色）全部由后端决策好的同一个 `color` 枚举驱动，经过 `getMetricColor()` 映射到实际主题色，保持差值徽章与图表交互的视觉一致性。
+
 ---
 
 ## 四、完整协同链路时序
@@ -404,13 +618,14 @@ Metric 组件渲染
    - 前端只做 **视觉执行**（枚举 → 实际 CSS 颜色 + 格式化字符串）
    - 两端通过 Protobuf 的强类型枚举解耦，避免重复判定逻辑。
 
-2. **格式化的前后端边界**
+2. **格式化的前后端边界与默认行为**
    - 后端只保证数字→可被解析的字符串，**不做本地化**
    - 前端利用浏览器 `Intl.NumberFormat` 按用户语言环境格式化
    - 通过 `isNumericString` 守门，避免对已格式化的字符串重复处理
+   - **默认 `format=None` 时完全跳过格式化**，直接使用后端原始字符串（经 StreamlitMarkdown 渲染），保证向后兼容不破坏既有显示。这是一个"功能默认关闭"的渐进式设计。
 
-3. **颜色的三重视觉通道**
-   同一个 `color` 枚举驱动三处视觉：差值徽章 **文字色 + 背景色** + sparkline 图表 **线/填充色**。三处使用不同函数映射，保证徽章的对比度要求和图表的美观度同时满足。
+3. **颜色的多重视觉通道**
+   同一个 `color` 枚举统一驱动：差值徽章 **文字色 + 背景色** + sparkline 图表 **主线色/面积填充色** + **hover 高亮圆点颜色**。四处使用不同函数映射，既保证徽章的文本对比度，又保证图表视觉层次，还保持交互反馈的语义一致性。
 
 4. **方向与箭头的独立控制**
    - `delta_arrow` 参数可强制覆盖 direction（影响箭头显示），但不影响 color
@@ -419,3 +634,13 @@ Metric 组件渲染
 
 5. **前端状态轻量**
    Metric 是 **纯展示组件**（无内部交互状态），仅使用 Hooks 管理图表引用和响应式尺寸，所有语义状态（值、颜色、方向）来自 props，天然适合 `memo` 优化。
+
+6. **Stale 机制的分层传递与豁免**
+   - 通过 `ScriptRunContext → ElementNodeRenderer → ElementContainer → styled-components` 四层管道传递 isStale 信号
+   - 内置 **三大豁免**：全屏模式不减淡（避免全屏报告内容被淡化）、骨架屏不减淡（避免加载态被二次弱化）、非 RUNNING/RERUN_REQUESTED 状态不减淡（保证稳定渲染）
+   - 通过 0.5s 延迟 + 1s ease-in 过渡避免快速 rerun 的视觉闪烁，仅在长计算时才让用户感知到过时标记
+
+7. **Sparkline Hover 的声明式三层架构**
+   - 完全在 Vega-Lite 声明式 spec 中实现交互，不依赖 React 事件监听，避免 DOM 事件与 SVG 的坐标换算
+   - **三层职责分离**：Layer 0 纯展示、Layer 1 纯捕获（视觉不可见）、Layer 2 纯反馈（按需渲染），互不干扰
+   - 通过 `nearest + encodings:["x"]` 降低交互精度要求，1000+ 大数据集时自动节流 mousemove 到 16ms，在可用性和性能间取得平衡
