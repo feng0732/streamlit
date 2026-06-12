@@ -1278,3 +1278,468 @@ T8: 前端按顺序收到消息
 | **self._client_state（会话保存的）** | 主要用于内部触发的重跑（文件变化等），会被 SCRIPT_STARTED 增量更新 | on_source_file_changed 等内部事件 |
 | **sender 检查** | 对象身份比较，过滤来自已不是"当前 runner"的所有事件 | 所有进入 _handle_scriptrunner_event_on_event_loop 的事件 |
 | **有意忽略** / **无意忽略** | fastReruns 的忽略是有意设计（推倒重来），STOP 态 runner 的忽略是副作用 | 12.4 节详述 |
+
+---
+
+## 十四、fragment 重跑的三条完整路径对比
+
+### 14.1 三条路径的触发条件总览
+
+```
+前端发来 fragment rerun BackMsg
+    │
+    ▼
+AppSession.request_rerun(fragment_id="xxx")
+    │
+    ├─ 预检查：fragment_id 存在于 fragment_storage？
+    │   ├─ 否 → 直接 return（不做处理，issue #9921 修复）
+    │   └─ 是 → 继续
+    │
+    ├─ 已有 _scriptrunner？
+    │   ├─ 否 → 直接走【路径 C：新建 runner】
+    │   └─ 是 → 继续
+    │
+    ├─ fastReruns 开启且非 fragment？
+    │   ├─ 是 → STOP 旧 runner，走【路径 C：新建 runner】（非 fragment 场景，本章不展开）
+    │   └─ 否 → 继续（因为是 fragment rerun，永远走此分支）
+    │
+    └─ _scriptrunner.request_rerun(rerun_data) 返回？
+        ├─ True → ScriptRequests 状态是 CONTINUE 或 RERUN
+        │         （脚本仍在运行中或已有排队 rerun）
+        │         → 走【路径 A/B：复用现有 runner】
+        └─ False → ScriptRequests 状态是 STOP
+                  （脚本已自然跑完进入终态）
+                  → 走【路径 C：新建 runner】
+```
+
+---
+
+### 14.2 路径 A：复用现有 runner（抢占式 fragment rerun）
+
+**触发条件**：
+- 旧 runner 仍在运行中（ScriptRequests._state = CONTINUE 或 RERUN）
+- 用户代码显式调用 `st.rerun(scope="fragment")`
+- `is_fragment_scoped_rerun = True`
+
+**核心判断**（[script_requests.py#L86-L97](file:///d:/fz/0601/solo-dogfeeding/code/230-streamlit/lib/streamlit/runtime/scriptrunner_utils/script_requests.py#L86-L97)）：
+```python
+_fragment_run_should_not_preempt_script(fragment_id_queue, is_fragment_scoped_rerun)
+  → bool([frag_id]) and not True → False
+  → should NOT preempt? = False → 意思是"应该抢占"！
+```
+
+**完整代码流程**：
+
+```
+  T1: 用户代码执行 st.rerun(scope="fragment")
+       ↓
+       execution_control.rerun(scope="fragment")
+         ├─ ctx.script_requests.request_rerun(RerunData(
+         │    fragment_id_queue=[ctx.fragment_ids_this_run],
+         │    is_fragment_scoped_rerun=True
+         │  ))
+         │   ├─ ScriptRequests 原状态 = CONTINUE → 转为 RERUN
+         │   └─ 返回 True
+         └─ st.empty()  ← 强制触发 yield 点
+              ↓
+       _maybe_handle_execution_control_request()
+         ├─ request = self._requests.on_scriptrunner_yield()
+         │   ├─ fast-path 检查：
+         │   │   state=RERUN，is_fragment_scoped_rerun=True
+         │   │   → should_not_preempt = False → 不 return None
+         │   ├─ lock: state=RERUN → CONTINUE
+         │   └─ return ScriptRequest(RERUN, rerun_data)
+         ├─ request.type == RERUN
+         └─ raise RerunException(rerun_data)  ← 抛异常中断脚本
+
+  T2: exec_func_with_error_handling 捕获
+       ├─ rerun_exception_data = data
+       ├─ premature_stop = False
+       └─ 清理 cursors/dg_stack
+
+  T3: _run_script 完成，判断 finished_event（[script_runner.py#L818-L825](file:///d:/fz/0601/solo-dogfeeding/code/230-streamlit/lib/streamlit/runtime/scriptrunner/script_runner.py#L818-L825)）：
+       if rerun_exception_data:  → 成立
+         finished_event = SCRIPT_STOPPED_FOR_RERUN  ← 关键！不是 FRAGMENT_STOPPED
+
+  T4: _on_script_finished(SCRIPT_STOPPED_FOR_RERUN, premature_stop=False)
+       ├─ premature_stop=False
+       │   → on_script_finished() 执行，清理 widget
+       │   → on_pages_changed? 清理 cursor
+       └─ emit SCRIPT_STOPPED_FOR_RERUN 事件
+            ↓ call_soon_threadsafe
+            进入主线程队列
+
+  T5: 内层循环：
+       if rerun_exception_data:
+         rerun_data = rerun_exception_data
+       → 不 break，继续下一轮 _run_script
+
+  T6: 新的 _run_script 开始
+       ├─ fragment_id_queue = [fragment_id]（非空）
+       ├─ fragment_ids_this_run = ordered fragment IDs
+       ├─ ctx.reset(...) ← 注入 fragment_ids_this_run
+       └─ 发送 SCRIPT_STARTED（sender=同一 runner）
+            ↓ call_soon_threadsafe
+            进入主线程队列（排在 SCRIPT_STOPPED_FOR_RERUN 之后）
+
+  T7: 主线程按顺序处理事件：
+       ① SCRIPT_STOPPED_FOR_RERUN（sender=当前 runner，正常处理）：
+         ├─ self._state = APP_NOT_RUNNING
+         ├─ 发送 FINISHED_EARLY_FOR_RERUN 给前端
+         ├─ update_watched_modules()（不 update_watched_pages）
+         └─ 发送 session_status_changed(running=false)
+
+       ② SCRIPT_STARTED（sender=当前 runner，正常处理）：
+         ├─ self._state = APP_IS_RUNNING
+         ├─ 更新 page_script_hash 到 self._client_state
+         ├─ _clear_queue(fragment_ids_this_run=[xxx])
+         ├─ 发送 NEW_SESSION（带 fragment_ids_this_run=[xxx]）
+         └─ 发送 session_status_changed(running=true)
+
+  T8: 前端处理消息：
+       ① FINISHED_EARLY_FOR_RERUN：
+         ├─ scriptFinishedHandlers 触发
+         ├─ 不 clearStaleNodes（防闪烁）
+         └─ 不 incrementMessageCacheRunCount
+
+       ② session_status(false)：状态指示器短暂闪烁
+
+       ③ NEW_SESSION（fragment 模式）：
+         ├─ fragmentIdsThisRun.length > 0 → 是
+         ├─ 不 clearAppState
+         ├─ setState(fragmentIdsThisRun, latestRunTime)
+         ├─ page_hash 没变 → elements.clearTransientNodes(fragmentIdsThisRun)
+         └─ hasReceivedNewSession = true
+
+       ④ session_status(true)：指示器恢复
+```
+
+**路径 A 的关键特征**：
+- ✅ sender 相同，所有事件正常处理，无事件被忽略
+- ✅ 抢占式：立即中断当前脚本执行
+- ✅ 前端收到 4 条消息（EARLY_FOR_RERUN + status(false) + NEW_SESSION + status(true)）
+- ⚠️  不清理 stale 节点（设计如此，防闪烁）
+
+---
+
+### 14.3 路径 B：复用现有 runner（非抢占式 fragment auto rerun）
+
+**触发条件**：
+- 旧 runner 仍在运行中（ScriptRequests._state = CONTINUE 或 RERUN）
+- 前端 widget 交互触发（不是用户 `st.rerun(scope="fragment")`）
+- `is_fragment_scoped_rerun = False`（RerunData 默认值）
+
+**核心判断**（[script_requests.py#L86-L97](file:///d:/fz/0601/solo-dogfeeding/code/230-streamlit/lib/streamlit/runtime/scriptrunner_utils/script_requests.py#L86-L97)）：
+```python
+_fragment_run_should_not_preempt_script(fragment_id_queue, is_fragment_scoped_rerun)
+  → bool([frag_id]) and not False → True
+  → should NOT preempt? = True → 意思是"不应该抢占！"
+```
+
+**完整代码流程**：
+
+```
+  T1: 前端 widget 交互，发来 BackMsg（fragment_id="xxx"）
+       ↓
+       AppSession.request_rerun(client_state)
+         ├─ 构造 RerunData：
+         │    fragment_id_queue = ["xxx"]
+         │    is_fragment_scoped_rerun = False（默认值）
+         │    is_auto_rerun = client_state.is_auto_rerun = True
+         └─ _scriptrunner.request_rerun(rerun_data)
+              ├─ ScriptRequests 原状态 = CONTINUE → 转为 RERUN
+              │  （如果原状态已是 RERUN，则合并 fragment_id_queue）
+              └─ 返回 True
+
+  T2: 脚本线程在 yield 点检查
+       _maybe_handle_execution_control_request()
+         └─ request = self._requests.on_scriptrunner_yield()
+              ├─ fast-path 检查：
+              │   state=RERUN，is_fragment_scoped_rerun=False
+              │   → should_not_preempt = True → return None！
+              └─ request is None → return（不抛异常，不中断脚本）
+
+       （脚本继续运行直到自然完成）
+
+  T3: 当前这轮脚本自然完成
+       exec_func_with_error_handling 正常返回（无 rerun_exception_data）
+
+  T4: _run_script 判断 finished_event：
+       if rerun_exception_data → 不成立
+       elif rerun_data.fragment_id_queue → 成立（排队的 fragment 在 rerun_data 中）
+         finished_event = FRAGMENT_STOPPED_WITH_SUCCESS？→ 不对！
+       等等，这里 rerun_data 是"当前这轮"的，不是排队的！
+       实际上当前这轮 rerun_data.fragment_id_queue 可能是空的（full-app）
+
+       重新分析（[script_runner.py#L818-L825](file:///d:/fz/0601/solo-dogfeeding/code/230-streamlit/lib/streamlit/runtime/scriptrunner/script_runner.py#L818-L825)）：
+         if rerun_exception_data → False
+         elif rerun_data.fragment_id_queue → 如果当前是 full-app run 则 False
+         else → True
+         → finished_event = SCRIPT_STOPPED_WITH_SUCCESS（或 FRAGMENT_STOPPED_WITH_SUCCESS）
+
+       具体情况：
+       - 当前是 full-app run（正在排队等 fragment）
+         → rerun_data.fragment_id_queue = []（空）
+         → finished_event = SCRIPT_STOPPED_WITH_SUCCESS
+       - 当前是 fragment run（又有新的 fragment auto rerun 排队）
+         → rerun_data.fragment_id_queue 非空
+         → finished_event = FRAGMENT_STOPPED_WITH_SUCCESS
+
+       假设当前是 full-app run：
+         finished_event = SCRIPT_STOPPED_WITH_SUCCESS
+
+  T5: _on_script_finished(SCRIPT_STOPPED_WITH_SUCCESS, premature_stop=False)
+       ├─ on_script_finished() 执行，清理 widget
+       └─ emit SCRIPT_STOPPED_WITH_SUCCESS 事件
+            ↓ call_soon_threadsafe，排队
+
+  T6: 内层循环：
+       if rerun_exception_data → False
+       break  ← 内层循环退出，回到外层循环
+
+  T7: 外层循环的 on_scriptrunner_ready()（[script_requests.py#L293-L311](file:///d:/fz/0601/solo-dogfeeding/code/230-streamlit/lib/streamlit/runtime/scriptrunner_utils/script_requests.py#L293-L311)）：
+       with lock:
+         if _state == RERUN → 成立（排队的 fragment rerun 在这）
+           _state = CONTINUE
+           return ScriptRequest(RERUN, _rerun_data)  ← 返回排队的 fragment 数据
+
+       → request.type == RERUN → 外层 while 继续，调用 _run_script(rerun_data)
+
+  T8: 新一轮 _run_script（fragment 模式）
+       ├─ rerun_data.fragment_id_queue 非空
+       ├─ fragment_ids_this_run = ["xxx"]
+       ├─ ctx.reset(...) ← 注入 fragment_ids_this_run
+       └─ 发送 SCRIPT_STARTED
+            ↓ call_soon_threadsafe，排队
+
+  T9: 主线程按顺序处理事件：
+       ① SCRIPT_STOPPED_WITH_SUCCESS（sender=当前 runner，正常处理）：
+         ├─ self._state = APP_NOT_RUNNING
+         ├─ 发送 FINISHED_SUCCESSFULLY 给前端
+         ├─ update_watched_modules() + update_watched_pages()
+         └─ 发送 session_status_changed(running=false)
+
+       ② SCRIPT_STARTED（sender=当前 runner，正常处理）：
+         ├─ self._state = APP_IS_RUNNING
+         ├─ 更新 page_script_hash 到 self._client_state
+         ├─ _clear_queue(fragment_ids_this_run=["xxx"])
+         ├─ 发送 NEW_SESSION（带 fragment_ids_this_run=["xxx"]）
+         └─ 发送 session_status_changed(running=true)
+
+  T10: 前端处理消息：
+        ① FINISHED_SUCCESSFULLY：
+          ├─ scriptFinishedHandlers 触发
+          ├─ elements.clearStaleNodes(scriptRunId, fragmentIdsThisRun=[])
+          │   → fragmentIdsThisRun 空 → 清理全量 stale 节点！
+          ├─ removeInactiveWidgetState()
+          └─ incrementMessageCacheRunCount(空 fragment 范围)
+
+        ② session_status(false)：指示器闪烁
+
+        ③ NEW_SESSION（fragment 模式）：
+          ├─ fragmentIdsThisRun.length > 0 → 是
+          ├─ 不 clearAppState
+          ├─ setState(fragmentIdsThisRun, latestRunTime)
+          ├─ elements.clearTransientNodes(["xxx"])
+          └─ hasReceivedNewSession = true
+
+        ④ session_status(true)：指示器恢复
+
+  T11: fragment 脚本自然完成
+        finished_event = FRAGMENT_STOPPED_WITH_SUCCESS
+        emit FRAGMENT_STOPPED_WITH_SUCCESS 事件
+          → 主线程处理：
+              self._state = APP_NOT_RUNNING
+              发送 FINISHED_FRAGMENT_RUN_SUCCESSFULLY
+              update_watched_modules + update_watched_pages
+              session_status_changed(false)
+          → 前端处理：
+              clearStaleNodes(scriptRunId, fragmentIdsThisRun=["xxx"])
+                → 只清 fragment 范围内的 stale 节点
+              removeInactiveWidgetState
+              incrementMessageCacheRunCount(["xxx"])
+```
+
+**路径 B 的关键特征**：
+- ✅ sender 相同，所有事件正常处理，无事件被忽略
+- ✅ 非抢占式：当前 full-app 跑完后才跑 fragment
+- ✅ full-app 的 FINISHED_SUCCESSFULLY 会清理全量 stale 节点（fragmentIdsThisRun 为空时）
+- ✅ fragment 的 FINISHED_FRAGMENT_RUN_SUCCESSFULLY 只清理 fragment 范围内 stale 节点
+- ⚠️  前端收到的完成消息类型取决于"当前正在跑的是什么"：full-app → SUCCESSFULLY，fragment → FRAGMENT_SUCCESSFULLY
+
+---
+
+### 14.4 路径 C：新建 runner（旧 runner 已 STOP）
+
+**触发条件**：
+- 旧 runner 已自然完成（ScriptRequests._state = STOP）
+- `_scriptrunner.request_rerun()` 返回 `False`
+
+**完整代码流程**：
+
+```
+  T1: 旧 runner A 完成上一轮脚本
+       ├─ ScriptRequests.state = STOP（on_scriptrunner_ready 转换）
+       ├─ emit SCRIPT_STOPPED_WITH_SUCCESS / FRAGMENT_STOPPED_WITH_SUCCESS
+       │    ↓ call_soon_threadsafe，排队（还未被主线程处理）
+       ├─ 外层 while 循环退出
+       ├─ 构造 ClientState(query_string / page_hash / context_info)
+       └─ emit SHUTDOWN 事件
+            ↓ call_soon_threadsafe，排队（还未被主线程处理）
+
+  T2: 前端发来 fragment rerun BackMsg（在 T1 事件被处理之前）
+       ↓
+       AppSession.request_rerun(fragment_id="xxx")
+         ├─ fragment_storage.contains("xxx") → True（假设存在）
+         ├─ 构造 RerunData（来自前端 BackMsg 携带的 client_state）
+         ├─ _scriptrunner 仍是 A？→ 是
+         ├─ fastReruns 分支？→ 否（是 fragment rerun）
+         ├─ A.request_rerun(rerun_data) → 返回 False（A.state 已是 STOP）
+         │
+         └─ _create_scriptrunner(rerun_data)
+              ├─ 新建 ScriptRunner B
+              │   ├─ B._requests = ScriptRequests()（全新实例）
+              │   └─ B._requests.request_rerun(rerun_data)
+              │        → state 初始就是 RERUN，不经过 CONTINUE
+              ├─ B.on_event.connect(...) ← 连接新事件处理器
+              ├─ B.start() → 启动脚本线程 B
+              └─ self._scriptrunner = B  ← 引用更新
+
+  T3: B 线程启动，_run_script_thread()
+       ├─ 创建新的 ScriptRunContext（与 A 无关）
+       ├─ on_scriptrunner_ready()：
+       │    state = RERUN → CONTINUE
+       │    return ScriptRequest(RERUN, initial_rerun_data)
+       ├─ 外层 while 循环：request.type == RERUN → 继续
+       └─ _run_script(initial_rerun_data)
+
+  T4: B 的 _run_script（fragment 模式）
+       ├─ fragment_id_queue 非空
+       ├─ fragment_ids_this_run = ["xxx"]
+       ├─ ctx.reset(...) ← 注入 fragment_ids_this_run
+       └─ emit SCRIPT_STARTED（sender=B）
+            ↓ call_soon_threadsafe，排队（排在 A 的事件之后）
+
+  T5: 主线程按顺序处理排队事件：
+       ① A 的 SCRIPT_STOPPED_WITH_SUCCESS（或 FRAGMENT_STOPPED_WITH_SUCCESS）：
+         ├─ sender = A
+         ├─ self._scriptrunner = B
+         ├─ sender is not B → return，完全忽略！
+         │   ├─ 不设 state = APP_NOT_RUNNING（影响不大，B 的 STARTED 会设为 RUNNING）
+         │   ├─ 不发送 FINISHED_SUCCESSFULLY / FRAGMENT_SUCCESSFULLY
+         │   │   ├─ 不 trigger scriptFinishedHandlers
+         │   │   ├─ 不执行 clearStaleNodes()  ◄── 关键！旧元素残留
+         │   │   ├─ 不执行 removeInactiveWidgetState
+         │   │   └─ 不 incrementMessageCacheRunCount
+         │   ├─ 不 update_watched_modules/pages
+         │   └─ 不发送 session_status_changed(running=false)
+
+       ② A 的 SHUTDOWN：
+         ├─ sender = A
+         ├─ sender is not B → return，完全忽略！
+         │   ├─ 不保存 client_state（query_string / page_script_hash / context_info）
+         │   └─ 不设 _scriptrunner = None（已指向 B，无害）
+         └─ 若是 SHUTDOWN_REQUESTED：不清 media / cache（极罕见）
+
+       ③ B 的 SCRIPT_STARTED（sender=B → 正常处理）：
+         ├─ self._state = APP_IS_RUNNING
+         ├─ 更新 page_script_hash 到 self._client_state
+         ├─ _clear_queue(fragment_ids_this_run=["xxx"])
+         ├─ 发送 NEW_SESSION（带 fragment_ids_this_run=["xxx"]）
+         └─ 发送 session_status_changed(running=true)
+              └─ prev=NOT_RUNNING? → 取决于之前状态，通常发
+
+  T6: 前端处理消息（只有 B 的 NEW_SESSION + status，无之前的 FINISHED）：
+       NEW_SESSION（fragment 模式）：
+         ├─ fragmentIdsThisRun.length > 0 → 是
+         ├─ 不 clearAppState
+         ├─ setState(fragmentIdsThisRun, latestRunTime)
+         ├─ page_hash 没变 → elements.clearTransientNodes(["xxx"])
+         │   → 只清 fragment 范围内的 transient 节点
+         ├─ hasReceivedNewSession = true
+         └─ **没有 clearStaleNodes！**因为没有收到 FINISHED 消息
+
+  T7: B 的 fragment 脚本自然完成
+       finished_event = FRAGMENT_STOPPED_WITH_SUCCESS
+       emit FRAGMENT_STOPPED_WITH_SUCCESS（sender=B → 正常处理）
+         → 主线程：
+             self._state = APP_NOT_RUNNING
+             发送 FINISHED_FRAGMENT_RUN_SUCCESSFULLY
+             update_watched_modules + update_watched_pages
+             session_status_changed(false)
+         → 前端：
+             clearStaleNodes(scriptRunId, fragmentIdsThisRun=["xxx"])
+               → 只清 fragment 范围内的 stale 节点
+             removeInactiveWidgetState
+             incrementMessageCacheRunCount(["xxx"])
+```
+
+**路径 C 的关键特征**：
+- ❌ sender 不同，旧 runner A 的所有排队事件被忽略
+- ❌ 旧 runner 的 FINISHED_* 消息丢失 → 前端不执行 clearStaleNodes（全量）
+- ✅ 新 runner B 的事件正常处理
+- ✅ 新 runner B 的 FINISHED_FRAGMENT_SUCCESSFULLY 会清理 fragment 范围内 stale 节点
+- ⚠️  **旧 full-app 的 stale 节点永远不会被清理**，除非之后有 full-app run 的 FINISHED_SUCCESSFULLY
+
+---
+
+### 14.5 三条路径的完整对比表
+
+| 对比维度 | 路径 A：复用（抢占式） | 路径 B：复用（非抢占式） | 路径 C：新建 runner |
+|---------|----------------------|------------------------|-------------------|
+| **触发者** | `st.rerun(scope="fragment")` | 前端 widget 交互 auto rerun | 旧 runner 已 STOP + widget 交互 |
+| `is_fragment_scoped_rerun` | True | False | False |
+| 是否中断当前脚本 | ✅ 立即中断（RerunException） | ❌ 等当前脚本跑完 | ❌ 旧脚本已跑完 |
+| **ScriptRequests 状态转换** | CONTINUE→RERUN→CONTINUE（yield 时） | CONTINUE→RERUN→CONTINUE（ready 时） | 新实例，初始 RERUN→CONTINUE |
+| **完成事件类型** | SCRIPT_STOPPED_FOR_RERUN | SCRIPT_STOPPED_WITH_SUCCESS<br>（当前 full-app 完成时）<br>→ FRAGMENT_STOPPED_WITH_SUCCESS<br>（fragment 完成时） | ❌ 旧 runner 的完成事件被忽略<br>✅ 新 runner：FRAGMENT_STOPPED_WITH_SUCCESS |
+| **sender 检查** | 同一 sender，全部正常 | 同一 sender，全部正常 | 旧 sender 被过滤，新 sender 正常 |
+| **前端 FINISHED 消息** | FINISHED_EARLY_FOR_RERUN | ① FINISHED_SUCCESSFULLY<br>② FINISHED_FRAGMENT_SUCCESSFULLY | ❌ 缺旧的 FINISHED_*<br>✅ FINISHED_FRAGMENT_SUCCESSFULLY（新的） |
+| **前端 NEW_SESSION** | fragment 模式（不清空全量） | fragment 模式（不清空全量） | fragment 模式（不清空全量） |
+| **clearStaleNodes** | ❌ 不执行（EARLY 防闪烁） | ① 全量清理（SUCCESSFULLY，fragmentIdsThisRun 为空）<br>② fragment 范围清理（FRAGMENT_SUCCESSFULLY） | ❌ 旧的不执行<br>✅ 新的 fragment 范围清理 |
+| **clearTransientNodes** | ✅ fragment 范围 | ✅ ① fragment 范围（新的） | ✅ fragment 范围 |
+| **removeInactiveWidgetState** | ❌ 不执行（EARLY） | ✅ 执行两次 | ❌ 旧的不执行<br>✅ 新的执行 |
+| **AppSessionState 变化** | RUNNING→NOT_RUNNING→RUNNING | RUNNING→NOT_RUNNING→RUNNING→NOT_RUNNING | ❌ 旧的 NOT_RUNNING 不设<br>✅ RUNNING→NOT_RUNNING（新的） |
+| **_client_state 更新** | SCRIPT_STARTED 增量更新 page_hash | SCRIPT_STARTED 增量更新 page_hash | ❌ 旧的 SHUTDOWN 不保存<br>✅ SCRIPT_STARTED 增量更新 page_hash |
+| **文件监听更新** | 只 update_watched_modules（EARLY） | update_watched_modules + update_watched_pages（两次） | ❌ 旧的不更新<br>✅ 新的 modules + pages |
+| **incrementMessageCacheRunCount** | ❌ 不执行（EARLY） | ✅ 执行两次 | ❌ 旧的不执行<br>✅ 新的执行 |
+| **前端状态指示器** | RUNNING→NOT→RUNNING（短暂闪烁） | RUNNING→NOT→RUNNING→NOT（完整循环） | ❌ 缺失一次 NOT<br>✅ RUNNING→NOT（新的） |
+| **session_status_changed 消息数** | 2 条（false, true） | 4 条（false, true, false, true...） | ❌ 缺失 1-2 条<br>✅ 2 条（新的） |
+
+---
+
+### 14.6 代码层面的决策流程图
+
+```
+AppSession.request_rerun(fragment_id="xxx")
+  │
+  ├─ 预检查：fragment_id 存在？
+  │   ├─ 否 → 丢弃，结束
+  │   └─ 是 → 继续
+  │
+  ├─ 已有 _scriptrunner？
+  │   ├─ 否 → 路径 C（新建）
+  │   └─ 是 → 继续
+  │
+  ├─ _scriptrunner.request_rerun(rerun_data)
+  │   │
+  │   ├─ state == STOP → 返回 False
+  │   │                  → 路径 C（新建）
+  │   │
+  │   ├─ state == CONTINUE → state = RERUN，存 data，返回 True
+  │   │   │
+  │   │   ├─ is_fragment_scoped_rerun == True（st.rerun(scope="fragment")）
+  │   │   │   → 路径 A（抢占式复用）
+  │   │   │
+  │   │   └─ is_fragment_scoped_rerun == False（widget auto rerun）
+  │   │       → 路径 B（非抢占式复用）
+  │   │
+  │   └─ state == RERUN → 合并 fragment_id_queue，返回 True
+  │       │
+  │       ├─ 其中任一排队请求 is_fragment_scoped_rerun == True
+  │       │   → 路径 A 特性（抢占式）
+  │       │
+  │       └─ 全部 is_fragment_scoped_rerun == False
+  │           → 路径 B 特性（非抢占式）
+  │
+  └─ 路径 A/B/C 处理完成
+```
