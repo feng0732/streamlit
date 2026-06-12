@@ -2,7 +2,7 @@
 
 ## 总览
 
-Streamlit 配置系统采用 **7 层覆盖**策略：高优先级来源的值会覆盖低优先级来源的值。整个加载流程由 `get_config_options()` 函数统一调度，定义在 [lib/streamlit/config.py](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config.py#L2751-L2834)。
+Streamlit 配置系统采用 **7 层覆盖**策略：高优先级来源的值会覆盖低优先级来源的值。整个加载流程由 `get_config_options()` 函数统一调度，定义位于 `lib/streamlit/config.py`。
 
 > **核心提醒**：环境变量有**两套独立机制**——敏感选项和非敏感选项走完全不同的代码路径，这也是最容易混淆的地方。
 
@@ -13,9 +13,9 @@ Streamlit 配置系统采用 **7 层覆盖**策略：高优先级来源的值会
 | 优先级 | 层级 | 来源 | 适用范围 | `where_defined` 标识 |
 |--------|------|------|----------|---------------------|
 | 1（最低） | 默认值层 | 代码内 `_create_option()` 定义的 `default_val` 或装饰器函数 | 所有配置项 | `"<default>"` |
-| 2 | 全局配置文件 | `~/.streamlit/config.toml` | 所有非 `sensitive` 选项 | 配置文件绝对路径 |
-| 3 | 项目配置文件 | `$CWD/.streamlit/config.toml` | 同上 | 配置文件绝对路径 |
-| 4 | 脚本配置文件 | 主脚本所在目录下的 `.streamlit/config.toml` | 同上 | 配置文件绝对路径 |
+| 2 | 全局配置文件 | `~/.streamlit/config.toml` | 所有非 `sensitive` 选项 | 配置文件的实际路径 |
+| 3 | 项目配置文件 | `$CWD/.streamlit/config.toml` | 同上 | 配置文件的实际路径 |
+| 4 | 脚本配置文件 | 主脚本所在目录下的 `.streamlit/config.toml` | 同上 | 配置文件的实际路径 |
 | 5 | 敏感环境变量层 | `STREAMLIT_*` 系列环境变量 | 仅 `sensitive=True` 的选项 | `"environment variable"` |
 | 6 | CLI / 非敏感环境变量层 | CLI flag 与 Click 库的 `envvar` 机制 | 仅 `sensitive=False` 的选项 | `"command-line argument or environment variable"` |
 | 7（最高） | 运行时层 | 脚本内调用 `st.set_option()` | 仅 `scriptable=True` 的选项 | `"<user defined>"` |
@@ -59,7 +59,7 @@ def _global_development_mode() -> bool:
 
 #### 加载顺序
 
-文件查找列表由 `get_config_files()` 返回，定义在 [lib/streamlit/config.py](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config.py#L2726-L2748)。列表顺序决定加载顺序，后加载的覆盖先加载的：
+文件查找列表由 `get_config_files()` 返回，定义位于 `lib/streamlit/config.py`。列表顺序决定加载顺序，后加载的覆盖先加载的：
 
 ```python
 def get_config_files(file_name):
@@ -77,7 +77,7 @@ def get_config_files(file_name):
 
 #### config.toml 内的 `env:` 引用
 
-在 config.toml 中可使用 `env:VAR_NAME` 语法引用外部环境变量，由 `_maybe_read_env_variable()` 解析，定义在 [lib/streamlit/config.py](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config.py#L2672-L2703)：
+在 config.toml 中可使用 `env:VAR_NAME` 语法引用外部环境变量，由 `_maybe_read_env_variable()` 解析，定义位于 `lib/streamlit/config.py`：
 
 ```toml
 [server]
@@ -104,7 +104,7 @@ def _maybe_read_env_variable(value):
 
 ### 2.3 第 5 层：敏感选项的环境变量
 
-**仅适用于 `sensitive=True` 的配置项**，由 `_update_config_with_sensitive_env_var()` 处理，定义在 [lib/streamlit/config.py](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config.py#L2537-L2550)：
+**仅适用于 `sensitive=True` 的配置项**，由 `_update_config_with_sensitive_env_var()` 处理，定义位于 `lib/streamlit/config.py`：
 
 ```python
 def _update_config_with_sensitive_env_var(config_options):
@@ -117,7 +117,7 @@ def _update_config_with_sensitive_env_var(config_options):
         _set_option(opt_name, env_var_value, _DEFINED_BY_ENV_VAR)
 ```
 
-环境变量名规则由 `ConfigOption.env_var` 属性给出，定义在 [lib/streamlit/config_option.py](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config_option.py#L309-L312)：
+环境变量名规则由 `ConfigOption.env_var` 属性给出，定义位于 `lib/streamlit/config_option.py`：
 
 ```python
 @property
@@ -140,7 +140,7 @@ def env_var(self) -> str:
 
 这一层最容易误解：**非敏感选项的环境变量不是在 config.py 里读取，而是在 CLI 层通过 Click 库的 `envvar` 机制统一处理**。
 
-核心代码位于 [lib/streamlit/web/cli.py](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/web/cli.py#L86-L110) 的 `configurator_options()` 装饰器：
+核心代码位于 `lib/streamlit/web/cli.py` 中的 `configurator_options()` 装饰器：
 
 ```python
 def configurator_options(func):
@@ -168,7 +168,7 @@ Click 的 `envvar` 参数语义如下：
 - 若用户没传 CLI flag 但设置了对应环境变量，使用环境变量的值；
 - 两者都没提供，则值为 `None`（不参与覆盖）。
 
-Click 解析后的结果通过 `flag_options` → `options_from_flags` 传入配置系统，中转代码在 [lib/streamlit/web/bootstrap.py](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/web/bootstrap.py#L286-L294)：
+Click 解析后的结果通过 `flag_options` → `options_from_flags` 传入配置系统，中转代码位于 `lib/streamlit/web/bootstrap.py`：
 
 ```python
 options_from_flags = {
@@ -196,7 +196,7 @@ for opt_name, opt_val in options_from_flags.items():
 
 ### 2.5 第 7 层：运行时修改（st.set_option()）
 
-用户脚本中调用 `st.set_option()`，最终进入 `set_user_option()`，定义在 [lib/streamlit/config.py](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config.py#L146-L191)：
+用户脚本中调用 `st.set_option()`，最终进入 `set_user_option()`，定义位于 `lib/streamlit/config.py`：
 
 ```python
 def set_user_option(key, value):
@@ -218,7 +218,7 @@ def set_user_option(key, value):
 
 ## 三、配置来源追踪：where_defined
 
-每个 `ConfigOption` 对象都带有 `where_defined` 字段，记录当前值的最终来源。该字段在 `set_value()` 中每次赋值时更新，定义在 [lib/streamlit/config_option.py](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config_option.py#L242-L260)：
+每个 `ConfigOption` 对象都带有 `where_defined` 字段，记录当前值的最终来源。该字段在 `set_value()` 中每次赋值时更新，定义位于 `lib/streamlit/config_option.py`：
 
 ```python
 def set_value(self, value, where_defined=None):
@@ -243,7 +243,7 @@ def set_value(self, value, where_defined=None):
 
 ## 四、特殊机制：主题继承（theme.base）
 
-当 `theme.base` 指向一个本地 TOML 文件或 URL（而不是简单的 `"light"` 或 `"dark"`）时，会触发额外的主题继承流程。该流程由 `process_theme_inheritance()` 处理，定义在 [lib/streamlit/config_util.py](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config_util.py#L744-L887)，发生在所有常规配置源加载完成**之后**。
+当 `theme.base` 指向一个本地 TOML 文件或 URL（而不是简单的 `"light"` 或 `"dark"`）时，会触发额外的主题继承流程。该流程由 `process_theme_inheritance()` 处理，定义位于 `lib/streamlit/config_util.py`，发生在所有常规配置源加载完成**之后**。
 
 ### 4.1 主题继承的子优先级链
 
@@ -286,13 +286,13 @@ def process_theme_inheritance(config_options, ...):
         set_option_func(opt_name, opt_data["value"], opt_data["where_defined"])
 ```
 
-主题配置的深层字典合并由 `_deep_merge_theme_dicts()` 完成，定义在 [lib/streamlit/config_util.py](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config_util.py#L684-L701)。
+主题配置的深层字典合并由 `_deep_merge_theme_dicts()` 完成，定义位于 `lib/streamlit/config_util.py`。
 
 ---
 
 ## 五、冲突检测与自动修正
 
-常规配置加载完成后，通过 `on_config_parsed` 信号触发 `_check_conflicts()` 进行冲突检查，定义在 [lib/streamlit/config.py](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config.py#L2837-L2879)。目前包含两条规则：
+常规配置加载完成后，通过 `on_config_parsed` 信号触发 `_check_conflicts()` 进行冲突检查，定义位于 `lib/streamlit/config.py`。目前包含两条规则：
 
 1. **开发模式端口冲突**：当 `global.developmentMode=true` 时，禁止设置 `server.port` 或 `browser.serverPort`，直接抛异常。
 
@@ -351,9 +351,9 @@ port = 9000
 
 | 文件（仓库相对路径） | 作用 |
 |----------------------|------|
-| [lib/streamlit/config.py](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config.py) | 配置系统主模块：定义全部选项、加载合并主逻辑、敏感环境变量处理 |
-| [lib/streamlit/config_option.py](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config_option.py) | `ConfigOption` 类：存储单个配置项的元数据与值，维护 `where_defined` |
-| [lib/streamlit/config_util.py](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config_util.py) | 配置工具：主题继承处理、`streamlit config show` 输出 |
-| [lib/streamlit/web/cli.py](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/web/cli.py) | CLI 入口：非敏感选项的环境变量通过 Click 的 `envvar` 机制解析 |
-| [lib/streamlit/web/bootstrap.py](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/web/bootstrap.py) | 启动引导：将 CLI 解析结果传入配置系统 |
-| [lib/tests/streamlit/config_test.py](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/tests/streamlit/config_test.py) | 单元测试：包含各层覆盖优先级的验证用例 |
+| `lib/streamlit/config.py` | 配置系统主模块：定义全部选项、加载合并主逻辑、敏感环境变量处理 |
+| `lib/streamlit/config_option.py` | `ConfigOption` 类：存储单个配置项的元数据与值，维护 `where_defined` |
+| `lib/streamlit/config_util.py` | 配置工具：主题继承处理、`streamlit config show` 输出 |
+| `lib/streamlit/web/cli.py` | CLI 入口：非敏感选项的环境变量通过 Click 的 `envvar` 机制解析 |
+| `lib/streamlit/web/bootstrap.py` | 启动引导：将 CLI 解析结果传入配置系统 |
+| `lib/tests/streamlit/config_test.py` | 单元测试：包含各层覆盖优先级的验证用例 |
