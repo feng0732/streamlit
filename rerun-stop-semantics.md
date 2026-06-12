@@ -476,3 +476,276 @@ APP_NOT_RUNNING  ──request_rerun()──►  APP_IS_RUNNING
 4. **`premature_stop` 的反直觉**：Rerun 明明"中断"了脚本，却 `premature_stop=False`，会执行 cleanup。这是因为从 widget 生命周期看，rerun 是新一轮的开始，旧元素可以清理；而 stop 是真的停了，要保留当前页面元素。
 
 5. **双层循环 + 双状态机**：外层 ScriptRequests 三态 × 内层 AppSession 三态 × 双层循环的组合，让"停止"概念有多种层次（ScriptRequests.STOP、内层 break、外层退出、ScriptRunner.SHUTDOWN、AppSession.NOT_RUNNING），与"重跑"的多类触发（用户 st.rerun、前端交互、fastReruns 新建 runner、fragment auto）交织在一起。
+
+---
+
+## 十一、会话层边界——已停止 runner 与 fragment 重跑的交互
+
+### 11.1 当遇到已停止的 runner 时，fragment 重跑的处理方式
+
+`AppSession.request_rerun()` 的完整分支逻辑（[app_session.py#L466-L488](file:///d:/fz/0601/solo-dogfeeding/code/230-streamlit/lib/streamlit/runtime/app_session.py#L466-L488)）：
+
+```
+已有 _scriptrunner ?
+    │
+    ├─ 是：
+    │   ├─ 条件 A：fastReruns 开启 AND 非 fragment rerun
+    │   │   ├─ _scriptrunner.request_stop()      ◄── STOP 旧 runner
+    │   │   └─ _scriptrunner = None              ◄── 丢弃引用
+    │   │
+    │   └─ 条件 B：其他（fastReruns 关闭 或 fragment rerun）
+    │       ├─ success = _scriptrunner.request_rerun(rerun_data)
+    │       │
+    │       ├─ success == True  → return  ◄── 复用现有 runner，万事大吉
+    │       │
+    │       └─ success == False → 继续向下  ◄── runner 已 STOP，无法接受请求
+    │
+    └─ 否 / 上一步返回 False：
+        └─ _create_scriptrunner(rerun_data)    ◄── 新建 runner 并启动
+```
+
+**`request_rerun()` 返回 False 的唯一条件**（[script_requests.py#L186-L189](file:///d:/fz/0601/solo-dogfeeding/code/230-streamlit/lib/streamlit/runtime/scriptrunner_utils/script_requests.py#L186-L189)）：
+```python
+if self._state == ScriptRequestType.STOP:
+    return False
+```
+
+> **关键边界点**：当 ScriptRunner 跑完一轮脚本后，`on_scriptrunner_ready()` 会将 state 从 CONTINUE 转为 STOP（见第 4.5 节混淆点 3）。此时 ScriptRunner 还未退出线程，正在准备发送 SHUTDOWN 事件，但 `_state` 已经是 STOP 终态。
+
+**在这个时间窗口内，如果收到 fragment 重跑请求**：
+1. `_scriptrunner.request_rerun()` → 返回 False（因为 `_state == STOP`）
+2. 条件判断继续向下，走到 `_create_scriptrunner(rerun_data)`
+3. **新建 ScriptRunner**，并将 `self._scriptrunner` 指向新实例
+
+---
+
+### 11.2 为何旧 runner 的事件会被忽略（sender 检查机制）
+
+#### 11.2.1 跨线程事件传递机制
+
+ScriptRunner 事件的传递是**异步跨线程**的（[app_session.py#L569-L597](file:///d:/fz/0601/solo-dogfeeding/code/230-streamlit/lib/streamlit/runtime/app_session.py#L569-L597)）：
+
+```
+脚本线程（ScriptRunner）                     主线程（EventLoop）
+     │                                            │
+     │  on_event.send(event)                      │
+     │    └─ _on_scriptrunner_event(sender=self)  │
+     │         └─ call_soon_threadsafe(...) ─────►│
+     │                                            │  排队中...
+     │                                            │
+     │                                            ▼
+     │                                    _handle_scriptrunner_event_on_event_loop(
+     │                                        sender=old_runner,
+     │                                        event=SHUTDOWN,
+     │                                        ...
+     │                                    )
+```
+
+事件从脚本线程发出后，通过 `call_soon_threadsafe()` 排队到主线程的 event loop。这意味着**事件的发出和处理之间存在时间差**。
+
+#### 11.2.2 sender 身份检查
+
+在事件处理函数的最开始，有一道关键的闸门（[app_session.py#L654-L661](file:///d:/fz/0601/solo-dogfeeding/code/230-streamlit/lib/streamlit/runtime/app_session.py#L654-L661)）：
+
+```python
+if sender is not self._scriptrunner:
+    _LOGGER.debug("Ignoring event from non-current ScriptRunner: %s", event)
+    return
+```
+
+**这是一个对象身份比较（`is` 而非 `==`）**，检查发送事件的 ScriptRunner 对象是否就是 AppSession 当前持有的 `_scriptrunner` 引用。
+
+#### 11.2.3 典型时序：事件被忽略的完整过程
+
+```
+  时间轴 →
+    │
+    ├─ T1: ScriptRunner A 跑完脚本，on_scriptrunner_ready()
+    │       → state = STOP
+    │       → 外层 while 循环退出
+    │
+    ├─ T2: ScriptRunner A 准备发送 SHUTDOWN 事件
+    │       （构造 ClientState，包含 query_string、page_script_hash 等）
+    │
+    ├─ T3: 前端发来 fragment 重跑请求（在 T2 之后，但在 T6 之前）
+    │       ↓
+    │       AppSession.request_rerun(fragment_id="xxx")
+    │         ├─ _scriptrunner 仍是 A
+    │         ├─ A.request_rerun() → 返回 False（A._state 已是 STOP）
+    │         ├─ 新建 ScriptRunner B
+    │         └─ self._scriptrunner = B  ◄── 引用已更新！
+    │
+    ├─ T4: ScriptRunner B 开始启动，连接事件处理器
+    │
+    ├─ T5: 主线程 event loop 开始处理排队的事件
+    │
+    ├─ T6: 处理 ScriptRunner A 的 SHUTDOWN 事件
+    │       ├─ sender = A
+    │       ├─ self._scriptrunner = B
+    │       ├─ sender is not self._scriptrunner → True！
+    │       └─ return  ◄── 事件被完全忽略！
+    │
+    └─ T7: ScriptRunner A 的线程静默退出，无人知晓
+```
+
+**被忽略的 SHUTDOWN 事件会导致两个严重问题**（[app_session.py#L427-L441](file:///d:/fz/0601/solo-dogfeeding/code/230-streamlit/lib/streamlit/runtime/app_session.py#L427-L441)）：
+
+1. **`_client_state` 未保存**：SHUTDOWN 事件本应更新 `self._client_state` 为 A 最终的 ClientState（[app_session.py#L746-L753](file:///d:/fz/0601/solo-dogfeeding/code/230-streamlit/lib/streamlit/runtime/app_session.py#L746-L753)）。这意味着下次重跑时，可能丢失 context_info（如浏览器时区）等信息。
+
+2. **`_scriptrunner` 引用不一致**：SHUTDOWN 事件本应将 `self._scriptrunner = None`（[app_session.py#L753](file:///d:/fz/0601/solo-dogfeeding/code/230-streamlit/lib/streamlit/runtime/app_session.py#L753)），但由于事件被忽略，虽然 `_scriptrunner` 已被设为 B，但 A 的清理逻辑未执行。更严重的是，如果 B 之后也完成了，它的 SHUTDOWN 会把引用置 None，系统状态变得混乱。
+
+3. **full-app-run 清理不执行**：SHUTDOWN 事件关联的 media file 清理、session cache 清理等（[app_session.py#L749-L750](file:///d:/fz/0601/solo-dogfeeding/code/230-streamlit/lib/streamlit/runtime/app_session.py#L749-L750)）也不会执行。
+
+---
+
+### 11.3 这些分支与 fast rerun 的关联
+
+#### 11.3.1 两条路径都会导致"旧 runner 事件被忽略"
+
+| 触发场景 | 路径 | `_scriptrunner` 何时更新 | 旧 runner 状态 |
+|----------|------|-------------------------|----------------|
+| **fastReruns 模式**（full-app rerun） | [app_session.py#L467-L476](file:///d:/fz/0601/solo-dogfeeding/code/230-streamlit/lib/streamlit/runtime/app_session.py#L467-L476)：<br>`request_stop()` → `_scriptrunner = None` → 创建新 runner | 在创建新 runner **之前**就已置 None | 被显式 request_stop |
+| **fragment 遇到 STOP 态 runner** | [app_session.py#L477-L488](file:///d:/fz/0601/solo-dogfeeding/code/230-streamlit/lib/streamlit/runtime/app_session.py#L477-L488)：<br>`request_rerun()` 返回 False → 创建新 runner | 在创建新 runner **之后**更新引用 | 已自然进入 STOP 终态 |
+
+**共同点**：两者都会在旧 runner 的 SHUTDOWN 事件被处理之前，更新 `_scriptrunner` 引用，导致 sender 检查失败。
+
+#### 11.3.2 关键差异：`fragment_storage.clear()` 的时机
+
+**full-app 模式**（[script_runner.py#L798-L800](file:///d:/fz/0601/solo-dogfeeding/code/230-streamlit/lib/streamlit/runtime/scriptrunner/script_runner.py#L798-L800)）：
+```python
+# 只有 full-app 正常跑完才会走到这里
+self._fragment_storage.clear(
+    new_fragment_ids=ctx.new_fragment_ids.snapshot()
+)
+```
+
+- `fragment_storage.clear()` 会**删除所有未在本次运行中重新注册的 fragment**
+- 这意味着：full-app 跑完后，所有 `@st.fragment` 装饰的函数都被重新注册到新的存储中，旧的 fragment_id 全部失效
+
+**fragment 模式**：
+- 不会调用 `fragment_storage.clear()`，fragment_id 始终有效
+- 但如果 fragment 是在 full-app 运行中被删除（如条件渲染不再走到 fragment），它也会被 `clear_stale_descendants` 清理
+
+#### 11.3.3 fastReruns 与 fragment 的互斥设计
+
+注意 `fastReruns` 条件中的 `not rerun_data.fragment_id`（[app_session.py#L468-L470](file:///d:/fz/0601/solo-dogfeeding/code/230-streamlit/lib/streamlit/runtime/app_session.py#L468-L470)）：
+
+```python
+if (
+    bool(config.get_option("runner.fastReruns"))
+    and not rerun_data.fragment_id  # 关键：只有非 fragment rerun 才走 fastReruns
+):
+```
+
+**设计意图**：
+- full-app rerun 可以安全地"杀旧建新"，因为新 runner 会重新执行整个脚本，重建所有状态
+- fragment rerun 不能杀旧 runner，因为 fragment 依赖于当前 runner 的 `fragment_storage`、`session_state` 等上下文
+- 但如果旧 runner 已经 STOP（跑完了一轮），就不得不新建 runner
+
+---
+
+### 11.4 防御性修复：fragment 存在性预检查
+
+为了解决 issue #9921（对话框有时无法关闭），代码中增加了一道**提前检查**（[app_session.py#L427-L448](file:///d:/fz/0601/solo-dogfeeding/code/230-streamlit/lib/streamlit/runtime/app_session.py#L427-L448)）：
+
+```python
+# Early check whether this fragment still exists in the fragment storage or
+# might have been removed by a full app run.
+if fragment_id and not self._fragment_storage.contains(fragment_id):
+    _LOGGER.info(
+        "The fragment with id %s does not exist anymore - "
+        "it might have been removed during a preceding full-app rerun.",
+        fragment_id,
+    )
+    return  # 直接丢弃请求，不创建新 runner
+```
+
+**这道检查解决的问题**：
+- 如果前面的 full-app runner 已经执行了 `fragment_storage.clear()`，那么该 fragment_id 已失效
+- 此时即使创建了新 runner 去跑这个 fragment，也会在 `_run_script` 中抛出 `FragmentStorageKeyError`
+- 提前检查可以避免创建不必要的 runner，也避免了新旧 runner 交替导致的事件丢失
+
+**但这道检查不解决的问题**：
+- 如果 full-app runner 跑完了脚本，但 `fragment_storage.clear()` 已经执行（fragment 已失效），此时检查能拦住
+- 但如果 fragment 仍然有效（比如刚跑完还没触发 clear，或者根本没有 full-app 运行），检查通过，还是会创建新 runner，旧 runner 的 SHUTDOWN 事件还是会被忽略
+
+---
+
+### 11.5 完整的 Race Condition 全景图（issue #9921 场景）
+
+```
+ T0: 用户打开对话框（fragment "dialog_frag"）
+     → fragment_id = "dialog_frag" 被注册到 fragment_storage
+
+ T1: 用户点击对话框中的按钮，触发 fragment 交互
+     → 前端发送 rerun_script BackMsg，fragment_id="dialog_frag"
+
+ T2: 同时，某个 full-app 重跑正在进行（比如 fastReruns 触发）
+     │
+     ├─ T2a: ScriptRunner A（full-app）正常完成
+     │      ├─ 执行 fragment_storage.clear()  ◄── "dialog_frag" 被清除！
+     │      ├─ on_scriptrunner_ready()
+     │      │   → state = STOP
+     │      ├─ 准备发送 SHUTDOWN 事件
+     │      └─ call_soon_threadsafe(SHUTDOWN, sender=A)  ◄── 排队到主线程
+     │
+     └─ T2b: 前端的 fragment 重跑请求到达 AppSession
+          ├─ request_rerun(client_state.fragment_id="dialog_frag")
+          │
+          ├─ 检查 fragment_storage.contains("dialog_frag")
+          │   → False！（因为 T2a 已经 clear 了）
+          │
+          └─ 直接 return，不做任何处理
+              └─ 对话框不会关闭，因为没有新的 runner 去执行关闭逻辑
+```
+
+如果**没有**这道预检查，会发生更糟的情况：
+```
+ T2b 没有预检查的路径：
+   ├─ _scriptrunner 仍是 A
+   ├─ A.request_rerun() → 返回 False（A.state 已是 STOP）
+   ├─ 创建 ScriptRunner B
+   ├─ B 开始运行 fragment "dialog_frag"
+   ├─ B 在 _run_script 中调用 fragment_storage.lookup("dialog_frag")
+   │   → 抛出 FragmentStorageKeyError！
+   └─ 整个脚本出错，对话框可能显示错误信息
+```
+
+---
+
+### 11.6 语义混淆点补充（第 11-13 点）
+
+| # | 场景 | 说明 |
+|---|------|------|
+| 11 | **STOP 态的两种含义** | ScriptRequests.STOP 既可以是"被 request_stop() 强制停止"，也可以是"脚本自然跑完进入终态"。后者虽然叫 STOP，但 ScriptRunner 还活着，还在发 SHUTDOWN 事件。 |
+| 12 | **sender 检查的双刃剑** | `sender is not self._scriptrunner` 能有效防止过期事件干扰新 runner，但也会导致正常的 SHUTDOWN 清理逻辑被跳过。这是正确性 vs 简单性的权衡。 |
+| 13 | **fastReruns 与 fragment 的不对称** | full-app rerun 可以主动 STOP 旧 runner 再新建；fragment rerun 只能被动接受旧 runner 的状态（复用或被拒）。这种不对称是理解所有边界情况的钥匙。 |
+
+---
+
+### 11.7 边界情况汇总决策树
+
+```
+收到 rerun 请求（带 fragment_id）
+    │
+    ├─ ▶ fragment_id 存在于 fragment_storage 吗？
+    │   ├─ 否 → 丢弃请求（issue #9921 修复）
+    │   └─ 是 → 继续
+    │
+    ├─ ▶ 已有 _scriptrunner 吗？
+    │   ├─ 否 → 新建 runner，结束
+    │   └─ 是 → 继续
+    │
+    ├─ ▶ fastReruns 开启 且 非 fragment？
+    │   ├─ 是 → STOP 旧 runner，丢弃引用，新建 runner
+    │   │      （旧 runner 的 SHUTDOWN 事件会被 sender 检查忽略）
+    │   └─ 否 → 继续
+    │
+    ├─ ▶ _scriptrunner.request_rerun() 返回？
+    │   ├─ True → 复用成功，结束
+    │   └─ False → runner 已 STOP，新建 runner
+    │            （旧 runner 的 SHUTDOWN 事件会被 sender 检查忽略）
+    │
+    └─ 新建 runner 完成
+        └─ 新 runner 开始运行，旧 runner 的后续事件全部被忽略
+```
