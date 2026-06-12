@@ -19,10 +19,11 @@
                        │
                        ▼
 ┌──────────────────────────────────────────────────────┐
-│  Python 后端 - MediaFileManager 注册                   │
-│  • 计算内容 hash 生成 file_id                           │
-│  • 存储到 MemoryMediaFileStorage (内存字典)             │
-│  • 返回相对 URL: /media/{file_id}.{ext}                │
+│  MediaFileManager.add() — 注册与协调                   │
+│  ├─ [Manager] 获取 session_id，决定 kind               │
+│  ├─ [Storage] 存储内容、计算 hash 生成 file_id          │
+│  ├─ [Manager] 记录 file_id → session+coord 引用        │
+│  └─ [Storage] 根据 file_id 生成相对 URL                │
 └──────────────────────┬───────────────────────────────┘
                        │
                        ▼
@@ -44,7 +45,7 @@
                        ▼
 ┌──────────────────────────────────────────────────────┐
 │  Starlette HTTP 服务 - /media/{file_id}                │
-│  • 根据 file_id 从 MemoryMediaFileStorage 取出 bytes    │
+│  • [Storage] 根据 file_id 取出 bytes                    │
 │  • 设置 Content-Type / Accept-Ranges / CORS            │
 │  • 支持 HTTP Range 请求 (视频流媒体)                     │
 └──────────────────────────────────────────────────────┘
@@ -103,21 +104,33 @@
   [media.py](lib/streamlit/elements/media.py#L415-L446)
 - **字幕文件** → `process_subtitle_data()` 同样注册到 MediaFileManager
 
-### 2.4 MediaFileManager：注册与生成 URL
+### 2.4 写入路径：`MediaFileManager.add()` 协调流程
 
-核心类在 [media_file_manager.py](lib/streamlit/runtime/media_file_manager.py#L82-L409)。
+[media_file_manager.py](lib/streamlit/runtime/media_file_manager.py#L223-L285) 的 `add()` 方法是写入路径的枢纽，但**它自身不计算 file_id、不存储内容、不拼接 URL**——这些全部委托给 Storage 层。
 
-**关键数据结构：**
+**`add(path_or_data, mimetype, coordinates)` 逐行对应代码的执行流程：**
+
 ```python
-self._files_by_id: dict[str, MediaFileMetadata]
-self._files_by_session_and_coord: dict[session_id, dict[coordinates, file_id]]
-```
+# [Manager 职责] 获取当前 session 标识
+session_id = _get_session_id()
 
-**`add(path_or_data, mimetype, coordinates)` 流程：**
-1. 通过 `_get_session_id()` 获取当前 AppSession 的 session_id
-2. 调用 `storage.load_and_get_id()` 存储并拿到 file_id
-3. 建立两层索引：`session_id → coordinates → file_id`
-4. 返回 `storage.get_url(file_id)`
+with self._lock:
+    # [Manager 职责] 根据业务语义决定文件种类
+    kind = MediaFileKind.DOWNLOADABLE if is_for_static_download else MediaFileKind.MEDIA
+
+    # [Storage 职责] 存储内容 + 计算 hash → 返回 file_id
+    file_id = self._storage.load_and_get_id(path_or_data, mimetype, kind, file_name)
+
+    # [Manager 职责] 记录生命周期元数据
+    metadata = MediaFileMetadata(kind=kind)
+    self._file_metadata[file_id] = metadata
+
+    # [Manager 职责] 建立会话引用追踪
+    self._files_by_session_and_coord[session_id][coordinates] = file_id
+
+    # [Storage 职责] 根据 file_id 生成可访问的 URL
+    return self._storage.get_url(file_id)
+```
 
 **coordinates 的作用**：格式如 `"1.(3.-14).5-0"`，是元素在 Delta 树中的路径 + 在列表中的索引。用来在同一位置元素被替换时，旧的 file_id 可以被判定为 orphan 并清理。
 
@@ -125,8 +138,8 @@ self._files_by_session_and_coord: dict[session_id, dict[coordinates, file_id]]
 
 [memory_media_file_storage.py](lib/streamlit/runtime/memory_media_file_storage.py)
 
-**`load_and_get_id()`：**
-- 若是文件路径字符串，先读成 bytes
+**`load_and_get_id()`**— 存储**内容**并返回 file_id：
+- 若是文件路径字符串，先通过 `_read_file()` 读成 bytes
 - 调用 `_calculate_file_id()` 生成稳定 ID：
   ```
   hash( content_length + content + mimetype + filename )
@@ -135,8 +148,9 @@ self._files_by_session_and_coord: dict[session_id, dict[coordinates, file_id]]
 - 存到 `self._files_by_id[file_id] = MemoryFile(content, mimetype, kind, filename)`
 - 因为 file_id 是内容哈希，**相同内容不会重复存储**
 
-**`get_url(file_id)`：**
+**`get_url(file_id)`**— 生成媒体 URL：
 ```python
+media_file = self.get_file(file_id)
 extension = get_extension_for_mimetype(media_file.mimetype)
 return f"{self._media_endpoint}/{file_id}{extension}"
 # 例如: /media/abc123def456.jpg
@@ -148,7 +162,7 @@ return f"{self._media_endpoint}/{file_id}{extension}"
 
 ### 3.1 接口抽象层：MediaFileStorage 协议
 
-[media_file_storage.py](lib/streamlit/runtime/media_file_storage.py#L42-L143) 定义了纯抽象接口（Protocol），定义存储层必须实现的三个核心能力：
+[media_file_storage.py](lib/streamlit/runtime/media_file_storage.py#L42-L143) 定义了纯抽象接口（Protocol），声明存储层必须实现的三个核心能力：
 
 ```python
 class MediaFileStorage(Protocol):
@@ -174,8 +188,9 @@ class MediaFileStorage(Protocol):
 
 | 状态 | MediaFileManager | MediaFileStorage (Memory) |
 |---|---|---|
-| **二进制内容** | ❌ 不持有 | ✅ `_files_by_id: dict[str, MemoryFile]` |
-| **内容元数据** | ✅ `_file_metadata: dict[str, MediaFileMetadata]` (kind, is_marked_for_delete) | ✅ 内嵌于 `MemoryFile` (mimetype, kind, filename) |
+| **二进制内容 (bytes)** | ❌ 不持有 | ✅ `_files_by_id: dict[str, MemoryFile]` — MemoryFile 含 content |
+| **内容描述元数据** | ❌ 不持有 | ✅ 内嵌于 `MemoryFile` (mimetype, kind, filename) |
+| **生命周期元数据** | ✅ `_file_metadata: dict[str, MediaFileMetadata]` (kind, is_marked_for_delete) | ❌ 不感知 |
 | **Session 引用关系** | ✅ `_files_by_session_and_coord: dict[session_id, dict[coord, file_id]]` | ❌ 不感知 |
 | **延迟执行逻辑** | ✅ `_deferred_callables: dict[str, DeferredCallableEntry]` | ❌ 不感知 |
 | **线程安全** | ✅ `_lock: threading.Lock` | ❌ 不做同步（由 Manager 保证） |
@@ -183,45 +198,47 @@ class MediaFileStorage(Protocol):
 | **统计信息** | ❌ 不提供 | ✅ 实现 `StatsProvider` 接口，提供内存使用统计 |
 
 **核心结论**：
-- **Storage 层** 维护「内容本身」：bytes 存哪里、怎么存、怎么取、怎么算 ID
+- **Storage 层** 维护「内容本身」：bytes 存哪里、怎么存、怎么取、怎么算 ID、怎么拼 URL
 - **Manager 层** 维护「生命周期」：谁在用、用在哪、什么时候删、并发安全
 
-### 3.3 媒体 URL 生成流程（写路径）
+### 3.3 写入路径中 file_id 与媒体 URL 的归属
 
-调用链：`image_to_url()` → `MediaFileManager.add()` → `Storage.load_and_get_id()` → `Storage.get_url()`
+`MediaFileManager.add()` 是写入路径的唯一入口，但**file_id 和 URL 的生成都不在 Manager 内部完成**，而是分别由 Storage 的两个方法承担：
+
+| 产物 | 由谁生成 | 具体方法 | 生成算法 |
+|---|---|---|---|
+| **file_id** | **Storage 层** | `MemoryMediaFileStorage.load_and_get_id()` | `_calculate_file_id(data, mimetype, filename)` — 内容哈希 |
+| **媒体 URL** | **Storage 层** | `MemoryMediaFileStorage.get_url()` | `f"{_media_endpoint}/{file_id}{extension}"` — endpoint + ID + 扩展名 |
+
+Manager 在 `add()` 中的角色是**协调者**：依次调用 Storage 的两个方法，并在中间插入自己的生命周期管理逻辑（记录 metadata、建立 session 引用）。
+
+**完整数据流：**
 
 ```
-用户数据 (bytes/str/PIL/numpy)
-        │
-        ▼
-image_to_url() — 格式归一化为 bytes + mimetype
-        │
+image_to_url() / _marshall_av_media()
+        │  传入 bytes + mimetype
         ▼
 MediaFileManager.add(data, mimetype, coordinates)
-  1. _get_session_id() → "session_abc123"
-  2. self._lock.acquire()
-  3. storage.load_and_get_id(data, mimetype, kind, filename)
-     ├─ 若 data 是文件路径 → _read_file() 读为 bytes
-     ├─ _calculate_file_id(bytes, mimetype, filename) → "file_xyz789"
-     └─ 若 ID 不存在 → _files_by_id["file_xyz789"] = MemoryFile(bytes, ...)
-  4. _file_metadata["file_xyz789"] = MediaFileMetadata(kind=MEDIA)
-  5. _files_by_session_and_coord["session_abc123"][coordinates] = "file_xyz789"
-  6. storage.get_url("file_xyz789")
-     ├─ get_file("file_xyz789") → MemoryFile
-     ├─ get_extension_for_mimetype("image/jpeg") → ".jpg"
-     └─ return "/media/file_xyz789.jpg"
-  7. self._lock.release()
         │
-        ▼
-返回: "/media/file_xyz789.jpg"
+        ├──① session_id = _get_session_id()           [Manager: 获取会话标识]
+        ├──② kind = MEDIA or DOWNLOADABLE              [Manager: 决定文件种类]
+        ├──③ file_id = storage.load_and_get_id(...)    [Storage: 存储 + 算 hash]
+        ├──④ _file_metadata[file_id] = Metadata(kind)  [Manager: 记录生命周期]
+        ├──⑤ _files_by_session_and_coord[...] = file_id [Manager: 建立会话引用]
+        └──⑥ return storage.get_url(file_id)           [Storage: 拼接 URL]
 ```
 
-**关键分层点**：
-- Manager 不知道 file_id 怎么算的，也不知道 URL 怎么拼的
-- Storage 不知道 session_id 是什么，也不知道 coordinates 有什么用
-- 两者通过 `file_id` 这个唯一标识符解耦
+### 3.4 `kind` 字段的归属：Manager 决定，Storage 记录
 
-### 3.4 媒体 URL 读取流程（读路径 / HTTP 层）
+`kind`（`MediaFileKind.MEDIA` 或 `MediaFileKind.DOWNLOADABLE`）在两层都有存储，但含义不同：
+
+- **Manager 决定 kind**：在 `add()` 中根据 `is_for_static_download` 参数判断，这是业务语义
+- **Manager 用 kind 做清理策略**：`remove_orphaned_files()` 中，MEDIA 类型直接删除，DOWNLOADABLE 类型先标记再延迟删除
+- **Storage 存储 kind**：`MemoryFile` 中保存 kind 是为了在 HTTP 响应时判断是否加 `Content-Disposition: attachment` 头
+
+所以 kind 是 Manager 的**决策结果**，传递给 Storage 作为**服务行为的依据**。两层存储同一字段，但用途不同。
+
+### 3.5 媒体 URL 读取流程（读路径 / HTTP 层）
 
 调用链：`GET /media/file_xyz789.jpg` → `Starlette _media_endpoint` → `Storage.get_file()`
 
@@ -248,18 +265,16 @@ media_storage.get_file("file_xyz789.jpg")
 - HTTP 层**绕过 Manager 直接访问 Storage**，因为读取路径不需要生命周期管理
 - 这也解释了为什么 Storage 必须独立存在：它同时被 Manager（写路径）和 Starlette 路由（读路径）调用
 
-### 3.5 引用计数与垃圾回收
+### 3.6 引用计数与垃圾回收
 
 `remove_orphaned_files()` 是 Manager 层的核心职责，完全基于自己维护的状态判断，Storage 不参与决策：
 
 ```python
 def _get_inactive_file_ids(self) -> set[str]:
-    # 所有已知的 file_id
     file_ids = set(self._file_metadata.keys())
-    # 减去所有 session 正在引用的 file_id
     for session_file_ids_by_coord in self._files_by_session_and_coord.values():
         file_ids.difference_update(session_file_ids_by_coord.values())
-    return file_ids  # 剩下的就是孤儿文件
+    return file_ids
 
 def remove_orphaned_files(self) -> None:
     with self._lock:
@@ -270,7 +285,9 @@ def remove_orphaned_files(self) -> None:
                 del self._file_metadata[file_id]    # 清理自己的元数据
 ```
 
-### 3.6 边界模糊点澄清
+注意：`_get_inactive_file_ids()` 基于 `_file_metadata` 计算，而不是基于 Storage 的 `_files_by_id`。Manager 不需要查询 Storage 就能知道哪些文件该被清理。
+
+### 3.7 边界模糊点澄清
 
 **Q: 为什么 `MediaFileMetadata` 由 Manager 维护，而不是存到 Storage 里？**
 
@@ -278,7 +295,7 @@ A: `MediaFileMetadata` 的 `is_marked_for_delete` 字段是生命周期状态（
 
 **Q: 为什么 `MediaFileManager.add()` 调用 `storage.get_url()` 而不是自己拼 URL？**
 
-A: URL 格式是存储层的内部约定。如果未来换成 S3 存储，URL 可能变成 `https://bucket.s3.amazonaws.com/file_xyz789.jpg`，Manager 层代码不需要改动。
+A: URL 格式是存储层的内部约定。如果未来换成 S3 存储，URL 可能变成 `https://bucket.s3.amazonaws.com/file_xyz789.jpg`，Manager 层代码不需要改动。同理，file_id 的计算算法（内容哈希、部分哈希优化等）也是 Storage 实现的内部细节，Manager 无需感知。
 
 **Q: 为什么读路径不经过 Manager？**
 
@@ -471,7 +488,7 @@ return <StyledAudio
      ))}
    </StyledVideo>
    ```
-   - 字幕的 URL 同样走 `buildMediaURL()`，因为字幕文件也注册在 MediaFileManager 中
+   - 字幕的 URL 同样走 `buildMediaURL()`，因为字幕文件也注册到 Storage 中
    - 因为 `<track>` 没有 onerror 事件，字幕加载失败通过 `fetch()` 主动探测
 
 ---
@@ -480,22 +497,24 @@ return <StyledAudio
 
 | 衔接环节 | 位置 | 关键数据 |
 |---|---|---|
-| **后端 bytes → URL** | `MediaFileManager.add()` → `MemoryMediaFileStorage.get_url()` | bytes + mimetype → `/media/{hash}.{ext}` |
+| **后端 bytes → file_id** | `Storage.load_and_get_id()` | bytes + mimetype → 内容哈希 → file_id |
+| **file_id → URL** | `Storage.get_url()` | file_id + mimetype → `/media/{file_id}.{ext}` |
 | **URL → Protobuf** | `marshall_images()` / `marshall_audio()` / `marshall_video()` | `proto.url = file_url` |
 | **Protobuf → WebSocket** | `DeltaGenerator._enqueue()` | ForwardMsg binary frame |
 | **WebSocket → 前端组件** | App render tree 根据 delta type 路由到 ImageList/Audio/Video | props.element 是反序列化后的 proto 对象 |
 | **相对 URL → 完整 URL** | `DefaultStreamlitEndpoints.buildMediaURL()` | `/media/...` → `http://host:port/media/...` |
-| **HTTP GET → bytes 返回** | Starlette `_media_endpoint` | 从 `_files_by_id[hash]` 取出 bytes 流式返回 |
+| **HTTP GET → bytes 返回** | Starlette `_media_endpoint` → `Storage.get_file()` | 从 `_files_by_id[hash]` 取出 bytes 流式返回 |
 | **bytes → 浏览器渲染** | 原生 `<img>` / `<audio>` / `<video>` 标签 | 由浏览器根据 Content-Type 解码展示 |
 
 ---
 
 ## 八、关键设计决策
 
-1. **内容寻址去重**：file_id = hash(content + mimetype + filename)，相同内容的媒体文件在服务端只存一份，跨 session 共享。
+1. **内容寻址去重**：file_id = hash(content + mimetype + filename)，由 Storage 层计算，相同内容的媒体文件在服务端只存一份，跨 session 共享。
 2. **二进制与控制信令分离**：protobuf 只传 URL 和元数据，大体积二进制走独立 HTTP 通道，避免 WebSocket 消息过大。
-3. **Session 引用计数清理**：`_files_by_session_and_coord` 追踪每个 session 在用哪些 file；脚本重跑或 session 断开后，`remove_orphaned_files()` 回收孤儿文件。
-4. **部分哈希优化**：>1 MiB 文件只取头尾中段各 64 KiB 计算指纹，权衡碰撞概率与性能。
-5. **HTTP Range 支持**：视频无需完整下载即可拖动进度条播放，响应 `206 Partial Content`。
-6. **SVG 内联为 data URI**：避免额外 HTTP 请求，并解决 SVG xmlns 缺失导致浏览器不渲染的问题。
-7. **Manager 与 Storage 分层**：通过 Protocol 抽象解耦，Storage 管"内容"（存哪里、怎么取），Manager 管"生命周期"（谁在用、何时删），两者通过 file_id 唯一标识符协作。
+3. **Manager 协调、Storage 执行**：`MediaFileManager.add()` 是写入路径的唯一入口，但 file_id 生成、内容存储、URL 构造全部委托给 Storage，Manager 只负责生命周期管理（session 引用追踪、孤儿清理、线程安全）。
+4. **Session 引用计数清理**：`_files_by_session_and_coord` 追踪每个 session 在用哪些 file；脚本重跑或 session 断开后，`remove_orphaned_files()` 基于 Manager 自身的 `_file_metadata` 计算孤儿集合，再通知 Storage 删除。
+5. **部分哈希优化**：>1 MiB 文件只取头尾中段各 64 KiB 计算指纹，权衡碰撞概率与性能。
+6. **HTTP Range 支持**：视频无需完整下载即可拖动进度条播放，响应 `206 Partial Content`。
+7. **SVG 内联为 data URI**：避免额外 HTTP 请求，并解决 SVG xmlns 缺失导致浏览器不渲染的问题。
+8. **读路径绕过 Manager**：HTTP `/media/...` 请求直接访问 Storage 取出 bytes，无需经过 Manager 的锁和引用追踪，读写路径彻底分离。
