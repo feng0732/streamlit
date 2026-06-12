@@ -773,17 +773,18 @@ def start(self) -> None:
 
 ### 4.3 脚本重跑机制 (Rerun)
 
-脚本在以下场景会被重新执行：
+脚本在以下场景会被重新执行（均有直接代码证据）：
 
 | 触发源 | 触发路径 | 关键代码 |
 |--------|---------|---------|
-| **用户交互** (按钮点击、滑块拖动) | WidgetStateManager.sendUpdateWidgetsMessage() → sendRerunBackMsg() → handle_backmsg → request_rerun | [WidgetStateManager.ts L831](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/frontend/lib/src/WidgetStateManager.ts#L831-L841) |
-| **st.rerun()** | 执行到 `st.rerun()` 时抛出 `RerunException` → ScriptRunner 捕获 → _requests.request_rerun | [script_runner.py] |
-| **文件变更** | LocalSourcesWatcher 检测到文件变化 → _on_source_file_changed → request_rerun | [app_session.py L538-L548](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/lib/streamlit/runtime/app_session.py#L538-L548) |
-| **页面切换** | App.handlePageChange → sendRerunBackMsg(pageScriptHash=...) | [App.tsx] |
-| **手动 Rerun 按钮** | MainMenu → rerunScript → sendRerunBackMsg | [App.tsx] |
-| **Fragment 自动重跑** | @st.fragment(rerun="auto") → 前端定时发送 rerun 请求 |  |
-| **st.cache_data/resource 过期** | 缓存过期通过 YieldPoint 机制触发 rerun |  |
+| **用户交互** (按钮/滑块/复选框等) | 前端 WidgetStateManager 状态变化 → sendUpdateWidgetsMessage() → sendRerunBackMsg() → WebSocket BackMsg → handle_backmsg → request_rerun | [WidgetStateManager.ts L831-L841](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/frontend/lib/src/WidgetStateManager.ts#L831-L841) |
+| **st.rerun()** | 调用 `ctx.script_requests.request_rerun()` 入队 → 通过 `st.empty()` 强制触发 yield point → `_maybe_handle_execution_control_request` 取出请求 → 抛出 `RerunException` 中断当前执行 → 下一轮循环取出 RERUN 重新执行 | [execution_control.py L140-L192](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/lib/streamlit/commands/execution_control.py#L140-L192) |
+| **文件变更** | LocalSourcesWatcher 检测到源文件/依赖文件变化 → `_on_source_file_changed()` → `request_rerun()` 入队 | [app_session.py L538-L548](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/lib/streamlit/runtime/app_session.py#L538-L548) |
+| **页面切换** (`st.switch_page`) | 设置新的 page_script_hash 和 page_name → `request_rerun()` 入队 → yield point 触发中断重跑 | [execution_control.py L194-L260](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/lib/streamlit/commands/execution_control.py#L194-L260) |
+| **手动 Rerun 按钮** | 前端 MainMenu → rerunScript → sendRerunBackMsg() → WebSocket BackMsg | [MainMenu.tsx](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/frontend/app/src/components/MainMenu/MainMenu.tsx) |
+| **Fragment 自动重跑** | `@st.fragment(rerun="auto")` → 前端定时发送 fragment rerun 请求 | [App.tsx](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/frontend/app/src/App.tsx) |
+
+> **注意**: `st.cache_data` / `st.cache_resource` 的 TTL 过期不会主动触发脚本重跑。缓存过期是惰性检查的（访问时判断），仅影响缓存命中与否，不参与 rerun 调度。
 
 #### 快重跑 (Fast Reruns) 优化
 
@@ -833,12 +834,15 @@ Streamlit 采用明确的多线程分工：
        lambda: self._handle_scriptrunner_event_on_event_loop(...)
    )
    ```
+   所有 ForwardMsg 的入队和 flush 操作都通过 `call_soon_threadsafe` 调度到事件循环线程执行，确保单线程访问。
 
-3. **ForwardMsgQueue 是线程安全的**:
-   可同时被 ScriptRunner 线程写入和事件循环线程读取。
+3. **ForwardMsgQueue 是非线程安全的**:
+   官方文档明确说明 [forward_msg_queue.py#L32-L33](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/lib/streamlit/runtime/forward_msg_queue.py#L32-L33)
+   "ForwardMsgQueue is not thread-safe - a queue should only be used from a single thread."
+   但在实际使用中，它只在事件循环线程上被操作（enqueue 通过 call_soon_threadsafe 投递，flush 在 Runtime 主循环中），因此是安全的。
 
 4. **SessionState 包装为 SafeSessionState**:
-   每次访问时检查是否需要处理执行控制请求 (如 yield、stop)。
+   每次访问时调用 `_yield_callback` 检查是否有挂起的 STOP 或 RERUN 请求，实现协作式中断。
 
 ---
 
@@ -923,7 +927,10 @@ discover_asgi_app(path)
 | [lib/streamlit/runtime/runtime.py](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/lib/streamlit/runtime/runtime.py) | Runtime 核心：会话管理、消息循环 |
 | [lib/streamlit/runtime/websocket_session_manager.py](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/lib/streamlit/runtime/websocket_session_manager.py) | 基于 WebSocket 的会话生命周期管理 |
 | [lib/streamlit/runtime/app_session.py](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/lib/streamlit/runtime/app_session.py) | 单个会话的状态管理、Rerun 调度 |
-| [lib/streamlit/runtime/scriptrunner/script_runner.py](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/lib/streamlit/runtime/scriptrunner/script_runner.py) | 脚本线程创建与执行、Rerun 队列处理 |
+| [lib/streamlit/runtime/scriptrunner/script_runner.py](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/lib/streamlit/runtime/scriptrunner/script_runner.py) | 脚本线程创建与执行、Rerun 队列处理、Yield Point |
+| [lib/streamlit/runtime/forward_msg_queue.py](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/lib/streamlit/runtime/forward_msg_queue.py) | ForwardMsg 消息队列、Delta 消息合并优化 |
+| [lib/streamlit/runtime/state/safe_session_state.py](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/lib/streamlit/runtime/state/safe_session_state.py) | SessionState 线程安全包装、yield_callback 机制 |
+| [lib/streamlit/commands/execution_control.py](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/lib/streamlit/commands/execution_control.py) | st.rerun()、st.switch_page() 等执行控制命令 |
 | [lib/streamlit/web/server/starlette/starlette_websocket.py](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/lib/streamlit/web/server/starlette/starlette_websocket.py) | WebSocket 连接处理、BackMsg 路由、Origin 验证 |
 | [frontend/app/src/App.tsx](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/frontend/app/src/App.tsx) | 前端主组件：连接状态管理、Rerun 请求触发 |
 | [frontend/lib/src/WidgetStateManager.ts](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/frontend/lib/src/WidgetStateManager.ts) | Widget 状态管理、更新消息批量发送 |
