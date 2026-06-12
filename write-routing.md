@@ -17,27 +17,38 @@ if len(args) == 1 and isinstance(args[0], str):
     return
 ```
 
-> 这是全文件唯一直接调用 `self.dg.markdown()` 的地方。其他所有文本渲染（多字符串、兜底代码块等）都先走 buffer → flush → `self.dg.empty()` → 子容器 `.markdown()` 的路径。
+> 这是两处直接调用 `self.dg.markdown()` 的地方之一（另一处在 StringIO 分支）。其他所有文本渲染（多字符串、兜底代码块等）都先走 buffer → flush → `self.dg.empty()` → 子容器 `.markdown()` 的路径。详见第3.5节。
 
 ## 3. 字符串缓冲机制与落地路径
 
-### 3.1 缓冲的触发：单字符串 vs 多参数/非字符串
+### 3.1 文本渲染的三条独立路径
 
-`st.write()` 有两条完全不同的文本渲染路径，是否使用 `st.empty()` 临时容器是核心区别：
+`st.write()` 实际上有 **三条完全不同的文本渲染路径**，而不是之前理解的两条。是否使用 `st.empty()` 临时容器、是否传递 `unsafe_allow_html` 是核心区别：
 
 ```
-┌─ 单字符串快速路径（len(args)==1 且 isinstance(str)）──────────┐
+┌─ ① 单字符串快速路径（len(args)==1 且 isinstance(str)）────────┐
 │  直接 self.dg.markdown(text, unsafe_allow_html=...)            │
 │  ❌ 不使用 string_buffer                                         │
 │  ❌ 不调用 st.empty()                                           │
+│  ✅ 传递 unsafe_allow_html                                      │
 │  ✅ 覆盖 >80% 的 st.write 调用场景                              │
 └────────────────────────────────────────────────────────────────┘
 
-┌─ 缓冲路径（其他所有情况）─────────────────────────────────────┐
+┌─ ② StringIO 直接路径（第15级命中 StringIO）───────────────────┐
+│  先 flush_buffer() → 再 self.dg.markdown(arg.getvalue())        │
+│  ❌ 不使用 string_buffer（自己作为独立元素）                     │
+│  ❌ 不调用 st.empty()                                           │
+│  ❌ 不传递 unsafe_allow_html（永远默认False）                   │
+│  ✅ 先清空前面的缓冲再输出自己                                   │
+└────────────────────────────────────────────────────────────────┘
+
+┌─ ③ buffer-flush-empty 路径（其他所有文本输出场景）───────────┐
 │  string_buffer = []                                             │
 │  逐个收集字符串 → 触发 flush → 创建 empty 容器 → markdown 渲染  │
 │  ✅ 使用 string_buffer                                          │
 │  ✅ 调用 st.empty() 创建临时容器                                │
+│  ✅ 传递 unsafe_allow_html                                      │
+│  ✅ 多字符串拼接、兜底代码块（22B/C）都走这条                   │
 └────────────────────────────────────────────────────────────────┘
 ```
 
@@ -111,6 +122,65 @@ st.write((1, 2, 3))
 > `self.dg.empty()` → 返回子 DeltaGenerator → 子容器 `.markdown(...)`
 
 多行对象兜底、多个字符串参数混合非字符串参数等场景的渲染路径完全一致，都是 **buffer 收集 → empty 占位 → 容器内 markdown 渲染**。
+
+---
+
+### 3.5 StringIO 特例：第三条独立的文本渲染路径
+
+`StringIO` 是第15级命中的类型（`isinstance(arg, StringIO)`），它形成了与前两条路径都不同的第三条文本渲染路径。
+
+**代码（第523-525行）：**
+```python
+elif isinstance(arg, StringIO):
+    flush_buffer()           # 先把前面缓冲的字符串清空输出
+    self.dg.markdown(arg.getvalue())   # 直接调顶层 markdown，不走 empty
+```
+
+#### 三条文本渲染路径完整对比
+
+| 维度 | ① 单字符串快速路径 | ② StringIO 直接路径 | ③ buffer-flush-empty 路径 |
+|------|-------------------|---------------------|--------------------------|
+| **触发场景** | `len(args)==1` 且 `isinstance(str)` | `isinstance(StringIO)` 第15级命中 | 多字符串参数、第22级兜底B/C（多行/单行代码） |
+| **先 flush_buffer？** | ❌ | ✅ 先清空缓冲再输出自己 | ✅ for 循环结束后 flush |
+| **是否走 `st.empty()`？** | ❌ | ❌ | ✅ 先占位再渲染 |
+| **实际调用链** | `self.dg.markdown(text, unsafe_allow_html=...)` | `self.dg.markdown(arg.getvalue())` | `c = self.dg.empty(); c.markdown(text, unsafe_allow_html=...)` |
+| **unsafe_allow_html** | ✅ 传递用户参数 | ❌ 永远默认 False（硬编码） | ✅ 传递用户参数 |
+| **加入 string_buffer？** | —（不走buffer） | ❌ 作为独立元素输出 | ✅ 先加入 buffer 再 flush |
+| **是否创建独立元素** | ✅ 一个 markdown 元素 | ✅ 一个独立的 markdown 元素 | ✅ flush 时创建一个 markdown 元素 |
+
+#### StringIO 为什么是特例？三点设计意图
+
+1. **作为"内容容器"而非"文本片段"**：StringIO 被视为一个完整的独立内容单元，需要先把前面的缓冲清空再展示自己，不和其他字符串拼在一起。这就是为什么它先 `flush_buffer()` 再输出。
+
+2. **故意不走 empty 容器**：代码显式写成 `self.dg.markdown(...)` 而不是先建 empty。StringIO 通常用于一次性输出一段完整的预渲染内容，不需要防灰出处理。
+
+3. **强制关闭 unsafe_allow_html**：代码中 `arg.getvalue()` 直接传，没有带 `unsafe_allow_html=unsafe_allow_html` 参数。这意味着即使 `st.write(StringIO("<script>alert(1)</script>"), unsafe_allow_html=True)`，HTML 也会被转义。这是一个安全特性 —— StringIO 的内容默认被当作纯文本/普通 Markdown，不允许原始 HTML。
+
+#### 示例：StringIO 与多字符串混合时的输出顺序
+
+```python
+from io import StringIO
+
+st.write("Hello", StringIO("**from StringIO**"), "world")
+```
+
+**执行顺序：**
+```
+arg1 = "Hello" → string_buffer = ["Hello"]
+arg2 = StringIO("**from StringIO**") → 命中第15级
+   → flush_buffer():
+       text_content = "Hello"
+       c = st.empty(); c.markdown("Hello")  ← 先输出 Hello
+   → self.dg.markdown("**from StringIO**")  ← 再输出 StringIO 内容（单独元素）
+arg3 = "world" → string_buffer = ["world"]
+for 循环结束 → flush_buffer():
+   c = st.empty(); c.markdown("world")  ← 最后输出 world
+```
+
+**最终页面上有三个独立元素：**
+1. `st.markdown("Hello")`（通过 empty 容器）
+2. `st.markdown("**from StringIO**")`（直接调用，不走 empty）
+3. `st.markdown("world")`（通过 empty 容器）
 
 ---
 
@@ -294,11 +364,11 @@ elif (
 
 | 级别 | 判断条件 | 命中后走的路径 |
 |------|----------|----------------|
-| 15 | `isinstance(arg, StringIO)` | `st.markdown(arg.getvalue())` |
-| 16 | 生成器 / OpenAI Stream | `st.write_stream(arg)` |
-| 17 | `type_util.is_pydeck(arg)` | `st.pydeck_chart(arg)` |
-| 18 | `isinstance(arg, HELP_TYPES)` 或 `dataclasses.is_dataclass(arg)` | `st.help(arg)` |
-| 19 | `inspect.isclass(arg)` | `st.help(arg)` |
+| 15 | `isinstance(arg, StringIO)` | 先 `flush_buffer()` → 再 `self.dg.markdown(arg.getvalue())` **直接调用（不走 empty，永远 unsafe_allow_html=False）** |
+| 16 | 生成器 / OpenAI Stream | 先 `flush_buffer()` → `st.write_stream(arg)` |
+| 17 | `type_util.is_pydeck(arg)` | 先 `flush_buffer()` → `st.pydeck_chart(arg)` |
+| 18 | `isinstance(arg, HELP_TYPES)` 或 `dataclasses.is_dataclass(arg)` | 先 `flush_buffer()` → `st.help(arg)` |
+| 19 | `inspect.isclass(arg)` | 先 `flush_buffer()` → `st.help(arg)` |
 
 其中 HELP_TYPES 包括：
 - `types.BuiltinFunctionType`, `types.BuiltinMethodType`
@@ -741,6 +811,7 @@ st.write(MyClass())
 │     - 已知图表类（第6-11,13,17）→ 对应图表组件                  │
 │     - PIL图像（第12）→ st.image()                               │
 │     - 集合/字典/数据模型（第14）→ st.json()                     │
+│     - StringIO（第15）→ flush → st.markdown()  ⭐ 直接调用，不走empty │
 │     - 生成器/流（第16）→ st.write_stream()                      │
 │     - 函数/模块/类（第18-19）→ st.help()                        │
 │    │                                                            │
@@ -870,7 +941,7 @@ def is_type(obj, fqn_type_pattern):
 | `Foo()` (默认repr) | 级别22A | 实例文档 | `st.help(...)` |
 | `Foo()` (多行repr) | 级别22B | Markdown代码块 | `c = st.empty(); c.markdown("\`\`\`...\n...\n\`\`\`")` （走临时容器） |
 | `Foo()` (单行repr) | 级别22C | 行内代码 | `c = st.empty(); c.markdown("\`...\`")` （走临时容器） |
-| `StringIO("hi")` | 级别15 | Markdown文本 "hi" | `st.markdown("hi")` （直接，不走empty） |
+| `StringIO("hi")` | 级别15 | Markdown文本 "hi" | `flush_buffer(); st.markdown("hi")` （直接，不走empty，永远 unsafe_allow_html=False） |
 | `obj` (有 _repr_html_) + `unsafe_allow_html=True` | 级别20 | 渲染HTML | `st.html(...)` |
 | `obj` (有 to_pandas) | 级别21 | 交互式数据表格 | `st.dataframe(...)` |
 | `st.session_state` | 级别14 | JSON折叠对象 | `st.json(...)` |
