@@ -64,7 +64,7 @@ streamlit run app.py [--args]
              │                                            │
              ▼                                            ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  uvicorn.Server                                                        │
+│  uvicorn.Server (Socket 监听中, 等待浏览器连接)                          │
 │  ┌──────────────────────────────────────────────────────────────────┐   │
 │  │ starlette_app.create_starlette_app(runtime)                      │   │
 │  │   ├─ create_streamlit_routes()  路由注册                         │   │
@@ -75,9 +75,46 @@ streamlit run app.py [--args]
 │  │ Runtime.start()                                                   │   │
 │  │   ├─ 创建 AsyncObjects (Event/Future)                            │   │
 │  │   ├─ 启动 _loop_coroutine_task 协程                              │   │
-│  │   └─ 等待 started 信号                                            │   │
+│  │   └─ 等待 started 信号 → NO_SESSIONS_CONNECTED 状态                │   │
 │  └──────────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────┘
+└─────────────────────────────────────────────┬───────────────────────────┘
+                                              │
+                        ┌─────────────────────┴─────────────────────┐
+                        │                                           │
+                        ▼                                           │
+              [浏览器] 打开 http://localhost:8501                   │
+                        │                                           │
+                        ▼                                           │
+              HTTP GET / → 返回 index.html + JS 资源                 │
+                        │                                           │
+                        ▼                                           │
+              WebSocket 握手 /_stcore/stream                        │
+                        │                                           │
+                        ▼                                           │
+              _websocket_endpoint()                                  │
+                ├─ Origin 验证                                       │
+                ├─ StarletteSessionClient (send 队列 + sender Task)  │
+                ├─ runtime.connect_session() → AppSession 创建      │
+                └─ has_connection.set() → 唤醒 Runtime 主循环        │
+                        │                                           │
+                        ▼                                           │
+              前端 handleConnectionStateChanged(CONNECTED)           │
+                └─ sendUpdateWidgetsMessage(undefined)               │
+                   └─ sendRerunBackMsg() → BackMsg(rerun_script)   │
+                        │                                           │
+                        ▼                                           │
+              后端 receive_bytes() → ParseFromString → handle_backmsg│
+                └─ AppSession.request_rerun()                       │
+                   └─ _create_scriptrunner() → start() 新线程       │
+                        │                                           │
+                        ▼                                           │
+              ScriptRunner.scriptThread (独立线程!)                  │
+                ├─ 创建 ScriptRunContext (threading.local)          │
+                ├─ _run_script()                                     │
+                │  ├─ 发送 SCRIPT_STARTED → NewSession              │
+                │  ├─ 编译并 exec(bytecode, module.__dict__)        │
+                │  └─ 逐行执行用户脚本 → 发送 DeltaMsg              │
+                └─ 发送 SCRIPT_STOPPED_WITH_SUCCESS                 │
 ```
 
 ---
@@ -370,6 +407,470 @@ def run_asgi_app(main_script_path, app_import_string, args, flag_options):
 
 ---
 
+## 四、浏览器建连与脚本执行时序
+
+服务启动完成后，用户在浏览器中打开页面并不会立即执行脚本。脚本执行是由浏览器的 WebSocket 连接和前端主动发送的 rerun 请求驱动的。本章节详细梳理从浏览器建连到脚本首次执行、以及后续重跑的完整时序。
+
+### 4.1 完整时序图
+
+```
+服务启动 (Runtime.start())
+        │
+        ▼  Runtime 进入 NO_SESSIONS_CONNECTED 状态
+        ▼  阻塞等待 has_connection Event
+        │
+        │                        [浏览器]
+        │                          │
+        │                          ▼  打开 http://localhost:8501
+        │                          │
+        │  HTTP GET /              │
+        │◀─────────────────────────┤  返回 index.html
+        │                          │
+        │                          ▼  加载前端 JS 资源
+        │                          │
+        │  WebSocket 握手 /_stcore/stream
+        │◀─────────────────────────┤
+        │  Sec-WebSocket-Protocol: streamlit
+        │  Origin: http://localhost:8501
+        │                          │
+        ▼  _is_origin_allowed() 验证通过
+        ▼  _parse_subprotocols() 提取 xsrf_token / existing_session_id
+        ▼  await websocket.accept()
+        ▼  StarletteSessionClient 实例化 (带 send 队列 + 后台 sender Task)
+        ▼  user_info 从 cookies/trusted headers 解析
+        ▼  runtime.connect_session() 被调用
+        │                          │
+┌───────┴──────────────────────────────────────────┐
+│  Step 1: 会话建立 (connect_session)              │
+│──────────────────────────────────────────────────│
+│  位置: runtime.py connect_session()              │
+│        websocket_session_manager.py              │
+│                                                  │
+│  runtime.connect_session(                        │
+│    client=StarletteSessionClient,                │
+│    user_info=user_info,                          │
+│    existing_session_id=...                       │
+│  )                                               │
+│    │                                             │
+│    ├─ 尝试从 SessionStorage 恢复已有会话          │
+│    │  (仅在断线重连场景)                         │
+│    │                                             │
+│    └─ 新建 AppSession                             │
+│        ├─ 生成唯一 session_id (UUID)              │
+│        ├─ ForwardMsgQueue (浏览器消息队列)        │
+│        ├─ PagesManager (页面管理)                 │
+│        ├─ SessionState (会话状态)                │
+│        ├─ FragmentStorage (片段缓存)             │
+│        ├─ LocalSourcesWatcher (文件监听)         │
+│        └─ BackendOperationDispatcher (文件请求)  │
+│                                                  │
+│  _session_mgr._active_session_info_by_id[...]     │
+│    = ActiveSessionInfo(client, session)          │
+│                                                  │
+│  Runtime 状态:                                    │
+│  NO_SESSIONS_CONNECTED → ONE_OR_MORE_SESSIONS    │
+│  has_connection.set()                            │
+│    │                                             │
+│    ▼  Runtime._loop_coroutine() 被唤醒            │
+│       开始轮询 flush_browser_queue()              │
+└──────────────────────────────────────────────────┘
+        │                          │
+        │                          ▼  前端: handleConnectionStateChanged(CONNECTED)
+        │                          │
+        │                          ▼  满足首次连接条件
+        │                          │
+┌───────┴──────────────────────────────────────────┐
+│  Step 2: 前端触发首次 rerun 请求                 │
+│──────────────────────────────────────────────────│
+│  位置: frontend/app/src/App.tsx                  │
+│        handleConnectionStateChanged() [L862-L898]│
+│                                                  │
+│  触发条件 (满足任一):                            │
+│  1. !sessionInfo.last         (首次连接)         │
+│  2. lastRunWasInterrupted    (上次被中断)        │
+│  3. wasRerunRequested        (重跑被请求)        │
+│  4. 使用了 fragments / auto-reruns                │
+│                                                  │
+│  this.widgetMgr.sendUpdateWidgetsMessage(undefined)
+│    │                                             │
+│    ▼  WidgetStateManager.sendUpdateWidgetsMessage │
+│       [frontend/lib/src/WidgetStateManager.ts L831]
+│       this.props.sendRerunBackMsg(               │
+│         createWidgetStatesMsg(),                 │
+│         fragmentId=undefined,                    │
+│         isAutoRerun=undefined                    │
+│       )                                          │
+│    │                                             │
+│    ▼  App.sendRerunBackMsg() [L1917]             │
+│       构建 BackMsg:                              │
+│       ├─ rerunScript: {                          │
+│       │   queryString: "...",                    │
+│       │   widgetStates: {},                      │
+│       │   pageScriptHash: "",                    │
+│       │   pageName: "",                          │
+│       │   fragmentId: "",                        │
+│       │   cachedMessageHashes: [],               │
+│       │   contextInfo: {                         │
+│       │     timezone, locale, url,               │
+│       │     isEmbedded, colorScheme              │
+│       │   }                                      │
+│       └─ }                                       │
+│                                                  │
+│  connectionManager.sendMessage(BackMsg)          │
+│  WebSocket 二进制帧发送                          │
+└──────────────────────────────────────────────────┘
+        │                          │
+        ▼  _websocket_endpoint: websocket.receive_bytes()
+        │  BackMsg.ParseFromString(data)
+        │  msg_type = "rerun_script"
+        │
+┌───────┴──────────────────────────────────────────┐
+│  Step 3: 后端路由到 AppSession                   │
+│──────────────────────────────────────────────────│
+│  位置: starlette_websocket.py [L510]             │
+│        runtime.handle_backmsg()                  │
+│                                                  │
+│  runtime.handle_backmsg(session_id, back_msg)    │
+│    │                                             │
+│    ├─ 查找 session_info =                         │
+│    │    _session_mgr.get_active_session_info(id) │
+│    │                                             │
+│    └─ session_info.session.handle_backmsg(msg)   │
+│                                                  │
+│  AppSession.handle_backmsg()                     │
+│  [app_session.py L338-L371]                      │
+│    │                                             │
+│    ├─ msg_type = "rerun_script"                  │
+│    └─ _handle_rerun_script_request(msg.rerun_script)
+│       → this.request_rerun(client_state)         │
+└──────────────────────────────────────────────────┘
+        │
+        ▼
+┌───────┴──────────────────────────────────────────┐
+│  Step 4: request_rerun 与 ScriptRunner 创建      │
+│──────────────────────────────────────────────────│
+│  位置: app_session.py [L406-L488]                │
+│                                                  │
+│  AppSession.request_rerun(client_state):         │
+│                                                  │
+│  1. 解析 RerunData:                              │
+│     ├─ query_string                               │
+│     ├─ widget_states (表单值、slider 值等)       │
+│     ├─ page_script_hash / page_name              │
+│     ├─ fragment_id (片段运行时)                  │
+│     ├─ cached_message_hashes (消息去重)          │
+│     └─ context_info (客户端环境)                 │
+│                                                  │
+│  2. 已有 ScriptRunner 时的处理:                   │
+│     ├─ fastReruns=True 且非片段运行:             │
+│     │   → request_stop() 终止当前运行             │
+│     │   → self._scriptrunner = None              │
+│     │                                             │
+│     └─ 否则:                                      │
+│        → _scriptrunner.request_rerun(rerun_data) │
+│        → 成功则直接返回                           │
+│                                                  │
+│  3. 无 ScriptRunner 或 fastReruns 时:             │
+│     → _create_scriptrunner(rerun_data)           │
+│                                                  │
+└──────────────────────────────────────────────────┘
+        │
+        ▼
+┌───────┴──────────────────────────────────────────┐
+│  Step 5: ScriptRunner 线程启动                   │
+│──────────────────────────────────────────────────│
+│  位置: app_session.py [L502-L518]                │
+│        script_runner.py [L333-L346]              │
+│                                                  │
+│  _create_scriptrunner(initial_rerun_data):       │
+│                                                  │
+│  1. 实例化 ScriptRunner:                          │
+│     ├─ session_id                                │
+│     ├─ main_script_path                          │
+│     ├─ SafeSessionState (带 yield 回调)          │
+│     ├─ ScriptRequests (请求队列)                 │
+│     │   └─ 预存 initial_rerun_data               │
+│     ├─ on_event Signal (事件回调)                │
+│     └─ 关联 PagesManager、FragmentStorage 等      │
+│                                                  │
+│  2. 事件绑定:                                     │
+│     _scriptrunner.on_event.connect(              │
+│       _on_scriptrunner_event                     │
+│     )                                            │
+│                                                  │
+│  3. 启动线程:                                    │
+│     _scriptrunner.start()                        │
+│       → threading.Thread(                        │
+│           target=_run_script_thread,             │
+│           name="ScriptRunner.scriptThread"       │
+│         ).start()                                │
+│                                                  │
+└──────────────────────────────────────────────────┘
+        │
+        ▼  ScriptRunner.scriptThread (独立线程!)
+        │
+┌───────┴──────────────────────────────────────────┐
+│  Step 6: 脚本线程主循环                          │
+│──────────────────────────────────────────────────│
+│  位置: script_runner.py [L378-L435]              │
+│                                                  │
+│  _run_script_thread():                           │
+│                                                  │
+│  1. 创建 ScriptRunContext (线程本地存储):         │
+│     ├─ session_id                                │
+│     ├─ _enqueue 回调 (发送 ForwardMsg)           │
+│     ├─ script_requests (请求队列)                │
+│     ├─ session_state                             │
+│     ├─ uploaded_file_mgr                         │
+│     ├─ user_info                                 │
+│     └─ pages_manager                             │
+│                                                  │
+│  2. 绑定上下文到线程:                            │
+│     add_script_run_ctx(thread, ctx)              │
+│     (通过 threading.local 存储)                  │
+│                                                  │
+│  3. 主循环:                                      │
+│     request = _requests.on_scriptrunner_ready()  │
+│     → 取出预存的 RERUN 请求                      │
+│                                                  │
+│     while request.type == RERUN:                 │
+│         _run_script(request.rerun_data)          │
+│         request = _requests.on_scriptrunner_ready()
+│                                                  │
+│  4. SHUTDOWN 时发送保存 client_state              │
+└──────────────────────────────────────────────────┘
+        │
+        ▼
+┌───────┴──────────────────────────────────────────┐
+│  Step 7: _run_script 实际执行用户代码             │
+│──────────────────────────────────────────────────│
+│  位置: script_runner.py                          │
+│                                                  │
+│  _run_script(rerun_data):                        │
+│                                                  │
+│  1. 发送 SCRIPT_STARTED 事件:                    │
+│     on_event.send(SCRIPT_STARTED, ...)           │
+│     → _on_scriptrunner_event                     │
+│       → call_soon_threadsafe 调度到事件循环线程   │
+│         → _handle_scriptrunner_event_on_event_loop
+│           → 发送 NewSession ForwardMsg           │
+│           → 包含 config, theme, pages 等元数据   │
+│           → 浏览器显示 "Running..." 状态         │
+│                                                  │
+│  2. 准备执行环境:                                │
+│     ├─ _set_execing_flag(True)                   │
+│     ├─ _install_tracer() (覆盖 sys.settrace)     │
+│     ├─ local_sources_watcher.on_script_run()     │
+│     └─ pages_manager.reset()                     │
+│                                                  │
+│  3. 编译并执行:                                  │
+│     ├─ get_command_line_from_page_name()         │
+│     ├─ _script_cache.load_bytecode(script_path)  │
+│     │  (带源代码哈希的缓存机制)                   │
+│     ├─ module = _new_module()                    │
+│     │  (__file__, __name__, __dict__)            │
+│     ├─ sys.modules[module_name] = module         │
+│     └─ exec(bytecode, module.__dict__)           │
+│        → 逐行执行用户脚本                        │
+│        → 遇到 st.write/st.button 等时调用组件API │
+│        → 组件通过 ScriptRunContext 发送 DeltaMsg │
+│        → Delta 入队 ForwardMsgQueue              │
+│                                                  │
+│  4. Runtime 刷新循环:                            │
+│     _loop_coroutine 每 MESSAGE_FLUSH_INTERVAL_SECS
+│     调用 session.flush_browser_queue()            │
+│     → 取出 ForwardMsg → client.write_forward_msg()
+│     → StarletteSessionClient.send_queue → websocket
+│     → 浏览器实时渲染 Delta 变化                   │
+│                                                  │
+│  5. 执行完成:                                    │
+│     ├─ 发送 SCRIPT_STOPPED_WITH_SUCCESS 事件     │
+│     ├─ on_scriptrunner_event 发送 script_finished
+│     ├─ 浏览器显示 "Running..." → 完成状态         │
+│     └─ 更新 LocalSourcesWatcher 监听列表          │
+└──────────────────────────────────────────────────┘
+```
+
+### 4.2 关键时间节点详解
+
+#### 节点 A: Runtime 启动后但浏览器未连接
+
+**文件**: [runtime.py](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/lib/streamlit/runtime/runtime.py#L624-L668)
+
+```python
+# Runtime._loop_coroutine() 中的 NO_SESSIONS_CONNECTED 分支
+while not async_objs.must_stop.is_set():
+    if self._state == RuntimeState.NO_SESSIONS_CONNECTED:
+        # 阻塞等待:
+        #   - must_stop (进程退出信号)
+        #   - has_connection (有浏览器连接)
+        done_tasks, pending_tasks = await asyncio.wait(
+            (
+                asyncio.create_task(async_objs.must_stop.wait()),
+                asyncio.create_task(async_objs.has_connection.wait()),
+            ),
+            return_when=asyncio.FIRST_COMPLETED,
+            timeout=_SIGNAL_CHECK_INTERVAL,  # Windows 信号处理
+        )
+```
+
+**注意**: 此时用户脚本完全没有被加载或执行。
+
+#### 节点 B: connect_session 完成
+
+**文件**: [websocket_session_manager.py](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/lib/streamlit/runtime/websocket_session_manager.py#L100-L168)
+
+```python
+session = AppSession(
+    script_data=ScriptData(main_script_path, is_hello),
+    uploaded_file_manager=...,
+    script_cache=...,
+    message_enqueued_callback=_enqueued_some_message,
+    user_info=user_info,
+)
+self._active_session_info_by_id[session.id] = ActiveSessionInfo(client, session)
+```
+
+此时 AppSession 创建完成，但仍然**没有**执行任何用户代码。ScriptRunner 尚未创建。
+
+#### 节点 C: 前端主动发送 rerun_script
+
+**文件**: [App.tsx](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/frontend/app/src/App.tsx#L862-L898)
+
+```typescript
+if (newState === ConnectionState.CONNECTED) {
+  if (!this.sessionInfo.last ||   // 首次连接
+      lastRunWasInterrupted ||
+      wasRerunRequested ||
+      fragmentIdsThisRun.length > 0) {
+    this.widgetMgr.sendUpdateWidgetsMessage(undefined)
+    // 触发 sendRerunBackMsg → WebSocket 发送 BackMsg
+  }
+}
+```
+
+这是**整个流程的关键触发点**：脚本执行不是由后端主动发起，而是由前端在连接建立后主动请求的。
+
+#### 节点 D: ScriptRunner 线程启动
+
+**文件**: [script_runner.py](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/lib/streamlit/runtime/scriptrunner/script_runner.py#L333-L346)
+
+```python
+def start(self) -> None:
+    self._script_thread = threading.Thread(
+        target=self._run_script_thread,
+        name="ScriptRunner.scriptThread",
+    )
+    self._script_thread.start()
+```
+
+**关键设计考量**:
+- 用户脚本在**独立线程**中执行，而非事件循环线程
+- 这避免了脚本执行阻塞 WebSocket 连接和其他会话
+- 通过 `call_soon_threadsafe` 实现跨线程通信
+
+---
+
+### 4.3 脚本重跑机制 (Rerun)
+
+脚本在以下场景会被重新执行：
+
+| 触发源 | 触发路径 | 关键代码 |
+|--------|---------|---------|
+| **用户交互** (按钮点击、滑块拖动) | WidgetStateManager.sendUpdateWidgetsMessage() → sendRerunBackMsg() → handle_backmsg → request_rerun | [WidgetStateManager.ts L831](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/frontend/lib/src/WidgetStateManager.ts#L831-L841) |
+| **st.rerun()** | 执行到 `st.rerun()` 时抛出 `RerunException` → ScriptRunner 捕获 → _requests.request_rerun | [script_runner.py] |
+| **文件变更** | LocalSourcesWatcher 检测到文件变化 → _on_source_file_changed → request_rerun | [app_session.py L538-L548](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/lib/streamlit/runtime/app_session.py#L538-L548) |
+| **页面切换** | App.handlePageChange → sendRerunBackMsg(pageScriptHash=...) | [App.tsx] |
+| **手动 Rerun 按钮** | MainMenu → rerunScript → sendRerunBackMsg | [App.tsx] |
+| **Fragment 自动重跑** | @st.fragment(rerun="auto") → 前端定时发送 rerun 请求 |  |
+| **st.cache_data/resource 过期** | 缓存过期通过 YieldPoint 机制触发 rerun |  |
+
+#### 快重跑 (Fast Reruns) 优化
+
+**文件**: [app_session.py](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/lib/streamlit/runtime/app_session.py#L466-L483)
+
+```python
+if self._scriptrunner is not None:
+    if (
+        bool(config.get_option("runner.fastReruns"))
+        and not rerun_data.fragment_id
+    ):
+        # 终止当前 ScriptRunner，创建新的
+        self._scriptrunner.request_stop()
+        self._scriptrunner = None
+        # 下方创建新 ScriptRunner 立即启动
+```
+
+**工作原理**:
+- 当 `runner.fastReruns=true` 时，新 rerun 请求会**终止当前正在运行**的脚本线程
+- 创建全新的 ScriptRunner 立即执行，减少等待时间
+- 对 Fragment 运行无效（Fragment 需要维持上下文）
+
+---
+
+### 4.4 多线程模型与线程安全
+
+Streamlit 采用明确的多线程分工：
+
+| 线程 | 职责 | 执行的代码 |
+|------|------|-----------|
+| **事件循环线程** (EventLoop Thread) | WebSocket 消息收发、会话管理、消息分发 | Runtime._loop_coroutine(), AppSession 事件处理 |
+| **ScriptRunner 线程** (每个会话) | 执行用户脚本代码 | 用户编写的 `app.py`、所有 `st.*` 组件调用 |
+| **StarletteSender 线程** (每个连接) | WebSocket 异步发送 | 后台 Task 发送 ForwardMsg |
+
+**线程安全机制**:
+
+1. **ScriptRunContext 线程本地存储**:
+   ```python
+   # script_run_context.py
+   _SCRIPT_RUN_CONTEXT = threading.local()
+   ```
+
+2. **跨线程通信使用 call_soon_threadsafe**:
+   ```python
+   # ScriptRunner 线程 → 事件循环线程
+   self._event_loop.call_soon_threadsafe(
+       lambda: self._handle_scriptrunner_event_on_event_loop(...)
+   )
+   ```
+
+3. **ForwardMsgQueue 是线程安全的**:
+   可同时被 ScriptRunner 线程写入和事件循环线程读取。
+
+4. **SessionState 包装为 SafeSessionState**:
+   每次访问时检查是否需要处理执行控制请求 (如 yield、stop)。
+
+---
+
+### 4.5 会话关闭与资源清理
+
+**路径**: 浏览器关闭标签 → WebSocket disconnect → 会话清理
+
+```
+浏览器关闭 → WebSocketDisconnect
+        │
+        ▼
+runtime.disconnect_session(session_id)
+        │
+        ▼
+session.request_script_stop()       # 终止脚本线程
+session.disconnect_file_watchers()  # 停止文件监听
+session.clear_session_caches()      # 清理 session 级缓存
+        │
+        ▼
+保存到 SessionStorage (用于重连)
+        │
+        ▼
+config.ttl 时间后被彻底清理
+        │
+        ▼
+session.shutdown()                  # 彻底清理所有资源
+```
+
+**文件**: [websocket_session_manager.py](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/lib/streamlit/runtime/websocket_session_manager.py#L170-L193)
+
+---
+
 ## 五、关键交互点总结
 
 ### 5.1 参数解析 → 脚本装载
@@ -420,3 +921,10 @@ discover_asgi_app(path)
 | [lib/streamlit/web/server/starlette/starlette_server.py](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/lib/streamlit/web/server/starlette/starlette_server.py) | UvicornServer/UvicornRunner 端口绑定与启动 |
 | [lib/streamlit/web/server/starlette/starlette_app.py](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/lib/streamlit/web/server/starlette/starlette_app.py) | Starlette 应用构建、st.App ASGI 兼容类 |
 | [lib/streamlit/runtime/runtime.py](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/lib/streamlit/runtime/runtime.py) | Runtime 核心：会话管理、消息循环 |
+| [lib/streamlit/runtime/websocket_session_manager.py](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/lib/streamlit/runtime/websocket_session_manager.py) | 基于 WebSocket 的会话生命周期管理 |
+| [lib/streamlit/runtime/app_session.py](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/lib/streamlit/runtime/app_session.py) | 单个会话的状态管理、Rerun 调度 |
+| [lib/streamlit/runtime/scriptrunner/script_runner.py](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/lib/streamlit/runtime/scriptrunner/script_runner.py) | 脚本线程创建与执行、Rerun 队列处理 |
+| [lib/streamlit/web/server/starlette/starlette_websocket.py](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/lib/streamlit/web/server/starlette/starlette_websocket.py) | WebSocket 连接处理、BackMsg 路由、Origin 验证 |
+| [frontend/app/src/App.tsx](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/frontend/app/src/App.tsx) | 前端主组件：连接状态管理、Rerun 请求触发 |
+| [frontend/lib/src/WidgetStateManager.ts](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/frontend/lib/src/WidgetStateManager.ts) | Widget 状态管理、更新消息批量发送 |
+| [frontend/connection/src/ConnectionManager.ts](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/frontend/connection/src/ConnectionManager.ts) | WebSocket 连接管理、重连逻辑 |
