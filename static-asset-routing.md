@@ -1,339 +1,483 @@
-# Streamlit 静态资源服务链路分析
+# Streamlit 静态资源服务链路深度分析
 
-本文档深入分析 Streamlit 静态资源服务链路，涵盖**路径映射**、**访问控制**和**浏览器缓存**三个维度及其相互之间的边界划分。
-
----
-
-## 1. 整体架构概览
-
-Streamlit 的静态资源服务基于 Starlette ASGI 框架构建，由后端（Python）和前端（TypeScript/React）协同完成。请求处理链路如下：
-
-```
-浏览器请求
-    │
-    ▼
-PathSecurityMiddleware (路径安全拦截，最先执行)
-    │
-    ▼
-SessionMiddleware (会话管理)
-    │
-    ▼
-SelectiveGZipMiddleware (选择性 GZip 压缩)
-    │
-    ▼
-Starlette Routes 路由分发
-    ├─ / 或 /{base_url}           → 核心前端资产 (JS/CSS/HTML)
-    ├─ /_stcore/*                 → 内部 API (health, upload, stream, metrics, host-config, bidi-components)
-    ├─ /media/{file_id}           → 媒体文件 (图片/音频/视频)
-    ├─ /component/{name}/{path}   → 自定义组件 v1 资源
-    ├─ /_stcore/bidi-components/  → 自定义组件 v2 资源
-    ├─ /app/static/{path}         → App 用户静态文件
-    └─ /auth/*                    → 认证路由
-```
-
-相关代码文件：
-- 应用组装: [starlette_app.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_app.py#L164-L205)
-- 路由定义: [starlette_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_routes.py#L64-L98)
+本文档深入分析 Streamlit 静态资源服务链路的**代码实现细节**，重点讲解：
+1. **资源分流数量** — 有多少类静态资源，各路由如何创建和分流
+2. **核心静态资源的独立挂载** — 为何使用 `Mount` 独立挂载，具体如何实现
+3. **上传路由跳过全量路径校验的原因** — 为何 `/_stcore/upload_file/*` 可以安全绕过 `is_unsafe_path_pattern()`
+4. **静态部署时外部静态源改写** — Static Connection 模式下如何将资源 URL 改写为外部静态源（如 S3）
 
 ---
 
-## 2. 路径映射
+## 1. 资源分流数量：6 类静态资源路由的代码编排
 
-### 2.1 路由类型与 URL 结构
+Streamlit 的静态资源在代码层面被拆分为 **6 类独立路由**，由 `create_streamlit_routes()` 函数统一编排，通过多次调用不同的 `create_*_routes()` 工厂函数将各类路由添加到同一个路由列表中。
 
-Streamlit 的静态资源路由可分为**五类**，每类有独立的路径前缀和处理逻辑：
+### 1.1 路由编排代码
 
-| 资源类型 | 路径前缀 | 路由创建函数 | 生产/开发模式 |
-|---|---|---|---|
-| 核心前端资产 (JS/CSS/HTML) | `/` 或 `/{base_url}` | `create_streamlit_static_assets_routes()` | 仅生产模式 |
-| 媒体文件 | `/media/{file_id}` | `create_media_routes()` | 通用 |
-| 自定义组件 v1 | `/component/{name}/{path}` | `create_component_routes()` | 通用 |
-| 自定义组件 v2 | `/_stcore/bidi-components/{name}/{path}` | `create_bidi_component_routes()` | 通用 |
-| App 用户静态文件 | `/app/static/{path}` | `create_app_static_serving_routes()` | 需启用 `server.enableStaticServing` |
-| 文件上传 | `/_stcore/upload_file/{session_id}/{file_id}` | `create_upload_routes()` | 通用 |
-
-### 2.2 Base URL 路径前缀机制
-
-所有路由均支持通过 `server.baseUrlPath` 配置添加统一前缀，由 `_with_base()` 函数统一处理：
+在 [create_streamlit_routes()](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_app.py#L101-L161) 中可以清晰看到分流过程：
 
 ```python
-def _with_base(path: str, base_url: str | None = None) -> str:
-    base = (
-        base_url if base_url is not None else config.get_option("server.baseUrlPath")
-    ) or ""
-    return make_url_path(base, path)  # 拼接如 "/myapp/_stcore/health"
+def create_streamlit_routes(runtime: Runtime) -> list[BaseRoute]:
+    routes: list[Any] = []
+
+    # 1. 健康检查
+    routes.extend(create_health_routes(runtime, base_url))
+    # 2. 指标
+    routes.extend(create_metrics_routes(runtime, base_url))
+    # 3. 主机配置
+    routes.extend(create_host_config_routes(base_url))
+    # 4. 媒体文件（st.image/st.audio/st.video/st.download_button）
+    routes.extend(create_media_routes(media_storage, base_url))
+    # 5. 文件上传
+    routes.extend(create_upload_routes(runtime, upload_mgr, base_url))
+    # 6. 自定义组件 v1
+    routes.extend(create_component_routes(component_registry, base_url))
+    # 7. 自定义组件 v2（双向组件）
+    routes.extend(create_bidi_component_routes(bidi_component_manager, base_url))
+    # 8. WebSocket
+    routes.extend(create_websocket_routes(runtime, base_url))
+    # 9. 认证路由
+    routes.extend(create_auth_routes(base_url))
+    # 10. App 用户静态文件（需启用 server.enableStaticServing）
+    if config.get_option("server.enableStaticServing"):
+        routes.extend(create_app_static_serving_routes(main_script_path, base_url))
+    # 11. 脚本健康检查（可选）
+    if config.get_option("server.scriptHealthCheckEnabled"):
+        routes.extend(create_script_health_routes(runtime, base_url))
+    # 12. 核心前端资产（仅生产模式）
+    if not dev_mode:
+        routes.extend(create_streamlit_static_assets_routes(base_url=base_url))
+
+    return routes
 ```
 
-路径拼接工具: [url_util.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/url_util.py#L107-L127)
+其中**静态资源相关**的有 **6 类**：
 
-### 2.3 核心前端资产的 SPA Fallback
+| 序号 | 资源类型 | 创建函数 | 路径前缀 | 处理的资源 |
+|---|---|---|---|---|
+| 1 | 核心前端资产 | `create_streamlit_static_assets_routes()` | `/` 或 `/{base_url}` | JS/CSS/HTML/字体等前端构建产物 |
+| 2 | 媒体文件 | `create_media_routes()` | `/media/{file_id}` | st.image / st.audio / st.video / st.download_button |
+| 3 | 自定义组件 v1 | `create_component_routes()` | `/component/{name}/{path}` | 第三方自定义组件的 HTML/JS/CSS |
+| 4 | 自定义组件 v2 | `create_bidi_component_routes()` | `/_stcore/bidi-components/{name}/{path}` | 新一代双向组件资源 |
+| 5 | App 用户静态文件 | `create_app_static_serving_routes()` | `/app/static/{path}` | 应用目录 `static/` 下的用户文件 |
+| 6 | 文件上传 | `create_upload_routes()` | `/_stcore/upload_file/{session_id}/{file_id}` | st.file_uploader 上传的文件（PUT/DELETE） |
 
-核心前端资产采用 `_StreamlitStaticFiles` 类（继承 Starlette `StaticFiles`），实现了 SPA（单页应用）路由回退：
+### 1.2 为什么要拆成多个工厂函数
 
-- **404 回退**: 当静态文件不存在时（非保留路径），返回 `index.html` 以支持客户端路由
-- **保留路径**: `/_stcore/health` 和 `/_stcore/host-config` 不回退，返回真实 404
-- **尾部斜杠重定向**: 路径带尾部斜杠时 301 重定向到无斜杠版本（避免 mount root 无限循环）
-- **双斜杠保护**: 以 `//` 开头的路径返回 400 Bad Request（防止协议相对 URL 攻击）
+这种"多函数分流"的设计有三个好处：
+1. **条件启用**：App 静态文件需启用配置、核心资产仅生产模式、脚本健康检查可选 — 按需组装
+2. **依赖注入**：每个工厂函数接收不同的运行时依赖（`media_storage`、`upload_mgr`、`component_registry`），职责单一
+3. **独立测试**：每个路由类型可单独测试，不依赖其他路由
 
-静态资产路由: [starlette_static_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_static_routes.py#L48-L166)
+---
 
-### 2.4 前端对 URL 的构建
+## 2. 核心静态资源的独立挂载：Mount 的设计与实现
 
-前端通过 `DefaultStreamlitEndpoints` 类统一构建后端资源 URL：
+### 2.1 为何要独立挂载
+
+核心前端资产（JS/CSS/HTML）与其他路由有本质区别：
+- **路径根占用**：需要挂载在 `/`（或 `/{base_url}`）根路径，而非特定前缀
+- **SPA 回退**：404 时需返回 `index.html` 支持客户端路由
+- **独立的缓存策略**：需根据文件名区分 `no-cache`（HTML）和 `immutable + max-age=1年`（带哈希的 JS/CSS）
+- **独立的安全检查**：双斜杠保护、尾部斜杠重定向等
+
+因此 Streamlit 没有将其作为普通 `Route` 添加，而是使用 Starlette 的 `Mount` 组件**独立挂载**了一个完整的 ASGI 应用。
+
+### 2.2 挂载实现代码
+
+在 [create_streamlit_static_assets_routes()](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_static_routes.py#L169-L191) 中：
+
+```python
+def create_streamlit_static_assets_routes(base_url: str | None) -> list[BaseRoute]:
+    """Create the static assets mount for serving Streamlit's core assets."""
+    from starlette.routing import Mount
+
+    static_dir = file_util.get_static_dir()
+    if not os.path.isdir(static_dir):
+        return []
+
+    # 创建自定义 StaticFiles 处理器（继承 Starlette StaticFiles）
+    static_assets = create_streamlit_static_handler(
+        directory=static_dir, base_url=base_url
+    )
+
+    # 构建挂载路径（去掉尾部斜杠）
+    mount_path = make_url_path(base_url or "", "").rstrip("/") or "/"
+
+    # 关键：使用 Mount 将整个 static_assets 应用挂载到根路径
+    return [
+        Mount(
+            mount_path,          # 挂载点："/" 或 "/myapp"
+            app=static_assets,   # 被挂载的 ASGI 应用：_StreamlitStaticFiles
+            name="static-assets",
+        )
+    ]
+```
+
+### 2.3 挂载点路径的处理细节
+
+注释中特别提到尾部斜杠的处理：
+> Strip trailing slash from the path because Starlette's Mount with a trailing
+> slash (e.g., "/myapp/") won't match requests without it (e.g., "/myapp").
+> Mount without trailing slash handles both cases by redirecting "/myapp" to
+> "/myapp/". Use "/" as fallback for root path.
+
+这是一个 Starlette 的行为适配：带尾部斜杠的 Mount 无法匹配不带斜杠的请求，而不带斜杠的 Mount 可以通过重定向兼容两种情况。
+
+### 2.4 自定义 StaticFiles 处理器
+
+`create_streamlit_static_handler()` 返回的 `_StreamlitStaticFiles` 类继承了 Starlette 的 `StaticFiles`，但重写了三个关键方法：
+
+| 重写方法 | 新增功能 |
+|---|---|
+| `__call__` | 双斜杠保护 → `is_unsafe_path_pattern` 检查 → 尾部斜杠重定向 |
+| `get_response` | 404 回退到 `index.html`（排除保留路径 `_stcore/health`、`_stcore/host-config`）→ 应用缓存头 |
+| `_apply_cache_headers` | 根据文件名判断是 HTML/manifest（`no-cache`）还是带哈希资源（`immutable + max-age=31536000`） |
+
+独立挂载处理器: [starlette_static_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_static_routes.py#L48-L166)
+
+---
+
+## 3. 上传路由跳过全量路径校验的原因
+
+### 3.1 快速路径的设计
+
+在 [PathSecurityMiddleware](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_path_security_middleware.py#L11-L55) 的开头注释明确说明了快速路径的设计原则：
+
+```
+Fast-Path Optimization
+----------------------
+For performance, certain known-safe routes skip the is_unsafe_path_pattern()
+validation. This is a **performance optimization only**, not a security boundary.
+
+Why upload_file/ is safe to skip:
+The /_stcore/upload_file/{session_id}/{file_id} route uses session_id and file_id
+as opaque dictionary keys in MemoryUploadedFileManager, never as filesystem paths.
+Even a malicious session_id like "../../../etc/passwd" is just a failed dict lookup,
+not a path traversal - the values are never passed to open() or os.path functions.
+```
+
+### 3.2 快速路径的判定代码
+
+```python
+# 安全路径列表
+safe_exact_paths = frozenset({
+    make_url_path(base_url_path, ROUTE_HEALTH),           # /_stcore/health
+    make_url_path(base_url_path, ROUTE_SCRIPT_HEALTH),    # /_stcore/script-health-check
+    make_url_path(base_url_path, ROUTE_METRICS),          # /_stcore/metrics
+    make_url_path(base_url_path, ROUTE_HOST_CONFIG),      # /_stcore/host-config
+})
+
+# 上传路径前缀（带尾部斜杠避免匹配到其他路由）
+_SAFE_ROUTE_UPLOAD_PREFIX = f"{BASE_ROUTE_UPLOAD_FILE}/"  # "_stcore/upload_file/"
+safe_path_prefix = make_url_path(base_url_path, _SAFE_ROUTE_UPLOAD_PREFIX)
+
+# 中间件中的快速路径判断
+if path in self._safe_exact_paths or path.startswith(self._safe_path_prefix):
+    await self.app(scope, receive, send)  # 直接放行，不执行 is_unsafe_path_pattern
+    return
+```
+
+### 3.3 为什么上传路径是安全的：完整证据链
+
+上传路由的 URL 格式是 `/_stcore/upload_file/{session_id}/{file_id}`，其中 `session_id` 和 `file_id` 只用作**字典键**，**永不作为文件系统路径**。完整证据链：
+
+#### 证据 1：MemoryUploadedFileManager 只做字典查找
+
+在 [MemoryUploadedFileManager](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/runtime/memory_uploaded_file_manager.py#L33-L118) 中：
+
+```python
+class MemoryUploadedFileManager(UploadedFileManager):
+    def __init__(self, upload_endpoint: str) -> None:
+        # file_storage 是一个嵌套字典：{session_id: {file_id: UploadedFileRec}}
+        self.file_storage: dict[str, dict[str, UploadedFileRec]] = defaultdict(dict)
+
+    def add_file(self, session_id: str, file: UploadedFileRec) -> None:
+        # session_id 和 file_id 只用作字典键
+        self.file_storage[session_id][file.file_id] = file
+
+    def remove_file(self, session_id: str, file_id: str) -> None:
+        # 同样只做字典操作，无任何 os.path 调用
+        session_storage = self.file_storage[session_id]
+        session_storage.pop(file_id, None)
+```
+
+#### 证据 2：上传路由处理器只做字典查找
+
+在 [create_upload_routes()](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_routes.py#L593-L745) 的 `_upload_put` 和 `_upload_delete` 中：
+
+```python
+async def _upload_put(request: Request) -> Response:
+    session_id = request.path_params["session_id"]
+    file_id = request.path_params["file_id"]
+
+    # 1. session_id 仅用于活跃会话校验（字典键）
+    if not runtime.is_active_session(session_id):
+        raise HTTPException(status_code=400, detail="Invalid session_id")
+
+    # 2. 读取上传的文件数据（file_id 用于存储时的字典键）
+    upload_mgr.add_file(
+        session_id=session_id,
+        file=UploadedFileRec(
+            file_id=file_id,   # 只作为存储键
+            name=upload.filename or "",
+            type=upload.content_type or "application/octet-stream",
+            data=data,         # 实际文件内容存在内存中
+        ),
+    )
+
+async def _upload_delete(request: Request) -> Response:
+    session_id = request.path_params["session_id"]
+    file_id = request.path_params["file_id"]
+
+    # 同样是字典操作
+    upload_mgr.remove_file(session_id=session_id, file_id=file_id)
+```
+
+**全程没有任何 `os.path` 调用，没有任何 `open()` 调用。** 即使 `session_id` 是 `../../../etc/passwd`，也只会导致：
+```python
+self.file_storage["../../../etc/passwd"][file_id] = file  # 安全的字典键
+```
+这只是一个奇怪的字典键名，不会造成任何文件系统操作。
+
+#### 证据 3：URL 生成时使用 UUID，不可预测
+
+URL 由后端生成，前端无法控制 `session_id` 和 `file_id` 的值：
+
+```python
+# [memory_uploaded_file_manager.py#L104-L118]
+def get_upload_urls(self, session_id: str, file_names: Sequence[str]) -> list[UploadFileUrlInfo]:
+    result = []
+    for _ in file_names:
+        file_id = str(uuid.uuid4())  # file_id 是随机 UUID
+        result.append(
+            UploadFileUrlInfo(
+                file_id=file_id,
+                upload_url=f"{self.endpoint}/{session_id}/{file_id}",
+                delete_url=f"{self.endpoint}/{session_id}/{file_id}",
+            )
+        )
+    return result
+```
+
+`session_id` 也是由后端生成的会话标识，不是用户可控的路径字符串。
+
+### 3.4 检查顺序的安全性
+
+中间件的检查顺序至关重要，**UNC 双斜杠检查始终在快速路径之前**：
+
+```python
+# [starlette_path_security_middleware.py#L137-L174]
+async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+    # Step 1: UNC 双斜杠检查（对所有请求强制执行，包括上传路径）
+    if path.startswith(("//", "\\\\")):
+        return 400
+
+    # Step 2: 快速路径绕过（仅当 UNC 检查通过后才执行）
+    if path in self._safe_exact_paths or path.startswith(self._safe_path_prefix):
+        await self.app(scope, receive, send)
+        return
+
+    # Step 3: 全量 is_unsafe_path_pattern 检查
+    if relative_path and is_unsafe_path_pattern(relative_path):
+        return 400
+```
+
+这意味着即使是上传路径，`//server/share` 这类 UNC 攻击仍然会被第一步拦截。快速路径**只跳过** `is_unsafe_path_pattern()` 的**路径穿越/盘符/绝对路径**检查，因为这些攻击对上传路由无效。
+
+---
+
+## 4. 静态部署时外部静态源改写
+
+### 4.1 什么是 Static Connection 模式
+
+Streamlit 支持**静态部署**（Static App）模式：将应用的全部状态序列化为 protobuf 文件，上传到 S3 等静态存储，前端直接从 S3 加载资源，不需要连接后端 WebSocket。这种模式下，所有媒体资源 URL 都需要被改写为 S3 地址。
+
+### 4.2 静态连接建立流程
+
+在 [establishStaticConnection()](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/StaticConnection.tsx#L125-L150) 中：
 
 ```typescript
-// 端点常量（需与后端保持同步）
+export async function establishStaticConnection(
+    staticAppId: string,                      // 从 URL 参数 ?staticAppId=xxx 获取
+    onConnectionStateChange: OnConnectionStateChange,
+    onMessage: OnMessage,
+    onConnectionError: (message: ErrorDetails) => void,
+    endpoints: StreamlitEndpoints
+): Promise<void> {
+    onConnectionStateChange(ConnectionState.STATIC_CONNECTING)
+
+    // Step 1: 获取静态配置 URL（S3 bucket 地址）
+    const staticConfigUrl = await getStaticConfig()
+    endpoints.setStaticConfigUrl(staticConfigUrl)  // 保存到 endpoints，供后续 URL 构建使用
+
+    // Step 2: 从 S3 加载序列化的 protobuf 消息并渲染
+    dispatchAppForwardMessages(staticAppId, staticConfigUrl, onMessage, onConnectionError)
+
+    onConnectionStateChange(ConnectionState.STATIC_CONNECTED)
+}
+```
+
+### 4.3 静态配置 URL 的获取与缓存
+
+[getStaticConfig()](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/StaticConnection.tsx#L36-L71) 函数负责获取静态资源的根地址：
+
+```typescript
+// 静态配置的固定地址（存放 static_url 指向实际的 S3 bucket）
+const STATIC_ASSET_CONFIG = "https://data.streamlit.io/static.json"
+
+export async function getStaticConfig(): Promise<string> {
+    // 1. 优先从 localStorage 读取缓存
+    const isLocalStoreAvailable = localStorageAvailable()
+    if (isLocalStoreAvailable) {
+        const cachedStaticConfigUrl = window.localStorage.getItem("stStaticAssetUrl")
+        if (cachedStaticConfigUrl) {
+            return cachedStaticConfigUrl
+        }
+    }
+
+    // 2. 从固定地址获取配置
+    const response = await fetch(STATIC_ASSET_CONFIG, { signal: AbortSignal.timeout(5000) })
+    const config = await response.json()
+    staticConfigUrl = config.static_url  // 例如："https://static.streamlit.io"
+
+    // 3. 缓存到 localStorage
+    if (isLocalStoreAvailable && staticConfigUrl) {
+        window.localStorage.setItem("stStaticAssetUrl", staticConfigUrl)
+    }
+
+    return staticConfigUrl
+}
+```
+
+### 4.4 静态部署下的 URL 改写逻辑
+
+当 `staticConfigUrl` 被设置后，[DefaultStreamlitEndpoints.buildMediaURL()](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/DefaultStreamlitEndpoints.ts#L187-L204) 会将相对媒体 URL 改写为外部静态源地址：
+
+```typescript
+// 端点常量
 const MEDIA_ENDPOINT = "/media"
 const STATIC_SERVING_ENDPOINT = "/app/static/"
-const UPLOAD_FILE_ENDPOINT = "/_stcore/upload_file"
-const COMPONENT_ENDPOINT_BASE = "/component"
-const BIDI_COMPONENT_ENDPOINT_BASE = "/_stcore/bidi-components"
+
+public buildMediaURL(url: string): string {
+    // 关键判断：如果 staticConfigUrl 已设置（静态部署模式）
+    if (this.staticConfigUrl) {
+        // 对 /media 和 /app/static/ 开头的 URL 都进行改写
+        if (url.startsWith(MEDIA_ENDPOINT) || url.startsWith(STATIC_SERVING_ENDPOINT)) {
+            return this.buildStaticUrl(url)  // 改写为 S3 地址
+        }
+    }
+
+    // 正常模式：拼接后端服务器地址
+    if (url.startsWith(MEDIA_ENDPOINT) || url.startsWith(STATIC_SERVING_ENDPOINT)) {
+        return buildHttpUri(this.requireServerUri(), url)
+    }
+    return url
+}
+
+// 实际改写逻辑
+private buildStaticUrl(file: string): string {
+    // 从 URL 参数获取 staticAppId
+    const queryParams = new URLSearchParams(document.location.search)
+    const staticAppId = queryParams.get("staticAppId")
+
+    // 构造成：https://static.streamlit.io/{staticAppId}/media/xxx.png
+    return `${this.staticConfigUrl}/${staticAppId}${file}`
+}
 ```
 
-关键逻辑：
-- `buildMediaURL()`: 以 `/media` 或 `/app/static/` 开头的相对 URL 会被拼接上服务器地址
-- `buildDownloadUrl()`: 支持通过 `StreamlitConfig.DOWNLOAD_ASSETS_BASE_URL` 配置 CDN 域名
-- `buildComponentURL()` / `buildBidiComponentURL()`: 构建自定义组件资源 URL
-- **Static Connection 模式**: 静态部署（如 S3）时，媒体 URL 会被重写为 S3 地址
+### 4.5 Protobuf 消息加载
 
-前端端点实现: [DefaultStreamlitEndpoints.ts](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/DefaultStreamlitEndpoints.ts#L50-L204)
-静态连接模式: [StaticConnection.tsx](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/StaticConnection.tsx#L30-L150)
+应用的实际内容通过序列化的 protobuf 加载：
 
-### 2.5 开发模式代理
+```typescript
+// [StaticConnection.tsx#L76-L96]
+export async function getProtoResponse(
+    staticAppId: string,
+    staticConfigUrl: string
+): Promise<null | ArrayBuffer> {
+    // 从 S3 加载序列化的 protobuf 消息：https://static.streamlit.io/{appId}/protos.pb
+    const path = `${staticConfigUrl}/${staticAppId}/protos.pb`
+    const response = await fetch(path, { signal: AbortSignal.timeout(5000) })
+    return response.arrayBuffer()
+}
 
-开发模式下，Vite Dev Server 通过代理将后端请求转发到 Python 服务（默认 `localhost:8501`）：
+// [StaticConnection.tsx#L100-L123]
+export async function dispatchAppForwardMessages(...) {
+    const arrayBuffer = await getProtoResponse(staticAppId, staticConfigUrl)
+    const forwardMsgList = ForwardMsgList.decode(new Uint8Array(arrayBuffer))
 
-```javascript
-// vite.config.ts 代理规则
-"^.*/_stcore/.*"          // 内部 API
-"^(?!.*/static/media).*/media/.*"  // 媒体文件（排除 Vite 自己的 static/media）
-"^.*/component/.*"        // 自定义组件
-"^.*/app/static/.*"       // App 静态文件
-"^.*/auth/.*"             // 认证
+    // 将 protobuf 消息逐一分发到 App.tsx 的 handleMessage，实现无后端渲染
+    forwardMsgList.messages.forEach(msg => {
+        onMessage(msg as ForwardMsg)
+    })
+}
 ```
 
-Vite 配置: [vite.config.ts](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/app/vite.config.ts#L156-L191)
+### 4.6 下载 URL 的额外改写
+
+除了媒体 URL，下载 URL 也支持通过 `StreamlitConfig.DOWNLOAD_ASSETS_BASE_URL` 配置 CDN 域名：
+
+```typescript
+// [DefaultStreamlitEndpoints.ts#L213-L223]
+public buildDownloadUrl(url: string): string {
+    if (!url.startsWith(MEDIA_ENDPOINT)) {
+        return url
+    }
+
+    // 如果配置了 DOWNLOAD_ASSETS_BASE_URL（通过 window.__streamlit 注入）
+    const downloadAssetBaseUrl = StreamlitConfig.DOWNLOAD_ASSETS_BASE_URL
+    return downloadAssetBaseUrl
+        ? buildHttpUri(parseUriIntoBaseParts(downloadAssetBaseUrl), url)
+        : buildHttpUri(this.requireServerUri(), url)
+}
+```
+
+`StreamlitConfig` 在模块加载时从 `window.__streamlit` 捕获并冻结：
+
+```typescript
+// [config/index.ts#L225-L255]
+const capturedConfig = (() => {
+    const windowConfig = window.__streamlit
+    if (!windowConfig) return undefined
+    const cloned = deepClone(windowConfig)
+    return deepFreeze(cloned)  // 深度冻结，防止运行时篡改
+})()
+
+export const StreamlitConfig = {
+    get DOWNLOAD_ASSETS_BASE_URL(): string | undefined {
+        return capturedConfig?.DOWNLOAD_ASSETS_BASE_URL
+    },
+    // ... 其他配置项
+} as const
+```
 
 ---
 
-## 3. 访问控制
+## 5. 整体架构回顾：路径映射、访问控制、缓存的边界
 
-Streamlit 采用**多层防御（Swiss Cheese 模型）**的访问控制策略，每层独立提供保护，即使某层失效其他层仍能拦截攻击。
+### 5.1 路径映射 × 访问控制 × 缓存 的交互矩阵
 
-### 3.1 第一层：PathSecurityMiddleware（全局路径安全）
+| 资源类型 | 路径映射方式 | 访问控制 | 缓存策略 |
+|---|---|---|---|
+| 核心前端资产 | `Mount` 独立挂载到 `/`，继承 StaticFiles | `_StreamlitStaticFiles.__call__` 内双斜杠 + `is_unsafe_path_pattern` 检查 | HTML: `no-cache`；带哈希资源: `immutable + max-age=1年` |
+| 媒体文件 | `Route` 精确匹配 `/media/{file_id}` | CORS + `Content-Disposition` 处理 | *(未设置)* |
+| 自定义组件 v1/v2 | `Route` 匹配 `/component/{name}/{path:path}` | `build_safe_abspath` 做路径规范化 + 根目录校验 | HTML: `no-cache`；其他: `public` |
+| App 用户静态文件 | `Route` 匹配 `/app/static/{path:path}` | `build_safe_abspath` + 文件大小限制 200MB + `X-Content-Type-Options: nosniff` | *(未设置)* |
+| 文件上传 | `Route` 匹配 `/_stcore/upload_file/{session_id}/{file_id}` | 快速路径跳过 `is_unsafe_path_pattern`（因为是字典键）+ XSRF + 会话校验 | *(未设置)* |
 
-位置：**最外层中间件，最先执行**，对所有 HTTP 请求生效。
+### 5.2 关键安全边界的代码定位
 
-拦截规则（按顺序，任何一步匹配即返回 400）：
-
-1. **UNC 路径检查** (`//`, `\\\\`): 防止 Windows UNC 路径触发 SMB 连接导致 SSRF/NTLM 哈希泄露
-2. **快速路径绕过**: 已知安全的路径跳过后续检查（`/_stcore/health`, `/_stcore/script-health-check`, `/_stcore/metrics`, `/_stcore/host-config`, `/_stcore/upload_file/*`）
-3. **完整路径模式检查**: 调用 `is_unsafe_path_pattern()` 检查剩余路径
-
-路径安全中间件: [starlette_path_security_middleware.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_path_security_middleware.py#L111-L174)
-
-### 3.2 第二层：路由处理器内的路径检查
-
-各路由处理函数在处理文件路径前独立执行安全检查，形成纵深防御。
-
-#### is_unsafe_path_pattern() 函数
-
-集中化路径验证，检查以下危险模式：
-
-| 检查项 | 示例 | 说明 |
+| 安全机制 | 所在文件 | 关键函数 |
 |---|---|---|
-| 空字节截断 | `file.exe\x00.jpg` | `\x00` 可被某些 API 用作字符串终止符 |
-| UNC 路径 | `\\\\server\\share`, `//server/share` | Windows 网络共享，可触发 SSRF |
-| Windows 盘符 | `C:\\Windows`, `D:foo` | 盘符路径可能映射到网络共享 |
-| 绝对路径 | `/etc/passwd`, `\\Windows` | 以斜杠或反斜杠开头的根路径 |
-| 路径穿越 | `../../../etc/passwd` | `..` 段向上跳出根目录 |
-
-路径安全核心: [path_security.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/path_security.py#L35-L98)
-
-#### build_safe_abspath() 函数
-
-用于组件和 App 静态文件的安全绝对路径构建：
-
-```python
-def build_safe_abspath(component_root: str, relative_url_path: str) -> str | None:
-    # 1. is_unsafe_path_pattern() 初步过滤
-    if is_unsafe_path_pattern(relative_url_path):
-        return None
-    # 2. realpath 解析符号链接
-    root_real = os.path.realpath(component_root)
-    candidate = os.path.normpath(os.path.join(root_real, relative_url_path))
-    candidate_real = os.path.realpath(candidate)
-    # 3. commonpath 确保结果仍在根目录内
-    if os.path.commonpath([root_real, candidate_real]) != root_real:
-        return None
-    return candidate_real
-```
-
-路径构建工具: [component_file_utils.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/component_file_utils.py#L35-L73)
-
-#### 静态资产路由内的安全检查
-
-`_StreamlitStaticFiles.__call__` 在进入文件系统操作前执行检查：
-
-```python
-# 1. 双斜杠检查
-if path.startswith("//"):
-    return 400
-# 2. 完整 unsafe pattern 检查
-relative_path = path.lstrip("/")
-if relative_path and is_unsafe_path_pattern(relative_path):
-    return 400
-```
-
-### 3.3 CORS 跨域控制
-
-跨域策略由 `_set_cors_headers()` 函数统一处理：
-
-```python
-def _set_cors_headers(request: Request, response: Response) -> None:
-    if allow_all_cross_origin_requests():
-        # 开发模式或 server.enableCORS=False → 允许所有来源 "*"
-        response.headers["Access-Control-Allow-Origin"] = "*"
-        return
-    # 生产模式: 严格匹配 server.corsAllowedOrigins 配置
-    origin = request.headers.get("Origin")
-    if origin and is_allowed_origin(origin):
-        response.headers["Access-Control-Allow-Origin"] = origin
-```
-
-特殊情况：
-- **文件上传路由** (PUT/DELETE): 启用 XSRF 时 CORS 策略更严格，设置 `Access-Control-Allow-Credentials: true` 并 `Vary: Origin`
-- **App 静态文件**: 始终返回 `Access-Control-Allow-Origin: *`（方便跨域引用）
-
-CORS 工具: [server_util.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/server_util.py#L37-L104)
-路由内 CORS: [starlette_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_routes.py#L179-L200)
-
-### 3.4 XSRF 跨站请求伪造防护
-
-采用 **Double-Submit Cookie** 模式：
-
-1. 健康检查接口响应时设置 XSRF Cookie（`_streamlit_xsrf`）
-2. Cookie 格式: `2|mask|token|timestamp`，不设 HttpOnly（JS 需读取）
-3. 非安全方法（PUT/DELETE）请求时，前端从 Cookie 读取 token 放入 `X-Xsrftoken` Header
-4. 后端比较 Header 值与 Cookie 值是否一致
-
-关键属性：
-- `SameSite=Lax`
-- SSL 时自动加 `Secure` 标志
-- `Path=/` 全站可用
-
-XSRF 处理: [starlette_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_routes.py#L202-L305)
-前端 XSRF 发送: [DefaultStreamlitEndpoints.ts](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/DefaultStreamlitEndpoints.ts#L382-L402)
-
-### 3.5 其他访问控制边界
-
-- **文件大小限制**: App 静态文件最大 200MB（`MAX_APP_STATIC_FILE_SIZE`），上传文件由 `server.maxUploadSize` 控制
-- **会话校验**: 上传接口校验 `session_id` 是否为活跃会话
-- **保留路由前缀**: 用户自定义路由不能以 `/_stcore/`, `/media/`, `/component/`, `/static/` 开头
-
-配置常量: [starlette_server_config.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_server_config.py#L64-L68)
-
----
-
-## 4. 浏览器缓存
-
-Streamlit 对不同类型的静态资源采用差异化的缓存策略，在性能与新鲜度之间权衡。
-
-### 4.1 缓存策略总览
-
-| 资源类型 | Cache-Control 头 | 说明 |
-|---|---|---|
-| 核心前端带哈希资源 (JS/CSS) | `public, immutable, max-age=31536000` | 一年强缓存，文件名含内容哈希 |
-| HTML / manifest.json | `no-cache` | 每次需服务器校验（304） |
-| 自定义组件 HTML | `no-cache` | 组件入口文件需保持新鲜 |
-| 自定义组件其他资源 | `public` | 允许缓存但无强缓存 |
-| App 用户静态文件 | *(未显式设置)* | 由浏览器默认行为 + `X-Content-Type-Options: nosniff` |
-| 媒体文件 (media) | *(未设置)* | 动态生成，默认不缓存 |
-| 健康检查 / 主机配置 | `no-cache` | 状态接口禁用缓存 |
-| 301 重定向 | `Cache-Control: no-cache` | 禁止缓存重定向 |
-
-### 4.2 核心前端资产的缓存实现
-
-由 `_StreamlitStaticFiles._apply_cache_headers()` 实现：
-
-```python
-_NO_CACHE_PATTERN = re.compile(r"(?:\.html$|^manifest\.json$)")
-
-def _apply_cache_headers(self, response: Response, served_path: str) -> None:
-    if response.status_code in {301, 302, 303, 304, 307, 308}:
-        return  # 重定向类响应不设置缓存头
-
-    normalized = served_path.replace("\\", "/").lstrip("./")
-    cache_value = (
-        "no-cache"
-        if not normalized or _NO_CACHE_PATTERN.search(normalized)
-        else f"public, immutable, max-age={STATIC_ASSET_CACHE_MAX_AGE_SECONDS}"
-        # STATIC_ASSET_CACHE_MAX_AGE_SECONDS = 365 * 24 * 60 * 60 = 1 年
-    )
-    response.headers["Cache-Control"] = cache_value
-```
-
-缓存头应用: [starlette_static_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_static_routes.py#L151-L164)
-
-构建产物配合：Vite 构建时对 JS/CSS 文件名加入内容哈希（`.[hash]`），保证文件内容变化时 URL 也变化，从而规避缓存过期问题。HTML 文件不带哈希，使用 `no-cache` 保持入口新鲜。
-
-Vite 构建配置: [vite.config.ts](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/app/vite.config.ts#L192-L233)
-
-### 4.3 自定义组件缓存
-
-- **组件入口 (index.html)**: `Cache-Control: no-cache`，确保组件更新后浏览器能立即加载新版本
-- **组件其他资源 (JS/CSS/图片)**: `Cache-Control: public`，允许浏览器和中间代理缓存，但每次可能触发协商缓存
-
-组件路由缓存: [starlette_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_routes.py#L786-L789)
-双向组件缓存: [starlette_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_routes.py#L865-L868)
-
-### 4.4 App 用户静态文件缓存
-
-App 静态文件不设置 `Cache-Control` 头，但设置了：
-- `Access-Control-Allow-Origin: *`（允许跨域引用）
-- `X-Content-Type-Options: nosniff`（禁止 MIME 嗅探，提升安全性）
-
-App 静态文件响应头: [starlette_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_routes.py#L927-L930)
-
-### 4.5 GZip 压缩与缓存的交互
-
-`SelectiveGZipMiddleware` 对以下情况跳过压缩：
-
-1. **静态资产路径** (`/static/*` 或 `/`): 前端构建产物已做过最优压缩，重复压缩反而浪费 CPU
-2. **音频/视频 Content-Type**: 压缩二进制媒体会破坏浏览器 Range 请求播放
-
-压缩中间件: [starlette_gzip_middleware.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_gzip_middleware.py#L44-L144)
-
----
-
-## 5. 边界划分总结
-
-### 5.1 路径映射 vs 访问控制边界
-
-| 维度 | 路径映射 | 访问控制 |
-|---|---|---|
-| 职责 | URL 到文件/资源的映射关系 | 判断请求是否允许被处理 |
-| 位置 | Starlette Routes 层（内部） | Middleware 外层 + 路由处理器内部双层 |
-| 失效时 | 404 Not Found | 400 Bad Request / 403 Forbidden |
-| 关键机制 | `_with_base()` 前缀、`Mount` 路径、SPA fallback | `PathSecurityMiddleware`、`is_unsafe_path_pattern()`、`build_safe_abspath()`、CORS、XSRF |
-| 错误含义 | 资源不存在或 URL 写错 | 攻击拦截或权限不足 |
-
-### 5.2 访问控制 vs 浏览器缓存边界
-
-| 维度 | 访问控制 | 浏览器缓存 |
-|---|---|---|
-| 作用阶段 | 请求到达时，处理前 | 响应返回时 + 后续浏览器重用 |
-| 目标 | 安全：防止非法请求 | 性能：减少重复传输 |
-| 相关头 | `Access-Control-Allow-*`、`Set-Cookie`、`X-Content-Type-Options` | `Cache-Control`、`ETag`、`Last-Modified` |
-| 冲突情况 | 缓存的 CORS 响应可能因 Origin 不同而失效 → 用 `Vary: Origin` 解决 | |
-
-### 5.3 路径映射 vs 浏览器缓存边界
-
-| 维度 | 路径映射 | 浏览器缓存 |
-|---|---|---|
-| 核心决策 | 这个 URL 对应哪个文件 | 这个响应是否可以缓存/重用 |
-| 关键设计 | 带哈希文件名（Cache Busting） | `immutable` + 长 `max-age` vs `no-cache` |
-| 配合点 | URL 含内容哈希 → 可安全强缓存；HTML 无哈希 → 需 `no-cache` 保持新鲜 | |
+| 全局路径安全（第一层） | [starlette_path_security_middleware.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_path_security_middleware.py) | `PathSecurityMiddleware.__call__` |
+| 路径模式检测（核心算法） | [path_security.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/path_security.py) | `is_unsafe_path_pattern` |
+| 路径规范化与根校验（第二层） | [component_file_utils.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/component_file_utils.py) | `build_safe_abspath` |
+| CORS 跨域控制 | [server_util.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/server_util.py) | `allow_all_cross_origin_requests`, `is_allowed_origin` |
+| XSRF 防护 | [starlette_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_routes.py) | `_ensure_xsrf_cookie`, `_check_xsrf` |
+| 选择性 GZip | [starlette_gzip_middleware.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_gzip_middleware.py) | `SelectiveGZipMiddleware.__call__` |
+| 前端 URL 构建 | [DefaultStreamlitEndpoints.ts](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/DefaultStreamlitEndpoints.ts) | `buildMediaURL`, `buildStaticUrl`, `buildDownloadUrl` |
+| 静态部署模式 | [StaticConnection.tsx](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/StaticConnection.tsx) | `establishStaticConnection`, `getStaticConfig` |
 
 ---
 
@@ -341,15 +485,17 @@ App 静态文件响应头: [starlette_routes.py](file:///d:/fz/0601/solo-dogfeed
 
 | 文件 | 职责 |
 |---|---|
-| [starlette_app.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_app.py) | 应用组装、中间件顺序、路由编排 |
-| [starlette_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_routes.py) | 所有业务路由定义（媒体、组件、上传、App静态等） |
-| [starlette_static_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_static_routes.py) | 核心前端资产路由（含SPA fallback和缓存策略） |
-| [starlette_path_security_middleware.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_path_security_middleware.py) | 全局路径安全中间件 |
-| [starlette_gzip_middleware.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_gzip_middleware.py) | 选择性 GZip 压缩中间件 |
-| [path_security.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/path_security.py) | 路径安全检查核心算法 |
-| [component_file_utils.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/component_file_utils.py) | 安全路径构建工具 |
-| [server_util.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/server_util.py) | CORS 和 XSRF 开关判断 |
-| [starlette_server_config.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_server_config.py) | 缓存年龄、文件大小等配置常量 |
-| [DefaultStreamlitEndpoints.ts](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/DefaultStreamlitEndpoints.ts) | 前端 URL 构建与 XSRF 头注入 |
-| [StaticConnection.tsx](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/StaticConnection.tsx) | 静态部署模式下的 S3 资源加载 |
-| [vite.config.ts](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/app/vite.config.ts) | 构建产物哈希命名与开发代理配置 |
+| [starlette_app.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_app.py) | 应用组装、中间件顺序、6类路由分流编排 |
+| [starlette_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_routes.py) | 各业务路由工厂函数（媒体、组件、上传、App静态等） |
+| [starlette_static_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_static_routes.py) | 核心前端资产的独立 Mount 挂载、_StreamlitStaticFiles 自定义处理器 |
+| [starlette_path_security_middleware.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_path_security_middleware.py) | 全局路径安全中间件、快速路径绕过逻辑 |
+| [path_security.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/path_security.py) | is_unsafe_path_pattern 核心算法（UNC、盘符、穿越检测） |
+| [component_file_utils.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/component_file_utils.py) | build_safe_abspath 安全路径构建 |
+| [memory_uploaded_file_manager.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/runtime/memory_uploaded_file_manager.py) | 上传文件仅做字典存储的证据（无文件系统操作） |
+| [starlette_gzip_middleware.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_gzip_middleware.py) | 选择性 GZip 压缩（跳过静态路径和音视频） |
+| [server_util.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/server_util.py) | CORS 策略、XSRF 开关 |
+| [starlette_server_config.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_server_config.py) | STATIC_ASSET_CACHE_MAX_AGE_SECONDS 等配置常量 |
+| [DefaultStreamlitEndpoints.ts](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/DefaultStreamlitEndpoints.ts) | 前端 URL 构建、静态部署 URL 改写、XSRF 头注入 |
+| [StaticConnection.tsx](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/StaticConnection.tsx) | 静态部署模式建立、S3 配置获取、Protobuf 消息加载 |
+| [config/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/utils/src/config/index.ts) | StreamlitConfig 捕获与冻结（含 DOWNLOAD_ASSETS_BASE_URL） |
+| [vite.config.ts](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/app/vite.config.ts) | 构建产物哈希命名（支持强缓存）、开发代理 |
