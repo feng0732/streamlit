@@ -549,7 +549,10 @@ ThemedSidebar 组件 [ThemedSidebar.tsx]
   │       └─ 完整的 Emotion + BaseWeb 主题构建
   │
   └─ <ThemeProvider theme={sidebarTheme.emotion} baseuiTheme={sidebarTheme.basewebTheme}>
-       └─ <Sidebar ...> ... </Sidebar>
+       │  └─ 内部: <baseui.ThemeProvider> + <EmotionThemeProvider>
+       └─ <SidebarWithProvider>  ← Sidebar.tsx 的默认导出
+            └─ <IsSidebarContext.Provider value={true}>
+                 └─ <Sidebar> ... </Sidebar>
      </ThemeProvider>
 ```
 
@@ -557,11 +560,12 @@ ThemedSidebar 组件 [ThemedSidebar.tsx]
 
 | 特性 | RootStyleProvider（主应用） | ThemeProvider（侧边栏） |
 |------|---------------------------|----------------------|
-| BaseProvider | ✅ 有 | ✅ 有 |
-| CacheProvider | ✅ 有（创建独立 emotion cache） | ❌ 无（复用外层 cache） |
+| baseui 上下文 | `BaseProvider`（from "baseui"） | `ThemeProvider`（from "baseui"） |
+| CacheProvider | ✅ 有（创建 `st-emotion-cache`） | ❌ 无（复用外层 cache） |
 | EmotionThemeProvider | ✅ 有 | ✅ 有 |
 | Global (全局样式) | ✅ 有（html/body/滚动条等） | ❌ 无（不重复注入） |
-| CSP nonce 支持 | ✅ 支持 | ❌ 不需要（复用 cache） |
+| FontSources / FontFaceDeclaration | ✅ 有 | ❌ 无（依赖外层加载） |
+| IsSidebarContext | ❌ | ✅（由 SidebarWithProvider 设置） |
 
 **关键洞察**：
 - 侧边栏主题是"嵌套主题"模式：外层主主题 + 内层侧边栏主题
@@ -632,7 +636,7 @@ export const StyledErrorMessage = styled.small(({ theme }) => ({
 
 侧边栏通过 `createSidebarTheme()` 从主主题派生：
 
-**位置**：[utils.ts L1562-end](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/lib/src/theme/utils.ts#L1562)
+**位置**：[utils.ts L1562-L1612](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/lib/src/theme/utils.ts#L1562-L1612)
 
 ```typescript
 // 默认: 侧边栏背景 = main.secondaryBg
@@ -640,7 +644,7 @@ export const StyledErrorMessage = styled.small(({ theme }) => ({
 // 背景色、文字色、字体、圆角、所有语义色均可独立配置
 ```
 
-渲染时在侧边栏容器外再包一层 `RootStyleProvider`（使用 sidebarTheme），实现内外主题隔离。
+渲染时在侧边栏容器外包一层轻量 `ThemeProvider`（[ThemeProvider.tsx](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/lib/src/components/core/ThemeProvider.tsx)），内部为 `baseui.ThemeProvider` + `EmotionThemeProvider`，不含 CacheProvider / Global / FontSources，实现内外主题隔离。
 
 ---
 
@@ -775,41 +779,44 @@ ThemedApp
   │  fontFaces/fontSources 来自 setFonts(themeInput)  ← 只执行一次
   │
   ├─ <RootStyleProvider theme={activeTheme}>
-  │     ├─ <BaseProvider theme={basewebTheme} zIndex={popup}>
-  │     └─ <CacheProvider value={cache}>
-  │          └─ <EmotionThemeProvider theme={emotion}>
-  │               ├─ <Global styles={globalStyles} />        ← body { font-family, bg, color }
-  │               ├─ <FontFaceDeclaration fontFaces={fontFaces} />  ← @font-face CSS
-  │               ├─ <FontSources fontSources={fontSources} />      ← <link rel=stylesheet>
+  │     ├─ <BaseProvider theme={basewebTheme} zIndex={popup}>     ← baseui 顶层 Provider
+  │     └─ <CacheProvider value={cache}>                          ← Emotion 样式缓存
+  │          └─ <EmotionThemeProvider theme={emotion}>            ← 主 Emotion 主题
+  │               ├─ <Global styles={globalStyles} />             ← body { font-family, bg, color }
+  │               ├─ <FontFaceDeclaration fontFaces={fontFaces} /> ← @font-face CSS
+  │               ├─ <FontSources fontSources={fontSources} />    ← <link rel=stylesheet>
   │               │
   │               └─ <AppWithScreencast theme={themeManager}>
   │                    └─ <App>
   │                         └─ <AppView>
   │                              ├─ <ThemedSidebar>
-  │                              │     ├─ useContext(ThemeContext) → activeTheme
-  │                              │     ├─ createSidebarTheme(activeTheme)
-  │                              │     └─ <ThemeProvider theme={sidebarTheme.emotion}
-  │                              │                       baseuiTheme={sidebarTheme.basewebTheme}>
-  │                              │          ├─ <BaseUIThemeProvider>     ← 侧边栏 BaseWeb
-  │                              │          ├─ <EmotionThemeProvider>    ← 侧边栏 Emotion
-  │                              │          │   └─ <IsSidebarContext.Provider value={true}>
-  │                              │          │        └─ <Sidebar> ... </Sidebar>
-  │                              │          └─ （无 FontSources / FontFaceDeclaration）
+  │                              │     │  useContext(ThemeContext) → activeTheme
+  │                              │     │  createSidebarTheme(activeTheme)
+  │                              │     │
+  │                              │     └─ <ThemeProvider>                            ← 轻量版
+  │                              │          ├─ <baseui.ThemeProvider>               ← 覆盖 BaseWeb 主题
+  │                              │          └─ <EmotionThemeProvider>               ← 覆盖 Emotion 主题
+  │                              │               └─ <SidebarWithProvider>            ← Sidebar.tsx 默认导出
+  │                              │                    └─ <IsSidebarContext.Provider value={true}>
+  │                              │                         └─ <Sidebar> ... </Sidebar>
   │                              │
   │                              └─ <StyledMainContent> ... </StyledMainContent>
+  │
+  │  注意：ThemeProvider 内没有 CacheProvider / Global / FontSources / FontFaceDeclaration
+  │  侧边栏的字体文件依赖外层 ThemedApp 加载
 ```
 
 #### 两层 Provider 的职责划分
 
 | 能力 | RootStyleProvider（主应用） | ThemeProvider（侧边栏） |
 |------|---------------------------|----------------------|
-| BaseWeb 主题 | ✅ `BaseProvider` | ✅ `BaseUIThemeProvider` |
+| baseui 上下文 | `BaseProvider`（from "baseui"） | `ThemeProvider`（from "baseui"） |
 | Emotion 缓存 | ✅ `CacheProvider`（创建 `st-emotion-cache`） | ❌ 复用外层缓存 |
 | Emotion 主题 | ✅ `EmotionThemeProvider` | ✅ `EmotionThemeProvider`（覆盖内层） |
 | 全局 CSS | ✅ `Global(globalStyles)` → body/html/滚动条 | ❌ 不重复注入 |
 | 字体源 `<link>` | ✅ `FontSources` → `<head>` 中 | ❌ 无 |
 | 字体声明 | ✅ `FontFaceDeclaration` → `@font-face` | ❌ 无 |
-| 侧边栏标志 | ❌ | ✅ `IsSidebarContext.Provider` |
+| 侧边栏标志 | ❌ | ✅ `IsSidebarContext.Provider`（由 SidebarWithProvider 设置） |
 
 **关键洞察**：侧边栏的 `ThemeProvider` 只覆盖了 Emotion 主题值（颜色、字体名、间距等），但不注入任何字体资源。侧边栏使用的字体依赖外层 `ThemedApp` 的 `FontSources` / `FontFaceDeclaration` 加载。
 
