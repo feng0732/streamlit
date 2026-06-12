@@ -7,8 +7,8 @@
 ## 2. 快速路径优化
 
 **单字符串快速路径**（第413-419行）：
-- 如果只有一个参数且是字符串，直接调用 `st.markdown()`
-- 跳过缓冲逻辑，避免不必要的 `st.empty()` 调用
+- 如果只有一个参数且是字符串，直接调用 `self.dg.markdown(text, unsafe_allow_html=...)`
+- **不创建临时容器**：跳过缓冲逻辑，避免不必要的 `st.empty()` 调用
 - 覆盖了超过 80% 的 `st.write` 使用场景
 
 ```python
@@ -17,13 +17,100 @@ if len(args) == 1 and isinstance(args[0], str):
     return
 ```
 
-## 3. 多参数缓冲机制
+> 这是全文件唯一直接调用 `self.dg.markdown()` 的地方。其他所有文本渲染（多字符串、兜底代码块等）都先走 buffer → flush → `self.dg.empty()` → 子容器 `.markdown()` 的路径。
 
-当传入多个参数时，使用 `string_buffer` 列表收集连续的字符串（第421-444行）：
+## 3. 字符串缓冲机制与落地路径
 
-- **字符串缓冲**：连续的字符串参数会被收集到 buffer 中
-- **Flush 触发**：遇到非字符串类型时，先将 buffer 中的内容用 `st.markdown()` 输出
-- **空间拼接**：多个字符串用空格连接
+### 3.1 缓冲的触发：单字符串 vs 多参数/非字符串
+
+`st.write()` 有两条完全不同的文本渲染路径，是否使用 `st.empty()` 临时容器是核心区别：
+
+```
+┌─ 单字符串快速路径（len(args)==1 且 isinstance(str)）──────────┐
+│  直接 self.dg.markdown(text, unsafe_allow_html=...)            │
+│  ❌ 不使用 string_buffer                                         │
+│  ❌ 不调用 st.empty()                                           │
+│  ✅ 覆盖 >80% 的 st.write 调用场景                              │
+└────────────────────────────────────────────────────────────────┘
+
+┌─ 缓冲路径（其他所有情况）─────────────────────────────────────┐
+│  string_buffer = []                                             │
+│  逐个收集字符串 → 触发 flush → 创建 empty 容器 → markdown 渲染  │
+│  ✅ 使用 string_buffer                                          │
+│  ✅ 调用 st.empty() 创建临时容器                                │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### 3.2 flush_buffer() 的完整实现（第434-444行）
+
+```python
+def flush_buffer() -> None:
+    if string_buffer:
+        text_content = " ".join(string_buffer)
+
+        # 关键：先创建一个空容器占位
+        # 代码注释明确说明：The usage of empty here prevents
+        # some grey out effects（防止某些"灰出"加载效果）
+        text_container = self.dg.empty()
+
+        # 在临时容器内部渲染 markdown
+        text_container.markdown(
+            text_content,
+            unsafe_allow_html=unsafe_allow_html,
+        )
+        string_buffer[:] = []   # 清空缓冲，复用 list 对象
+```
+
+**为什么要先 `st.empty()` 再 `.markdown()`，而不是直接 `st.markdown()`？**
+
+代码注释写得很直白：*"prevents some grey out effects"*。Streamlit 在渲染过程中有时会给元素加上灰化加载动画，如果直接在顶层 DeltaGenerator 上连续调用 `markdown()`，可能出现闪烁或灰出。通过先插入一个 `empty` 占位容器，再在该容器内部替换内容，可以避免这个视觉副作用。
+
+### 3.3 缓冲的收集与触发时机
+
+缓冲内容来自两个来源：
+1. **级别1命中的字符串参数**：`st.write("hello", "world")` 中的每个字符串
+2. **第22级兜底分支的文本**：tuple/set/frozenset/自定义类等 `str()` 后包装的代码块
+
+触发 flush_buffer() 的时机（共三类）：
+- **遇到非字符串级别**：级别2-21 的任意一个分支命中前先 flush
+- **循环结束**：整个 `for arg in args` 循环结束后，最后再 flush 一次
+- **兜底分支A**：`is_mem_address_str()` 为 True 时（走 help，不走缓冲）
+
+### 3.4 tuple/set/frozenset 如何借缓冲链路落地
+
+以 `st.write((1, 2, 3))` 为例，完整链路：
+
+```
+st.write((1, 2, 3))
+    │
+    ├─ len(args)==1 但 isinstance(str)?  ❌ 不是字符串
+    │     → 进入缓冲路径
+    │     → string_buffer = []
+    │
+    ├─ 遍历 args:
+    │   └─ arg = (1, 2, 3)
+    │        │
+    │        ├─ 级别1 isinstance(str)?  ❌
+    │        ├─ 级别2-21？  全部 ❌ （第14级 JSON 分支 tuple 不在列表）
+    │        └─ 级别22 兜底 分支C（单行）
+    │             ├─ str(arg) → "(1, 2, 3)"
+    │             ├─ backtick_wrapper = "`"
+    │             └─ string_buffer.append("`(1, 2, 3)`")
+    │                → string_buffer = ["`(1, 2, 3)`"]
+    │
+    ├─ for 循环结束
+    │
+    └─ 调用 flush_buffer():
+         ├─ text_content = "`(1, 2, 3)`"
+         ├─ text_container = self.dg.empty()   ← 创建临时容器
+         └─ text_container.markdown("`(1, 2, 3)`", unsafe_allow_html=False)
+            ← 在容器内渲染行内代码
+```
+
+**关键纠正**：之前文档写成 `st.markdown("`(1, 2, 3)`")` 是不准确的。实际调用链是：
+> `self.dg.empty()` → 返回子 DeltaGenerator → 子容器 `.markdown(...)`
+
+多行对象兜底、多个字符串参数混合非字符串参数等场景的渲染路径完全一致，都是 **buffer 收集 → empty 占位 → 容器内 markdown 渲染**。
 
 ---
 
@@ -32,15 +119,24 @@ if len(args) == 1 and isinstance(args[0], str):
 ```
 st.write(*args)
     │
-    ├─ 单字符串快速路径 → st.markdown()  [END]
+    ├─ 单字符串快速路径 → self.dg.markdown() 直接调用  [END]
     │
     ├─ 多参数校验：非顶层容器且 len(args)>1 → 抛异常  [END]
     │
     └─ 逐个处理 arg：
         │
-        ├─ 字符串缓冲区（多个 arg 合并处理）
+        ├─ 字符串缓冲区 string_buffer（收集所有待输出文本）
         │      │
-        │      └─ 每处理完一个非字符串 arg → flush_buffer()
+        │      ├─ 触发 flush 三类时机：
+        │      │   ① 遇到非字符串类型（级别2-21命中前）
+        │      │   ② for arg in args 整个循环结束后
+        │      │   ③ 兜底分支A命中内存地址时（走 help，不走缓冲）
+        │      │
+        │      └─ flush_buffer() 实际执行：
+        │           text_content = " ".join(string_buffer)
+        │           text_container = self.dg.empty()    ← 先创建临时容器占位
+        │           text_container.markdown(text_content, ...)  ← 在容器内渲染
+        │           string_buffer[:] = []
         │
         └─ 对每个 arg，按以下顺序逐条匹配，先命中先分派：
 
@@ -479,10 +575,13 @@ st.write((1, 2, 3))
         ├─ "\n" in "(1, 2, 3)"？ → False
         │
         └─ → 行内代码分支：string_buffer.append("`(1, 2, 3)`")
-           → flush_buffer() 后 st.markdown("`(1, 2, 3)`")  [END]
+           → for 循环结束 → flush_buffer()
+           →   self.dg.empty() 创建临时容器
+           →   临时容器.markdown("`(1, 2, 3)`", unsafe_allow_html=False)  [END]
 ```
 
 **最终展示**：Markdown 行内代码，显示为 `` `(1, 2, 3)` ``
+> ⚠️ 注意：不是直接调用 `st.markdown()`，而是先 `st.empty()` 建临时容器，再在容器内 `.markdown()`
 
 ---
 
@@ -502,10 +601,14 @@ st.write({1, 2, 3})
     │
     └─ 级别22 兜底：
         ├─ str(arg) → "{1, 2, 3}"  (单行)
-        └─ → 行内代码分支：string_buffer.append("`{1, 2, 3}`")  [END]
+        └─ → 行内代码分支：string_buffer.append("`{1, 2, 3}`")
+           → for 循环结束 → flush_buffer()
+           →   self.dg.empty() 创建临时容器
+           →   临时容器.markdown("`{1, 2, 3}`")  [END]
 ```
 
 **最终展示**：Markdown 行内代码，显示为 `` `{1, 2, 3}` ``
+> ⚠️ 注意：不是直接调用 `st.markdown()`，而是先 `st.empty()` 建临时容器，再在容器内 `.markdown()`
 
 ---
 
@@ -522,10 +625,15 @@ st.write(frozenset([1, 2, 3]))
     │   └─ frozenset 不在 isinstance 列表中！→ ❌
     │
     └─ 级别22 兜底：
-        └─ str(arg) → "frozenset({1, 2, 3})" → 行内代码  [END]
+        └─ str(arg) → "frozenset({1, 2, 3})"
+           → string_buffer.append("`frozenset({1, 2, 3})`")
+           → for 循环结束 → flush_buffer()
+           →   self.dg.empty() 创建临时容器
+           →   临时容器.markdown("`frozenset({1, 2, 3})`")  [END]
 ```
 
 **最终展示**：Markdown 行内代码，显示为 `` `frozenset({1, 2, 3})` ``
+> ⚠️ 注意：不是直接调用 `st.markdown()`，而是先 `st.empty()` 建临时容器，再在容器内 `.markdown()`
 
 ---
 
@@ -560,8 +668,17 @@ st.write(MyClass())
     │   │
     │   └─ → flush_buffer() → self.dg.help(arg)  [END-A]
     │
-    │   (如果 __repr__ 被重写为多行文本，则走 END-B: Markdown代码块)
-    │   (如果 __repr__ 被重写为单行文本，则走 END-C: 行内代码)
+    │   (如果 __repr__ 被重写为多行文本：
+    │      → string_buffer.append("```...```")
+    │      → for 循环结束 → flush_buffer()
+    │      →   self.dg.empty() 创建临时容器
+    │      →   临时容器.markdown("```...```")  [END-B: Markdown代码块])
+    │
+    │   (如果 __repr__ 被重写为单行文本：
+    │      → string_buffer.append("`...`")
+    │      → for 循环结束 → flush_buffer()
+    │      →   self.dg.empty() 创建临时容器
+    │      →   临时容器.markdown("`...`")  [END-C: 行内代码])
     └─
 ```
 
@@ -732,38 +849,38 @@ def is_type(obj, fqn_type_pattern):
 
 ## 11. 常见类型 → 最终展示路径速查表
 
-| 输入示例 | 命中级别 | 最终展示 | 执行的命令 |
-|----------|----------|----------|------------|
-| `"hello"` (单参数) | 快速路径 | Markdown文本 | `st.markdown()` |
-| `"a"`, `"b"` (多参数) | 级别1+flush | Markdown文本 "a b" | `st.markdown()` |
-| `[1, 2, 3]` | 级别14 | JSON折叠数组 | `st.json()` |
-| `[{"a":1}, {"a":2}]` | 级别14 | JSON折叠数组（记录列表） | `st.json()` |
-| `{"a": 1}` | 级别14 | JSON折叠对象 | `st.json()` |
-| `{"col": pd.Series([1,2])}` | 级别5 | 交互式数据表格 | `st.dataframe()` |
-| `(1, 2, 3)` | 级别22C | 行内代码 | `` st.markdown("`(1, 2, 3)`") `` |
-| `{1, 2, 3}` | 级别22C | 行内代码 | `` st.markdown("`{1, 2, 3}`") `` |
-| `frozenset([1,2,3])` | 级别22C | 行内代码 | `` st.markdown("`frozenset({1, 2, 3})`") `` |
-| `pd.DataFrame(...)` | 级别5 | 交互式数据表格 | `st.dataframe()` |
-| `np.array([1,2,3])` | 级别5 | 交互式数据表格 | `st.dataframe()` |
-| `pl.DataFrame(...)` | 级别5 | 交互式数据表格 | `st.dataframe()` |
-| `ValueError("oops")` | 级别3 | 异常堆栈 | `st.exception()` |
-| `import os; os` | 级别18 | 模块文档 | `st.help()` |
-| `def f(): pass` | 级别18 | 函数文档 | `st.help()` |
-| `class Foo: pass` | 级别19 | 类文档 | `st.help()` |
-| `Foo()` (默认repr) | 级别22A | 实例文档 | `st.help()` |
-| `Foo()` (多行repr) | 级别22B | Markdown代码块 | `st.markdown(```...```)` |
-| `Foo()` (单行repr) | 级别22C | 行内代码 | `` `str(arg)` `` |
-| `StringIO("hi")` | 级别15 | Markdown文本 "hi" | `st.markdown()` |
-| `obj` (有 _repr_html_) + `unsafe_allow_html=True` | 级别20 | 渲染HTML | `st.html()` |
-| `obj` (有 to_pandas) | 级别21 | 交互式数据表格 | `st.dataframe()` |
-| `st.session_state` | 级别14 | JSON折叠对象 | `st.json()` |
-| `PydanticModel(...)` | 级别14 | JSON折叠对象 | `st.json()` |
-| `namedtuple(x=1, y=2)` | 级别14 | JSON折叠对象 | `st.json()` |
-| 生成器函数 | 级别16 | 打字机流式输出 | `st.write_stream()` |
-| `PIL.Image.open(...)` | 级别12 | 图片展示 | `st.image()` |
-| `matplotlib.figure.Figure` | 级别7 | Matplotlib图表 | `st.pyplot()` |
-| `alt.Chart(...)` | 级别6 | Altair图表 | `st.altair_chart()` |
-| `plotly Figure` | 级别8 | Plotly图表 | `st.plotly_chart()` |
+| 输入示例 | 命中级别 | 最终展示 | 执行的命令（实际调用链） |
+|----------|----------|----------|--------------------------|
+| `"hello"` (单参数) | 快速路径 | Markdown文本 | `st.markdown("hello")` （直接，不走empty） |
+| `"a"`, `"b"` (多参数) | 级别1+flush | Markdown文本 "a b" | `c = st.empty(); c.markdown("a b")` （走临时容器） |
+| `[1, 2, 3]` | 级别14 | JSON折叠数组 | `st.json([1,2,3])` |
+| `[{"a":1}, {"a":2}]` | 级别14 | JSON折叠数组（记录列表） | `st.json(...)` |
+| `{"a": 1}` | 级别14 | JSON折叠对象 | `st.json(...)` |
+| `{"col": pd.Series([1,2])}` | 级别5 | 交互式数据表格 | `st.dataframe(...)` |
+| `(1, 2, 3)` | 级别22C | 行内代码 | `c = st.empty(); c.markdown("\`(1, 2, 3)\`")` （走临时容器） |
+| `{1, 2, 3}` | 级别22C | 行内代码 | `c = st.empty(); c.markdown("\`{1, 2, 3}\`")` （走临时容器） |
+| `frozenset([1,2,3])` | 级别22C | 行内代码 | `c = st.empty(); c.markdown("\`frozenset({1, 2, 3})\`")` （走临时容器） |
+| `pd.DataFrame(...)` | 级别5 | 交互式数据表格 | `st.dataframe(...)` |
+| `np.array([1,2,3])` | 级别5 | 交互式数据表格 | `st.dataframe(...)` |
+| `pl.DataFrame(...)` | 级别5 | 交互式数据表格 | `st.dataframe(...)` |
+| `ValueError("oops")` | 级别3 | 异常堆栈 | `st.exception(...)` |
+| `import os; os` | 级别18 | 模块文档 | `st.help(...)` |
+| `def f(): pass` | 级别18 | 函数文档 | `st.help(...)` |
+| `class Foo: pass` | 级别19 | 类文档 | `st.help(...)` |
+| `Foo()` (默认repr) | 级别22A | 实例文档 | `st.help(...)` |
+| `Foo()` (多行repr) | 级别22B | Markdown代码块 | `c = st.empty(); c.markdown("\`\`\`...\n...\n\`\`\`")` （走临时容器） |
+| `Foo()` (单行repr) | 级别22C | 行内代码 | `c = st.empty(); c.markdown("\`...\`")` （走临时容器） |
+| `StringIO("hi")` | 级别15 | Markdown文本 "hi" | `st.markdown("hi")` （直接，不走empty） |
+| `obj` (有 _repr_html_) + `unsafe_allow_html=True` | 级别20 | 渲染HTML | `st.html(...)` |
+| `obj` (有 to_pandas) | 级别21 | 交互式数据表格 | `st.dataframe(...)` |
+| `st.session_state` | 级别14 | JSON折叠对象 | `st.json(...)` |
+| `PydanticModel(...)` | 级别14 | JSON折叠对象 | `st.json(...)` |
+| `namedtuple(x=1, y=2)` | 级别14 | JSON折叠对象 | `st.json(...)` |
+| 生成器函数 | 级别16 | 打字机流式输出 | `st.write_stream(...)` |
+| `PIL.Image.open(...)` | 级别12 | 图片展示 | `st.image(...)` |
+| `matplotlib.figure.Figure` | 级别7 | Matplotlib图表 | `st.pyplot(...)` |
+| `alt.Chart(...)` | 级别6 | Altair图表 | `st.altair_chart(...)` |
+| `plotly Figure` | 级别8 | Plotly图表 | `st.plotly_chart(...)` |
 
 ---
 
