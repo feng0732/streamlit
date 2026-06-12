@@ -468,22 +468,48 @@ def on_script_finished(self, widget_ids_this_run: frozenset[str]) -> None:
 // useSubmitFormViaEnterKey.ts - 默认导出 第39行
 export default function useSubmitFormViaEnterKey(
   formId: string,
-  widgetProps: { disabled?: boolean },
-  commit: () => void,
-  fragmentId?: string
-): void {
-  const widgetMgr = useContext(WidgetManagerContext)
-  
-  const onEnterPressed = useCallback((): void => {
-    if (widgetProps.disabled) return       // 1. widget 自身禁用
-    if (!widgetMgr.allowFormEnterToSubmit(formId)) return  // 2. 表单级校验
-    commit()                               // 3. 先提交当前 widget 的值
-    widgetMgr.submitForm(formId, fragmentId)  // 4. 再触发表单提交
-  }, [widgetProps.disabled, widgetMgr, formId, commit, fragmentId])
-  
-  // 绑定 keydown 事件...
+  commitWidgetValue: () => void,       // widget 内部的 commit 函数
+  callCommitWidgetValue: boolean,      // 是否需要先 commit(如 dirty 检查)
+  widgetMgr: WidgetStateManager,
+  fragmentId?: string,
+  requireCommandKey = false            // 某些 widget 如 Textarea 需要 Cmd+Enter
+): (e: SubmitFormKeyboardEvent) => void {
+  return useCallback(
+    (e: SubmitFormKeyboardEvent): void => {
+      // 检查 1: 键位校验(Enter 键 + 可选 Cmd/Ctrl)
+      const isCommandKeyPressed = requireCommandKey
+        ? e.metaKey || e.ctrlKey
+        : true
+      if (!isEnterKeyPressed(e) || !isCommandKeyPressed) {
+        return
+      }
+
+      e.preventDefault()
+
+      // 检查 2: 是否需要先 commit 当前输入值(如 TextInput 的 dirty 检查)
+      if (callCommitWidgetValue) {
+        commitWidgetValue()
+      }
+
+      // 检查 3: 表单级规则校验(allowFormEnterToSubmit)
+      if (widgetMgr.allowFormEnterToSubmit(formId)) {
+        widgetMgr.submitForm(formId, fragmentId)
+      }
+    },
+    [
+      formId,
+      fragmentId,
+      callCommitWidgetValue,
+      commitWidgetValue,
+      widgetMgr,
+      requireCommandKey,
+    ]
+  )
 }
 ```
+
+> **注意:** `useSubmitFormViaEnterKey` **没有** `widgetProps.disabled` 参数,也不做 widget 自身禁用检查。
+> 如果 widget 被禁用,浏览器会直接阻止 `keydown` 事件触发,事件根本不会到达该 Hook。
 
 #### 判断二:allowFormEnterToSubmit(表单级规则)
 
@@ -504,12 +530,14 @@ public allowFormEnterToSubmit(formId: string): boolean {
 }
 ```
 
-> **判断优先级(从高到低):**
-> 1. 当前输入 widget 自身 `disabled=true` → 拦截
-> 2. 表单显式 `enter_to_submit=False` → 拦截  
-> 3. 表单无任何 submit button → 拦截
-> 4. 第一个 submit button `disabled=true` → 拦截
+> **判断优先级(从高到低,均为 JS 代码层实际判断):**
+> 1. Enter 键未按下 或 Cmd/Ctrl 不满足 `requireCommandKey` → 拦截(Hook 入口)
+> 2. 表单显式 `enter_to_submit=False` → 拦截(allowFormEnterToSubmit 层级 2)
+> 3. 表单无任何 submit button → 拦截(allowFormEnterToSubmit 层级 3)
+> 4. 第一个 submit button `disabled=true` → 拦截(allowFormEnterToSubmit 层级 4)
 > 5. 全部通过 → 允许回车提交
+>
+> **补充说明:** 输入 widget 自身 `disabled` 不在任何 JS 代码中判断。浏览器原生禁用的元素不会派发 `keydown` 事件,Hook 根本不会被调用。
 
 ---
 
@@ -691,7 +719,7 @@ const isDisabled = disabled || hasInProgressUpload
 
 ### 4.4 Enter 键提交校验
 
-`allowFormEnterToSubmit` 检查是否允许回车提交:
+`allowFormEnterToSubmit` 检查是否允许回车提交(仅判断表单级规则,不判断输入 widget 自身是否 disabled——后者由浏览器 DOM 层保证):
 
 ```typescript
 // WidgetStateManager.ts 第932行
@@ -1003,31 +1031,31 @@ def _widget_changed(self, widget_id: str) -> bool:
 
 ### 8.2 回车提交的实际依赖条件
 
-回车提交的判断**完全在前端完成**,后端不参与任何校验。整个判断链路涉及 3 层检查,全部通过才会真正提交。
+回车提交的判断**完全在前端完成**,后端不参与任何校验。判断链路分为两部分:**浏览器 DOM 层前置拦截**(不在 JS 代码中)和 **JS 代码层检查**(在 Hook 及 WidgetStateManager 中)。
 
-#### 8.2.1 完整判断链路
+#### 8.2.1 完整判断链路(代码层)
 
 ```
 用户按下 Enter 键
       │
       ▼
-useSubmitFormViaEnterKey Hook
+useSubmitFormViaEnterKey Hook (JS 层)
       │
-      ├─ 检查 1: isEnterKeyPressed(e) ?          ← 是否真的是 Enter
+      ├─ 检查 1: isEnterKeyPressed(e) ?      ← 是否真的是 Enter 键
       ├─ 检查 2: requireCommandKey ?
       │          └─ 若需要,检查 metaKey || ctrlKey
+      │     └─ 否 → return,终止
       │
-      ├─ 检查 3: widgetProps.disabled ?          ← 当前输入 widget 自身禁用
-      │     └─ 是 → 终止,不提交
+      ├─ e.preventDefault()
       │
-      ├─ 检查 4: callCommitWidgetValue ?         ← 是否需要先 commit 输入值
-      │     └─ 是 → commitWidgetValue()          ← 先把当前输入写入 WidgetStateManager
+      ├─ 检查 3: callCommitWidgetValue ?    ← 是否需要先 commit 输入值
+      │     └─ 是 → commitWidgetValue()      ← 把当前输入写入 WidgetStateManager
       │
-      └─ 检查 5: allowFormEnterToSubmit(formId) ? ← 表单级规则
-            ├─ 层级 1: formId 有效 ?
-            ├─ 层级 2: form.enterToSubmit != false ? ← 用户显式关闭?
-            ├─ 层级 3: 表单有 >=1 个 submit button ?
-            └─ 层级 4: 第一个 submit button.disabled != true ?
+      └─ 检查 4: allowFormEnterToSubmit(formId) ? ← 表单级规则
+            ├─ 层级 a: formId 有效 ?
+            ├─ 层级 b: form.enterToSubmit != false ? ← 用户显式关闭?
+            ├─ 层级 c: 表单有 >=1 个 submit button ?
+            └─ 层级 d: 第一个 submit button.disabled != true ?
                   │
                   └─ 全部通过 → widgetMgr.submitForm(formId, fragmentId)
 ```
@@ -1089,18 +1117,21 @@ public allowFormEnterToSubmit(formId: string): boolean {
 
 #### 8.2.3 实际依赖条件汇总
 
-回车提交必须**同时满足**以下所有条件:
+回车提交必须**同时满足**以下所有代码层条件:
 
-| # | 依赖条件 | 来源 | 失效场景 |
-|---|---------|------|---------|
-| 1 | 按下 Enter 键(keyCode=13 或 key="Enter") | `isEnterKeyPressed()` | 按了其他键 |
-| 2 | 若 `requireCommandKey=true`,还需 Cmd 或 Ctrl 按下 | Hook 参数 | Textarea 等多行控件使用 Cmd+Enter |
-| 3 | 当前输入 widget 自身 `disabled=false` | 调用方传入 | widget 被用户代码禁用 |
-| 4 | 表单 `enter_to_submit != false`(默认 true) | `st.form()` 参数 | 用户显式关闭 |
-| 5 | 表单内至少有一个 `st.form_submit_button` | `formsData.submitButtons` | 表单缺少提交按钮 |
-| 6 | DOM 顺序第一个 submit button 的 `disabled=false` | submit button 的 proto 字段 | 第一个提交按钮被禁用 |
+| # | 依赖条件 | 检查位置 | 失效场景 |
+|---|---------|---------|---------|
+| 1 | 按下 Enter 键(`keyCode=13` 或 `key="Enter")` | Hook 入口 `isEnterKeyPressed(e)` | 按了其他键 |
+| 2 | 若 `requireCommandKey=true`,还需 Cmd 或 Ctrl 按下 | Hook 入口判断 | Textarea 等多行控件只响应 Cmd+Enter |
+| 3 | 表单 `enter_to_submit != false`(默认 `true`) | `allowFormEnterToSubmit` 层级 2 | 用户显式 `st.form(..., enter_to_submit=False)` |
+| 4 | 表单内至少有一个 `st.form_submit_button` | `allowFormEnterToSubmit` 层级 3 | 表单缺少提交按钮 |
+| 5 | **DOM 顺序第一个** submit button 的 `disabled=false` | `allowFormEnterToSubmit` 层级 4 | 第一个提交按钮被禁用 |
+| 6 | (可选)`callCommitWidgetValue=true` 时 commit 成功执行 | Hook 内部调用 | 当前输入值无法写入 WidgetStateManager(极少发生) |
 
-> **特别注意:** 回车提交选择的是 **DOM 顺序第一个** submit button(由 `FormSubmitButton` 组件 `useEffect` 注册顺序决定),不一定是视觉上第一个。
+> **特别注意:**
+> - 输入 widget 自身 `disabled` **不在任何 JS 代码中判断**。浏览器原生禁用的元素不派发 `keydown` 事件,Hook 不会被调用。
+> - 回车提交选择的是 **DOM 顺序第一个** submit button(由 `FormSubmitButton` 组件 `useEffect` 注册顺序决定),不一定是视觉上第一个。
+> - 以上条件中,真正由 `allowFormEnterToSubmit()` 函数内部判断的只有 #3、#4、#5 三条。
 
 ---
 
