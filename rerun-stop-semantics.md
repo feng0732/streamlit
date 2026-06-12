@@ -417,43 +417,64 @@ APP_NOT_RUNNING  ──request_rerun()──►  APP_IS_RUNNING
 ### 8.2 `st.rerun()` 时序
 
 ```
-用户线程（脚本线程）                    AppSession/主线程
-     │                                     │
-     │  st.rerun()                         │
-     │    ├─ request_rerun(data)           │
-     │    │   → state=RERUN, 存 data       │
-     │    └─ st.empty() → _enqueue...      │
-     │         └─ _maybe_handle...         │
-     │            ├─ on_scriptrunner_yield()
-     │            │   → ScriptRequest(RERUN)
-     │            │   → state=CONTINUE
-     │            └─ raise RerunException ─┐│
-     │                                     ││
-     │  exec_func_with_error_handling:    ││
-     │    catch RerunException            ││
-     │    → rerun_exception_data = data   ││
-     │    → premature_stop=False          ││
-     │    → 清理 cursors/dg_stack         ││
-     │                                     ││
-     │  _on_script_finished():            ││
-     │    → premature_stop=False          ││
-     │      执行 widget 清理              ││
-     │    → emit SCRIPT_STOPPED_FOR_RERUN ││
-     │                                     ││
-     │  内层循环：rerun_data = data        ││
-     │  （不 break，继续下一轮）            ││
-     │                                     ││
-     │  ┌──── 重新开始 _run_script ─────┐  │
-     │  │  准备、编译、执行（新数据）      │  │
-     │  └───────────────────────────────┘  │
-     │                                     │
-     │  ...直到没有 RerunException...      │
-     │                                     │
-     │  on_scriptrunner_ready()           ││
-     │    ├─ 有排队 RERUN → 继续外层循环   ││
-     │    └─ 无 → state→STOP, 退出         │
+用户线程（脚本线程）                    AppSession/主线程                          前端
+     │                                     │                                        │
+     │  st.rerun()                         │                                        │
+     │    ├─ request_rerun(data)           │                                        │
+     │    │   → state=RERUN, 存 data       │                                        │
+     │    └─ st.empty() → _enqueue...      │                                        │
+     │         └─ _maybe_handle...         │                                        │
+     │            ├─ on_scriptrunner_yield()                                        │
+     │            │   → ScriptRequest(RERUN)                                         │
+     │            │   → state=CONTINUE                                               │
+     │            └─ raise RerunException ─┐│                                        │
+     │                                     ││                                        │
+     │  exec_func_with_error_handling:    ││                                        │
+     │    catch RerunException            ││                                        │
+     │    → rerun_exception_data = data   ││                                        │
+     │    → premature_stop=False          ││                                        │
+     │    → 清理 cursors/dg_stack         ││                                        │
+     │                                     ││                                        │
+     │  _on_script_finished():            ││                                        │
+     │    → premature_stop=False          ││                                        │
+     │      执行 widget 清理              ││                                        │
+     │    → emit SCRIPT_STOPPED_FOR_RERUN ││                                        │
+     │                                     ││                                        │
+     │  内层循环：rerun_data = data        ││                                        │
+     │  （不 break，继续下一轮）            │↓                                        │
+     │                                     │ _handle_scriptrunner_event_on_event_loop │
+     │                                     │ 处理 SCRIPT_STOPPED_FOR_RERUN：           │
+     │                                     │  ① state = APP_NOT_RUNNING               │
+     │                                     │  ② 发送 FINISHED_EARLY_FOR_RERUN ────────→│
+     │                                     │  ③ 发送 session_status_changed(false) ──→│
+     │                                     │                                        │
+     │  ┌──── 重新开始 _run_script ─────┐  │  ...继续事件处理                         │
+     │  │  SCRIPT_STARTED 事件发出──────┼─→│  处理 SCRIPT_STARTED：                  │
+     │  │  准备、编译、执行（新数据）     │  │  ① state = APP_IS_RUNNING               │
+     │  └───────────────────────────────┘  │  ② 发送 NEW_SESSION ───────────────────→│
+     │                                     │  ③ 发送 session_status_changed(true) ──→│
+     │                                     │                                        │
+     │                                     │ ↓                                      │
+     │                                     │ 前端处理消息：                          │
+     │                                     │  ① FINISHED_EARLY_FOR_RERUN：          │
+     │                                     │    - scriptFinishedHandlers 触发        │
+     │                                     │    - 不 clearStaleNodes（防闪烁）       │
+     │                                     │  ② session_status(false) → 指示器闪烁   │
+     │                                     │  ③ NEW_SESSION：                       │
+     │                                     │    - hasReceivedNewSession = true      │
+     │                                     │    - clearTransientNodes               │
+     │                                     │    - 更新 scriptRunId                  │
+     │                                     │  ④ session_status(true) → 指示器恢复    │
+     │                                     │                                        │
+     │  ...直到没有 RerunException...      │                                        │
+     │                                     │                                        │
+     │  on_scriptrunner_ready()           │                                        │
+     │    ├─ 有排队 RERUN → 继续外层循环   │                                        │
+     │    └─ 无 → state→STOP, 退出         │                                        │
      ▼
 ```
+
+> **修正说明**：补充了 AppSession 主线程处理事件时的真实状态变化，以及前端接收到的完整消息序列（FINISHED_EARLY_FOR_RERUN → session_status(false) → NEW_SESSION → session_status(true)）。
 
 ---
 
@@ -484,7 +505,7 @@ APP_NOT_RUNNING  ──request_rerun()──►  APP_IS_RUNNING
 
 4. **`premature_stop` 的反直觉**：Rerun 明明"中断"了脚本，却 `premature_stop=False`，会执行 cleanup。这是因为从 widget 生命周期看，rerun 是新一轮的开始，旧元素可以清理；而 stop 是真的停了，要保留当前页面元素。
 
-5. **双层循环 + 双状态机**：外层 ScriptRequests 三态 × 内层 AppSession 三态 × 双层循环的组合，让"停止"概念有多种层次（ScriptRequests.STOP、内层 break、外层退出、ScriptRunner.SHUTDOWN、AppSession.NOT_RUNNING），与"重跑"的多类触发（用户 st.rerun、前端交互、fastReruns 新建 runner、fragment auto）交织在一起。
+5. **双层循环 + 双状态机交织**：AppSession 三态（外层会话管理）× ScriptRunner 双层循环 × ScriptRequests 三态（内层执行控制）的组合，让"停止"概念有多种层次（ScriptRequests.STOP、内层 break、外层退出、ScriptRunner.SHUTDOWN、AppSession.NOT_RUNNING），与"重跑"的多类触发（用户 st.rerun、前端交互、fastReruns 新建 runner、fragment auto、文件变化内部触发）交织在一起。
 
 ---
 
@@ -597,13 +618,20 @@ if sender is not self._scriptrunner:
     └─ T7: ScriptRunner A 的线程静默退出，无人知晓
 ```
 
-**被忽略的 SHUTDOWN 事件会导致两个严重问题**（[app_session.py#L427-L441](file:///d:/fz/0601/solo-dogfeeding/code/230-streamlit/lib/streamlit/runtime/app_session.py#L427-L441)）：
+**被忽略的 SHUTDOWN 事件会导致 3 项未执行的状态更新和清理操作**（[app_session.py#L740-L753](file:///d:/fz/0601/solo-dogfeeding/code/230-streamlit/lib/streamlit/runtime/app_session.py#L740-L753)），但实际影响取决于后续场景：
 
-1. **`_client_state` 未保存**：SHUTDOWN 事件本应更新 `self._client_state` 为 A 最终的 ClientState（[app_session.py#L746-L753](file:///d:/fz/0601/solo-dogfeeding/code/230-streamlit/lib/streamlit/runtime/app_session.py#L746-L753)）。这意味着下次重跑时，可能丢失 context_info（如浏览器时区）等信息。
+1. **`_client_state` 未保存**：SHUTDOWN 事件本应更新 `self._client_state` 为 A 最终的 ClientState（只保存 `query_string`、`page_script_hash`、`context_info` 三项，**不包含 widget_states**）。
+   - ❌ **不影响用户交互**：用户每次点击/操作都会携带新的 client_state，不从这里读
+   - ✅ **影响文件变化等内部触发的重跑**：`_on_source_file_changed()` 直接使用 `self._client_state` 构造 RerunData
+   - ✅ **缓解机制**：每次 SCRIPT_STARTED 都会更新 `page_script_hash`，request_rerun 入口会合并 `context_info`，所以大部分字段会被持续修正
 
-2. **`_scriptrunner` 引用不一致**：SHUTDOWN 事件本应将 `self._scriptrunner = None`（[app_session.py#L753](file:///d:/fz/0601/solo-dogfeeding/code/230-streamlit/lib/streamlit/runtime/app_session.py#L753)），但由于事件被忽略，虽然 `_scriptrunner` 已被设为 B，但 A 的清理逻辑未执行。更严重的是，如果 B 之后也完成了，它的 SHUTDOWN 会把引用置 None，系统状态变得混乱。
+2. **`_scriptrunner` 引用未被 SHUTDOWN 显式置 None**：SHUTDOWN 事件本应将 `self._scriptrunner = None`，但由于事件被忽略，引用其实已经在创建 B 时被更新为 B 了。
+   - ❌ **实际无害**：新的赋值在 request_rerun 中完成，不存在"引用不一致"
+   - ❌ **B 之后的 SHUTDOWN 不会造成混乱**：只要 B.sender 与 `self._scriptrunner` 相同，B 的 SHUTDOWN 会被正常处理，将引用置 None
 
-3. **full-app-run 清理不执行**：SHUTDOWN 事件关联的 media file 清理、session cache 清理等（[app_session.py#L749-L750](file:///d:/fz/0601/solo-dogfeeding/code/230-streamlit/lib/streamlit/runtime/app_session.py#L749-L750)）也不会执行。
+3. **media file 和 session cache 清理不执行**：只有当 `AppSession._state == SHUTDOWN_REQUESTED` 时，SHUTDOWN 才会触发 `clear_session_refs()` 和 `clear_session_caches()`。
+   - ❌ **正常运行时（非关闭会话）不会出现**：`SHUTDOWN_REQUESTED` 只会在会话关闭时设置，用户正常交互期间 state 是 `APP_IS_RUNNING` / `APP_NOT_RUNNING`
+   - ✅ **仅在关闭会话的瞬间 race 才会出现**：极罕见
 
 ---
 
@@ -970,3 +998,283 @@ T3: 主线程处理事件
 
 结果：页面上残留旧元素，可能出现重叠或"关不上"的现象（issue #9921）。
 ```
+
+---
+
+## 十三、旧结论重新梳理与全文口径统一
+
+### 13.1 修正一：fragment 重跑遇 STOP 态 runner 的实际执行流程
+
+**之前的模糊点**：新建 ScriptRunner 时初始状态是什么？会不会经过 STOP→RERUN 的转换？初始数据从哪里来？
+
+#### 13.1.1 新 runner 的初始化细节（[script_runner.py#L249-L250](file:///d:/fz/0601/solo-dogfeeding/code/230-streamlit/lib/streamlit/runtime/scriptrunner/script_runner.py#L249-L250)）
+
+新的 ScriptRunner 在构造函数中不经过 STOP 态：
+```python
+self._requests = ScriptRequests()         # 创建新的、空的 ScriptRequests
+self._requests.request_rerun(initial_rerun_data)  # 直接存为 RERUN 态
+```
+
+- 初始状态：`_state = RERUN`（不是 CONTINUE 再转换，而是一开始就是 RERUN）
+- 初始数据：来自 `request_rerun(client_state)` 中由**前端请求携带的** `client_state` 构造的 `RerunData`
+- **注意**：初始数据**不依赖** `self._client_state`（会话保存的旧值），而是每次请求都会带新的
+
+#### 13.1.2 完整的实际执行流程
+
+```
+T1: 旧 runner A 完成 full-app 脚本
+    ├─ ScriptRequests.state = STOP（on_scriptrunner_ready 转换）
+    ├─ _on_script_finished() → 发送 SCRIPT_STOPPED_WITH_SUCCESS 事件
+    │                           call_soon_threadsafe → 进入主线程队列
+    ├─ _run_script_thread 外层循环退出
+    ├─ 构造 ClientState（query_string / page_script_hash / context_info）
+    └─ 发送 SHUTDOWN 事件
+       call_soon_threadsafe → 进入主线程队列
+
+T2: 前端发来 fragment rerun BackMsg（在 T1 的事件被处理之前）
+    ↓
+    AppSession.request_rerun(client_state=前端传过来的 ClientState)
+    ├─ 预检查：fragment_id 存在？→ 是（假设刚跑完的 full-app 重新注册过 fragment）
+    ├─ 合并 context_info → self._client_state.context_info 更新
+    ├─ 构造 RerunData（从前端 client_state 提取：query_string / widget_states / page_script_hash / fragment_id / cached_message_hashes / context_info）
+    ├─ self._scriptrunner 仍是 A？→ 是
+    ├─ fastReruns 分支？→ 否（是 fragment rerun）
+    ├─ A.request_rerun(rerun_data) → 返回 False（A.state 已是 STOP）
+    │
+    └─ _create_scriptrunner(rerun_data)  ◄── 关键分支
+        ├─ 新建 ScriptRunner B
+        ├─ B._requests = ScriptRequests()  ◄── 新实例
+        ├─ B._requests.request_rerun(rerun_data)  ◄── 初始就是 RERUN 态
+        ├─ B.on_event.connect(...)  ◄── 连接新事件处理器
+        ├─ B.start() → 启动脚本线程 B
+        └─ self._scriptrunner = B  ◄── 引用更新
+
+T3: B 线程入口 _run_script_thread()
+    ├─ 创建新的 ScriptRunContext（与 A 无关）
+    ├─ request = B._requests.on_scriptrunner_ready()
+    │   → request.type = RERUN，携带初始 rerun_data
+    ├─ 进入外层 while 循环，调用 _run_script(rerun_data)
+    │
+    ├─ _run_script 内部：
+    │   ├─ fragment_id_queue 非空？→ 是
+    │   ├─ fragment_ids_this_run = [fragment_id]  ◄── 标记为 fragment 模式
+    │   ├─ ctx.reset(...) ← 注入 fragment_ids_this_run
+    │   └─ 发送 SCRIPT_STARTED（B.sender）
+    │       ↓ call_soon_threadsafe
+    │       进入主线程队列（排在 A 的 SCRIPT_STOPPED 和 SHUTDOWN 之后）
+    │
+    └─ ...编译、执行 fragment...
+
+T4: 主线程依次处理排队事件
+    ├─ 处理 A 的 SCRIPT_STOPPED_WITH_SUCCESS
+    │   ├─ sender = A
+    │   ├─ self._scriptrunner = B
+    │   ├─ sender is not B → 忽略！
+    │   │   ├─ 不设 state = NOT_RUNNING（但影响不大，新的会设为 RUNNING）
+    │   │   ├─ 不发送 FINISHED_SUCCESSFULLY
+    │   │   │   ├─ 不触发 scriptFinishedHandlers
+    │   │   │   ├─ 不执行 elements.clearStaleNodes()  ◄── 关键！
+    │   │   │   ├─ 不执行 removeInactiveWidgetState
+    │   │   │   └─ 不 incrementMessageCacheRunCount
+    │   │   └─ 不 update_watched_modules/pages
+    │   └─ 不发 session_status_changed（状态不匹配不发）
+    │
+    ├─ 处理 A 的 SHUTDOWN
+    │   ├─ sender = A
+    │   ├─ sender is not B → 忽略！
+    │   │   ├─ 不保存 client_state（query_string / page_script_hash / context_info）
+    │   │   └─ 不设 _scriptrunner = None（已指向 B，无害）
+    │   └─ 如果是 SHUTDOWN_REQUESTED：
+    │       不清 media_file_mgr 和 session_caches
+    │
+    └─ 处理 B 的 SCRIPT_STARTED
+        ├─ sender = B → 正常处理
+        ├─ state → APP_IS_RUNNING
+        ├─ 更新 page_script_hash 到 self._client_state
+        ├─ _clear_queue(fragment_ids_this_run=[xxx])：
+        │   └─ 保留生命周期消息 + 非 fragment delta
+        ├─ 发送 NEW_SESSION（带 fragment_ids_this_run = [xxx]）
+        │
+        └─ 前端收到 NEW_SESSION：
+            ├─ fragmentIdsThisRun.length > 0？→ 是
+            ├─ fragment 模式分支：
+            │   ├─ 不执行 clearAppState（不清空全量元素）
+            │   ├─ 不更新 config / theme / pages
+            │   └─ 只 setState：fragmentIdsThisRun、latestRunTime
+            ├─ appHash 和 pageScriptHash 没变？→ 是
+            │   ├─ elements.clearTransientNodes(fragmentIdsThisRun)
+            │   │   └─ 只清 transient（临时）节点，**不清 stale 节点**
+            │   └─ 更新 scriptRunId
+            └─ hasReceivedNewSession = true
+
+T5: B 的 fragment 执行完成
+    ├─ rerun_exception_data = None（正常完成）
+    ├─ fragment_id_queue 非空 → FRAGMENT_STOPPED_WITH_SUCCESS
+    ├─ _on_script_finished(premature_stop=False)
+    │   └─ fragment_storage.clear_stale_descendants(fragment_ids_this_run)
+    └─ 内层循环 break
+
+T6: B.on_scriptrunner_ready()
+    ├─ _state = CONTINUE → 转为 STOP（没有排队的 RERUN）
+    ├─ 外层循环退出
+    ├─ 构造 client_state，发送 SHUTDOWN
+    └─ sender=B → 正常处理
+
+最终效果：
+  ✅ fragment 新元素被渲染
+  ✅ fragment 范围内的 transient 节点被清理
+  ❌ full-app 的 stale 节点没有被清理（A 的 SCRIPT_STOPPED_WITH_SUCCESS 被忽略）
+  ❌ inactive widget 状态没被清理
+  ⚠️  旧的 full-app 元素可能与新元素重叠显示
+```
+
+#### 13.1.3 关键澄清
+
+| 之前可能误解 | 实际情况 |
+|-------------|---------|
+| 新建的 runner 初始态是 CONTINUE，然后转 RERUN | **初始态就是 RERUN**（构造函数里直接 request_rerun），不经过 CONTINUE |
+| 初始 RerunData 来自 self._client_state | **来自前端请求携带的 client_state**，与旧的 SHUTDOWN 保存无关 |
+| 新 runner 的 SCRIPT_STARTED 会清空前端所有元素 | **fragment 模式不清空**，只清 transient nodes；只有 page/app hash 变了才清空 |
+| fragment 重跑一定会创建新 runner | **不一定**，只有当旧 runner 是 STOP 态时才新建；如果旧 runner 还在运行，则是复用（通过内层循环 rerun） |
+
+---
+
+### 13.2 修正二：SCRIPT_STOPPED_FOR_RERUN 状态与前端消息的完整关联
+
+**之前的模糊点**：FINISHED_EARLY_FOR_RERUN 是发给前端的，那它和 SCRIPT_STARTED 的 NEW_SESSION 有什么关系？前端如何处理这两者的组合？
+
+#### 13.2.1 完整链路
+
+```
+同一 ScriptRunner 内部的 st.rerun() 触发场景：
+
+T1: 内层 _run_script 中抛 RerunException
+    ├─ exec_func_with_error_handling 捕获
+    ├─ rerun_exception_data = e.rerun_data
+    └─ premature_stop = False
+
+T2: _on_script_finished()
+    ├─ premature_stop=False → 执行 on_script_finished()（清理 widget）
+    └─ finished_event = SCRIPT_STOPPED_FOR_RERUN
+
+T3: 事件发送（sender=当前 runner）
+    SCRIPT_STOPPED_FOR_RERUN → call_soon_threadsafe → 进入主线程队列
+
+T4: 内层循环：rerun_data = rerun_exception_data → 继续下一轮 _run_script
+
+T5: 新一轮 _run_script 开头
+    发送 SCRIPT_STARTED → call_soon_threadsafe → 进入主线程队列（排在 SCRIPT_STOPPED_FOR_RERUN 之后）
+
+T6: 主线程先处理 SCRIPT_STOPPED_FOR_RERUN
+    ├─ self._state = APP_NOT_RUNNING  ◄── 暂时变为 NOT_RUNNING
+    ├─ 发送 FINISHED_EARLY_FOR_RERUN 给前端
+    └─ 发送 session_status_changed（script_is_running = false）
+       （如果 prev 是 RUNNING，就会发）
+
+T7: 紧接着处理 SCRIPT_STARTED
+    ├─ self._state = APP_IS_RUNNING  ◄── 变回 RUNNING
+    ├─ 更新 page_script_hash
+    ├─ 发送 NEW_SESSION 给前端
+    └─ 发送 session_status_changed（script_is_running = true）
+       （如果 prev 是 NOT_RUNNING，就会发）
+
+T8: 前端按顺序收到消息
+    ① SCRIPT_FINISHED(EARLY_FOR_RERUN)：
+      ├─ scriptFinishedHandlers 全部触发
+      ├─ 不 clearStaleNodes（设计如此，防闪烁）
+      └─ 不 incrementMessageCacheRunCount（等 NEW_SESSION 之后）
+
+    ② SESSION_STATUS_CHANGED(running=false)：
+      └─ 指示器显示"停止"（极短时间）
+
+    ③ NEW_SESSION：
+      ├─ hasReceivedNewSession = true  ◄── 关键标志位
+      ├─ fragment 模式 / full 模式处理
+      └─ 重置 scriptRunId、clearTransientNodes
+
+    ④ SESSION_STATUS_CHANGED(running=true)：
+      └─ 指示器显示"运行中"
+
+最终前端感知：
+  ✅ scriptFinishedHandlers 触发
+  ✅ 状态指示器短暂闪烁（RUNNING → NOT_RUNNING → RUNNING）
+  ✅ stale 元素**不会**被立即清除（留到 FINISHED_SUCCESSFULLY 再清）
+  ✅ message cache**不会**立即过期（有 hasReceivedNewSession 守护）
+```
+
+#### 13.2.2 关键澄清
+
+| 之前可能误解 | 实际情况 |
+|-------------|---------|
+| SCRIPT_STOPPED_FOR_RERUN 之后立刻处理下一轮，前端收不到状态变化 | **会收到**，状态变化是 RUNNING→NOT_RUNNING→RUNNING，有两次 session_status_changed 消息 |
+| FINISHED_EARLY_FOR_RERUN 和普通 FINISHED 处理一样 | **不一样**：前者不 clearStaleNodes、不递增 message cache run count（见 [App.tsx#L1607-L1633](file:///d:/fz/0601/solo-dogfeeding/code/230-streamlit/frontend/app/src/App.tsx#L1607-L1633) 和 [L1635-L1656](file:///d:/fz/0601/solo-dogfeeding/code/230-streamlit/frontend/app/src/App.tsx#L1635-L1656)） |
+| FINISHED_EARLY_FOR_RERUN 之后就不会有 session_status_changed | **会有两次**：STOPPED 发一次（running=false），新 STARTED 再发一次（running=true） |
+| hasReceivedNewSession 是防止收到旧 runner 的 FINISHED | **是的**，见 [App.tsx#L1643-L1650](file:///d:/fz/0601/solo-dogfeeding/code/230-streamlit/frontend/app/src/App.tsx#L1643-L1650)：只有收到 NEW_SESSION 后设置为 true，才允许递增 cache；否则忽略来自旧 run 的 FINISHED 消息 |
+| 只有 fastReruns 才会出现 FINISHED_EARLY_FOR_RERUN | **不对**，任何 st.rerun()（包括 fragment.scope="fragment"）在同一 ScriptRunner 内都会触发 SCRIPT_STOPPED_FOR_RERUN → FINISHED_EARLY_FOR_RERUN |
+
+---
+
+### 13.3 修正三：SHUTDOWN 被忽略后的实际影响分级
+
+**之前的模糊点**：SHUTDOWN 保存 client_state，但是哪些场景会真正用到 self._client_state？每次前端请求都带新的 client_state 啊？
+
+#### 13.3.1 `self._client_state` 的全部使用场景（[app_session.py#L174-L752](file:///d:/fz/0601/solo-dogfeeding/code/230-streamlit/lib/streamlit/runtime/app_session.py#L174-L752)）
+
+| 位置 | 场景 | 读取/写入 | 后果（如果 SHUTDOWN 被忽略 → _client_state 是旧值） |
+|------|------|-----------|---------------------------------------------------|
+| L174 | AppSession 初始化 | 写入空 ClientState | 无影响 |
+| L451 | request_rerun 入口 | 合并 context_info（写入） | 无影响（写操作，不是读） |
+| **L533** | **文件变化判断** `_should_rerun_on_file_change` | **读 page_script_hash** | **影响**：改变的是当前页面之外的文件时，本应不触发重跑，可能误触发 |
+| **L548** | **文件变化触发重跑** `_on_source_file_changed` | **读全部字段**作为 RerunData 传给 request_rerun() | **严重影响**：重跑使用旧的 query_string、page_script_hash、context_info |
+| L677-L678 | SCRIPT_STARTED 事件处理 | 写入 page_script_hash | 无影响（写操作，与 SHUTDOWN 保存来源不同） |
+| L752 | SHUTDOWN 事件处理 | 写入全部字段 | 被忽略，不执行 |
+
+#### 13.3.2 其他场景的 client_state 来源
+
+| 场景 | client_state 来源 | 是否依赖 SHUTDOWN 保存 |
+|------|-------------------|----------------------|
+| 前端 BackMsg（用户交互、widget 变化、R 键、Run 按钮） | 前端每次都携带完整的 client_state | ❌ **不依赖** |
+| WebSocket 重连后首次重跑 | 前端初始化时携带 | ❌ 不依赖 |
+| **文件变化触发重跑**（on_source_file_changed） | **self._client_state** | ✅ **完全依赖** |
+| **手动调用** `AppSession.request_rerun(None)` | self._client_state（函数内默认值） | ✅ 完全依赖 |
+| 定时器 / run_on_save | 通过 on_source_file_changed 间接调用 | ✅ 依赖 |
+
+#### 13.3.3 实际影响分级
+
+| 影响项 | 是否出现 | 触发条件 | 严重程度 |
+|--------|---------|---------|---------|
+| page_script_hash 不准确 | 是 | SHUTDOWN 被忽略之后、下一次文件变化之前，**没有** SCRIPT_STARTED 更新过它 | 中 |
+| context_info（时区、语言、UA）过时 | 是 | 同上，且脚本中 query / context_info 有变化 | 低（通常重连后会更新） |
+| query_string 过时 | 是 | 同上 | 中（文件变化重跑会用旧的 query） |
+| widget_states 丢失 | **否** | SHUTDOWN 不保存 widget_states（[script_runner.py#L428-L432](file:///d:/fz/0601/solo-dogfeeding/code/230-streamlit/lib/streamlit/runtime/scriptrunner/script_runner.py#L428-L432) 只保存 query/page_hash/context_info） | - |
+| media_file_mgr 不清 | 极罕见 | 需要 AppSession 处于 SHUTDOWN_REQUESTED 状态 | 低（只有关闭会话时出现） |
+| session_caches 不清 | 极罕见 | 同上 | 低 |
+
+#### 13.3.4 关键澄清
+
+| 之前可能误解 | 实际情况 |
+|-------------|---------|
+| SHUTDOWN 会保存 widget_states | **不会**，SHUTDOWN 保存的 ClientState 只有 query_string、page_script_hash、context_info 三项（[script_runner.py#L428-L432](file:///d:/fz/0601/solo-dogfeeding/code/230-streamlit/lib/streamlit/runtime/scriptrunner/script_runner.py#L428-L432)） |
+| SHUTDOWN 被忽略后用户每次交互都会用旧状态 | **不会**，用户交互通过 BackMsg 携带新的 client_state，不依赖 self._client_state |
+| 只有 SHUTDOWN 会更新 self._client_state | **不对**，SCRIPT_STARTED 也会更新其中的 page_script_hash（[app_session.py#L677-L678](file:///d:/fz/0601/solo-dogfeeding/code/230-streamlit/lib/streamlit/runtime/app_session.py#L677-L678)），request_rerun 入口也会更新 context_info |
+| SHUTDOWN 被忽略是致命的 | **不致命**，只有文件变化等内部触发的重跑会使用旧状态，且新的 SCRIPT_STARTED 会不断修正 page_script_hash |
+| fragment 模式下 SHUTDOWN 保存的数据不完整 | **都一样**，无论是 full 还是 fragment 模式的 SHUTDOWN，保存的都是相同字段 |
+
+---
+
+### 13.4 全文口径统一表
+
+| 概念 | 统一口径 | 典型场景 |
+|------|---------|---------|
+| **主动重跑（st.rerun()）** | 同一 ScriptRunner 内层循环中通过 RerunException 触发的同线程立即重跑 | 用户代码调用 `st.rerun()` 或 `st.switch_page()` |
+| **新建 runner 的重跑** | 旧 runner STOP（自然或被 fastReruns 强制）后，AppSession 创建新 ScriptRunner 的场景 | fastReruns full-app、fragment 遇 STOP 态 runner |
+| **SCRIPT_STOPPED_FOR_RERUN** | 主动重跑的信号，表示"这一轮脚本因 rerun 中断，马上会有下一轮" | 同一 ScriptRunner 内 st.rerun() → 内层循环 continue |
+| **SCRIPT_STOPPED_WITH_SUCCESS** | 正常完成的信号，表示"这一轮脚本跑完了，没有更多内容" | full-app / fragment 自然完成 |
+| **FINISHED_EARLY_FOR_RERUN** | 对应 SCRIPT_STOPPED_FOR_RERUN，前端不做清理（等新的 SCRIPT_STARTED） | st.rerun() 后前端的消息 |
+| **FINISHED_SUCCESSFULLY / FINISHED_FRAGMENT_SUCCESSFULLY** | 对应 SCRIPT_STOPPED_WITH_SUCCESS，前端执行清理（clearStaleNodes） | 一轮脚本完成后前端的消息 |
+| **fastReruns 路径** | full-app rerun 时，主动 STOP 旧 runner 再建新的 | AppSession.request_rerun 中的 fastReruns 分支 |
+| **STOP 态 runner 路径** | 旧 runner 自然完成后（state=STOP），请求无法复用，被迫建新 runner | 尤其是 fragment 重跑时遇到的情况 |
+| **client_state（前端 BackMsg 带的）** | 每次请求都带最新值，不依赖 SHUTDOWN 保存 | 用户交互、widget 点击、Run 按钮 |
+| **self._client_state（会话保存的）** | 主要用于内部触发的重跑（文件变化等），会被 SCRIPT_STARTED 增量更新 | on_source_file_changed 等内部事件 |
+| **sender 检查** | 对象身份比较，过滤来自已不是"当前 runner"的所有事件 | 所有进入 _handle_scriptrunner_event_on_event_loop 的事件 |
+| **有意忽略** / **无意忽略** | fastReruns 的忽略是有意设计（推倒重来），STOP 态 runner 的忽略是副作用 | 12.4 节详述 |
