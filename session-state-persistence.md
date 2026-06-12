@@ -622,6 +622,219 @@ def _parse_subprotocols(headers: Headers) -> tuple[str|None, str|None, str|None]
     return selected, xsrf_token, existing_session
 ```
 
+#### SessionInfo 切换过程的完整时序
+
+前端会话标识的保存和传递，核心在于 `_current` / `_last` 的切换时机，与 `getLastSessionId()` 调用的相对顺序。以下是完整的切换生命周期：
+
+**阶段1：正常运行中**
+```
+_session_info = {
+  _current: { sessionId: "abc-123", isConnected: true, ... },  ← 活跃会话
+  _last: undefined                                              ← 空
+}
+
+getLastSessionId() → undefined  （因为 _last 是空）
+```
+
+**阶段2：连接断开（触发 disconnect）**
+
+[App.tsx#L919-L921](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/frontend/app/src/App.tsx#L919-L921)
+```typescript
+// handleConnectionStateChanged 中，进入非 CONNECTED 状态时
+if (this.sessionInfo.isSet) {
+  this.sessionInfo.disconnect()  // ← 关键调用
+}
+```
+
+[SessionInfo.ts#L80-L88](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/frontend/lib/src/SessionInfo.ts#L80-L88)
+```typescript
+public disconnect(): void {
+  if (this._current) {
+    // setCurrent 会把 _current 拷贝到 _last，_current 设置为新值
+    this.setCurrent({
+      ...this._current,    // 拷贝原 _current 的所有字段
+      isConnected: false,  // 只修改 isConnected 标志
+    })
+  }
+}
+```
+
+disconnect 后状态变为：
+```
+_session_info = {
+  _current: { sessionId: "abc-123", isConnected: false, ... },  ← 原_current，isConnected改为false
+  _last:    { sessionId: "abc-123", isConnected: true, ... }    ← 原_current的完整拷贝
+}
+
+getLastSessionId() → "abc-123"  （从 _last.sessionId 取）
+```
+
+**阶段3：WebSocket 重新建立连接（此时还未收到 NewSession 消息）**
+
+[WebsocketConnection.tsx#L504-L544](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/frontend/connection/src/WebsocketConnection.tsx#L504-L544)
+```typescript
+// 构造 WebSocket 连接前，先取 lastSessionId
+const lastSessionId = this.args.getLastSessionId()  // → "abc-123"
+const sessionTokens = [token, ...(lastSessionId ? [lastSessionId] : [])]
+// → ["streamlit", "token", "abc-123"]
+
+this.websocket = new WebSocket(uri, sessionTokens)
+```
+
+**阶段4：收到 NewSession 消息（handleNewSession 触发）**
+
+[App.tsx#L1365-L1368](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/frontend/app/src/App.tsx#L1365-L1368)
+```typescript
+handleNewSession = (newSessionProto: NewSession): void => {
+  // 判断条件：如果未初始化 或者 当前标记为断开（isConnected=false）
+  if (!this.sessionInfo.isSet || !this.sessionInfo.current.isConnected) {
+    this.handleInitialization(newSessionProto)  // ← 重连时走这里
+  }
+  // ...
+}
+```
+
+[App.tsx#L1452-L1454](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/frontend/app/src/App.tsx#L1452-L1454)
+```typescript
+handleInitialization = (newSessionProto: NewSession): void => {
+  this.sessionInfo.setCurrent(
+    SessionInfo.propsFromNewSessionMessage(newSessionProto)
+  )
+  // propsFromNewSessionMessage 返回的 sessionId 是服务端返回的
+  // - 如果重连恢复成功：同一个 id "abc-123"（恢复的AppSession.id）
+  // - 如果恢复失败创建新会话：新的 uuid
+}
+```
+
+handleNewSession 后状态变为：
+```
+假设重连恢复成功，服务端返回相同 sessionId：
+_session_info = {
+  _current: { sessionId: "abc-123", isConnected: true, ... },   ← 新的会话对象
+  _last:    { sessionId: "abc-123", isConnected: false, ... }   ← 上一个 _current（断开时的）
+}
+
+假设创建新会话，服务端返回新 sessionId：
+_session_info = {
+  _current: { sessionId: "def-456", isConnected: true, ... },   ← 全新会话
+  _last:    { sessionId: "abc-123", isConnected: false, ... }   ← 旧会话
+}
+```
+
+**关键理解**：
+- `_last` 在断开→重连的全程中始终**保留旧 sessionId**
+- `getLastSessionId()` 只在 `connectToWebSocket()` 建立新连接的那一瞬间被调用，此时 `_last` 尚未被 `setCurrent()` 覆盖
+- 如果重连后再次断开，`_last` 会被更新为刚断开的 `_current`，不会累积多层历史
+
+---
+
+#### CONNECTED 状态 vs NewSession 消息的时序
+
+这是最容易混淆的一点：**前端 CONNECTION 状态进入 CONNECTED，与收到 NewSession 消息，哪个先发生？**
+
+[WebsocketConnection.tsx#L562-L567](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/frontend/connection/src/WebsocketConnection.tsx#L562-L567)
+```typescript
+// WebSocket onopen 触发 → 进入 CONNECTED 状态
+this.websocket.addEventListener("open", () => {
+  if (checkWebsocket()) {
+    LOG.info("WebSocket onopen")
+    this.stepFsm("CONNECTION_SUCCEEDED")  // ← 触发 setFsmState(CONNECTED)
+  }
+})
+```
+
+[WebsocketConnection.tsx#L283-L296](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/frontend/connection/src/WebsocketConnection.tsx#L283-L296)
+```typescript
+// setFsmState 中 CONNECTING 后回调：
+switch (this.state) {
+  case ConnectionState.CONNECTING:
+    // 先触发 onConnectionStateChange 回调（通知上层 App.tsx）
+    this.args.onConnectionStateChange(state, errDetails)
+    break
+  // ...
+}
+
+// 后执行 post-callback 动作
+switch (this.state) {
+  case ConnectionState.CONNECTING:
+    // 这里是连接前的动作，不适用
+  // ...
+}
+```
+
+**完整时序图**：
+
+```
+时间轴 →→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→
+
+T0: 浏览器创建新 WebSocket 连接
+    ↓
+    [WebsocketConnection.connectToWebSocket]
+    ↓ sessionId=getLastSessionId()  ← 此时_sessionInfo.last=旧会话
+    ↓ new WebSocket(uri, ["streamlit", token, sessionId])
+
+T1: TCP/TLS 握手成功 → WebSocket.onopen 触发
+    ↓
+    stepFsm("CONNECTION_SUCCEEDED")
+    ↓
+    setFsmState(ConnectionState.CONNECTED)
+    ↓
+    args.onConnectionStateChange(CONNECTED)  ← ★ 回调1
+        ↓
+    App.tsx: handleConnectionStateChanged(CONNECTED)
+        ↓
+    此时 sessionInfo 是什么状态？
+        → 如果是重连恢复路径：sessionInfo._last 是旧会话（abc）
+                            sessionInfo._current 是旧会话（isConnected=false）
+                            sessionInfo.isSet = true
+                            sessionInfo.current.isConnected = false
+        ↓
+    判断条件：
+      !this.sessionInfo.last ||                     // false（有_last）
+      lastRunWasInterrupted ||                      // true/false 取决于中断状态
+      wasRerunRequested ||                          // true/false
+      fragmentIdsThisRun.length > 0 ||              // true/false
+      autoReruns.length > 0                         // true/false
+        ↓
+    如果任一条件为 true → 补发 rerun 消息 ★
+        sendUpdateWidgetsMessage()
+        ↓ 发送 BackMsg.rerunScript
+
+T2: 服务端 connect_session() → connect_session → 从存储恢复 AppSession
+    ↓
+    恢复后，服务端 connect_session 本身不触发脚本运行（看代码返回 return existing_session.id，没有主动 request_rerun）
+
+T3: 服务端收到前端在 T1 补发的 BackMsg.rerun_script
+    ↓
+    AppSession.handle_backmsg("rerun_script")
+    ↓ request_rerun(client_state)
+    ↓ 创建/复用 ScriptRunner → 开始执行脚本
+    ↓
+    ScriptRunner._run_script() → SCRIPT_STARTED 事件
+    ↓ AppSession 处理 SCRIPT_STARTED 事件
+    ↓ _create_new_session_message()
+    ↓ 发送 ForwardMsg.new_session
+
+T4: 前端收到 ForwardMsg.new_session
+    ↓
+    ConnectionManager.handleMessage()
+    ↓ onMessage 回调 → App.handleMessage()
+    ↓ dispatchProto → handleNewSession(newSessionMsg)  ← ★ 回调2
+    ↓
+    if (!sessionInfo.isSet || !sessionInfo.current.isConnected):
+        → true（current.isConnected 还是 false）
+        → handleInitialization()
+        → sessionInfo.setCurrent(新会话 props)
+        → _current.sessionId = 服务端返回的 id
+        → _current.isConnected = true
+```
+
+**核心结论**：
+1. **时序**：`onConnectionStateChange(CONNECTED)` **先于** `handleNewSession()` 发生，中间还插入了前端补发的 rerun 请求和服务端的脚本执行
+2. **补发 rerun 时 sessionInfo 还未切换**：此时 `sessionInfo.current.isConnected` 仍是 `false`，`sessionInfo.last` 仍保存旧会话
+3. **widgetMgr 状态来源**：补发的 rerun 使用 `createWidgetStatesMsg()` 取**前端 widgetMgr 内存中**保存的所有 widget 值（这些值在整个断开-重连过程中都保留在前端）
+4. **双重状态校验**：前端补发的 widgetStates + 服务端 SessionState 合并，最终由 `on_script_will_rerun()` 统一处理
+
 **完整数据流**：
 
 ```
@@ -765,7 +978,7 @@ ScriptRunner._run_script_loop()
 
 ### 4B.6 连接点深度剖析：源码热更新时复用上一份 ClientState
 
-当用户修改了 Python 源码并开启了 `runOnSave` 时，Streamlit 会自动触发重跑。关键在于重跑时复用了上一份 `_client_state`，其中包含上一次的所有 widget 值。
+当用户修改了 Python 源码并开启了 `runOnSave` 时，Streamlit 会自动触发重跑。关键在于**区分页面缓存（URL、页面哈希、上下文）与交互状态（widget 值）**的不同复用路径。
 
 #### 热更新触发入口
 
@@ -787,105 +1000,145 @@ def _on_source_file_changed(self, filepath: str | None = None) -> None:
         self._enqueue_forward_msg(self._create_file_change_message())
 ```
 
-#### _client_state 是什么
+#### _client_state 字段构成与更新来源详解
 
-[app_session.py#L174](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/runtime/app_session.py#L174)
+**问题核心**：`_client_state` 中到底保存了哪些字段？是否会错误复用浏览器先前上报的所有控件值？
 
-```python
-# 在 AppSession.__init__ 中初始化
-self._client_state = ClientState()  # 空 ClientState
-```
+##### _client_state 的更新有且仅有两个路径：
 
-`_client_state` 是一个 Protobuf 对象，包含以下关键字段：
+**路径 A：SHUTDOWN 事件（ScriptRunner 线程退出时）—— 主要来源**
 
-```
-ClientState {
-  widget_states: WidgetStates    ← 前端所有 widget 的当前值
-  query_string: string           ← 当前 URL 查询参数
-  page_script_hash: string       ← 当前页面脚本哈希
-  page_name: string              ← 当前页面名称
-  fragment_id: string            ← fragment ID（如有）
-  is_auto_rerun: bool            ← 是否自动 rerun
-  cached_message_hashes: ...     ← 消息缓存哈希
-  context_info: ContextInfo      ← 时区、语言等
-}
-```
-
-#### _client_state 的更新时机
-
-`_client_state` 在两个地方被更新：
-
-1. **前端发送 rerun 请求时**，`request_rerun(client_state)` 更新 `_client_state` 的部分字段：
-
-[app_session.py#L450-L451](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/runtime/app_session.py#L450-L451)
+[script_runner.py#L426-L435](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/runtime/scriptrunner/script_runner.py#L426-L435)
 
 ```python
-if client_state.HasField("context_info"):
-    self._client_state.context_info.CopyFrom(client_state.context_info)
+# ScriptRunner._run_script_thread() 退出前
+client_state = ClientState()                # ★ 创建空的 ClientState！
+client_state.query_string = ctx.query_string      # 仅填 query_string
+client_state.page_script_hash = ctx.page_script_hash  # 仅填 page_script_hash
+if ctx.context_info:
+    client_state.context_info.CopyFrom(ctx.context_info)  # 仅填 context_info
+# ★ 注意：widget_states 字段完全没有设置！始终为空！
+self.on_event.send(
+    self, event=ScriptRunnerEvent.SHUTDOWN, client_state=client_state
+)
 ```
 
-2. **ScriptRunner SHUTDOWN 事件时**，完整替换 `_client_state`：
+**关键**：SHUTDOWN 事件中创建的 `client_state` **刻意不包含** `widget_states` 字段。只有三个字段被设置：
+
+| 字段 | 来源 | 说明 |
+|------|------|------|
+| `query_string` | `ctx.query_string`（ScriptRunContext） | 最近一次脚本运行使用的 URL 查询参数 |
+| `page_script_hash` | `ctx.page_script_hash` | 最近一次脚本运行的页面哈希 |
+| `context_info` | `ctx.context_info` | 时区、语言、URL 等上下文信息 |
+| `widget_states` | **未设置** | **始终不传！widget 状态由服务端 SessionState 保存** |
+| 其他字段 | **未设置** | `page_name`、`fragment_id`、`cached_message_hashes` 等均为空 |
 
 [app_session.py#L752](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/runtime/app_session.py#L752)
 
 ```python
 elif event == ScriptRunnerEvent.SHUTDOWN:
     # ...
-    self._client_state = client_state  # ★ 完整替换为最新的 client_state
+    self._client_state = client_state  # 完整替换为 SHUTDOWN 传来的 client_state
 ```
 
-#### 热更新路径与普通重跑的对比
+**路径 B：前端请求 rerun 时（request_rerun 入口）—— 只更新 context_info**
 
-| 维度 | 普通重跑 | 源码热更新 |
-|------|---------|-----------|
-| **触发** | 前端 `BackMsg.rerun_script` | 服务端 `_on_source_file_changed` |
-| **ClientState 来源** | 前端实时构造（含最新 widget 值） | 服务端缓存的 `self._client_state` |
-| **Widget 状态** | 前端当前所有 widget 值（经过用户交互） | **上一次前端发来的** widget 值 |
-| **request_rerun 入参** | `client_state`（来自前端） | `self._client_state`（来自缓存） |
-| **后续路径** | `on_script_will_rerun()` | 同左 |
-| **_compact_state 行为** | 相同 | 相同 |
+[app_session.py#L450-L451](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/runtime/app_session.py#L450-L451)
 
-#### 热更新时的完整数据流
+```python
+if client_state:
+    # 仅当前端传来了 context_info 时，增量更新 _client_state.context_info
+    if client_state.HasField("context_info"):
+        self._client_state.context_info.CopyFrom(client_state.context_info)
+    # ★ 其他字段（widget_states、query_string 等）只用于本次 rerun，
+    #    不会被写入 self._client_state！
+```
+
+##### Widget 状态的正确服务端来源
+
+用户交互状态的权威来源**不是** `_client_state.widget_states`，而是 **`SessionState` 本身**：
 
 ```
-源码文件变化
-    ↓ LocalSourcesWatcher 检测到变化
-    ↓ _on_source_file_changed(filepath)
-    ↓ _script_cache.clear()
-    ↓ _should_rerun_on_file_change(filepath) → True
-    ↓ self._run_on_save → True
+用户交互（拖动滑块等）
+    ↓ 前端 BackMsg.rerun_script { widget_states: {...} }
+    ↓ ScriptRunner._run_script_loop()
+    ↓ on_script_will_rerun(latest_widget_states)
+    ↓   set_widgets_from_proto(latest_widget_states)
+    ↓       _new_widget_state[widget_id] = Serialized(protobuf)
     ↓
-request_rerun(self._client_state)  ★ 复用缓存的 ClientState
+脚本执行中，用户代码访问 st.session_state
+    ↓ SessionState.__getitem__
+    ↓   _new_widget_state → WStates.__getitem__
+    ↓     懒加载反序列化 Protobuf → Python 对象
     ↓
-    ├─ 分支A: 复用现有 ScriptRunner
-    │   request_rerun(rerun_data)
-    │   ↓ rerun_data = RerunData(
-    │       widget_states=self._client_state.widget_states,  ← 缓存的 widget 值
-    │       query_string=self._client_state.query_string,    ← 缓存的 URL 参数
-    │       page_script_hash=self._client_state.page_script_hash,
-    │       ...
-    │   )
-    │
-    └─ 分支B: 新建 ScriptRunner
-        _create_scriptrunner(initial_rerun_data=rerun_data)
-        ↓ 同样使用缓存的 widget_states
+本次脚本运行完成 → 下次 on_script_will_rerun()
+    ↓ _compact_state()
+    ↓   遍历 self.keys() → self[key] → self._old_state[key] = value
+    ↓     _old_state: {widget_id: python_value, ...}  ← 持久化！
+```
 
+**热更新时 Widget 状态的恢复路径**：
+
+```
+_on_source_file_changed() → request_rerun(self._client_state)
+    ↓
+request_rerun() 构造 RerunData:
+    query_string      = client_state.query_string       ← SHUTDOWN 时保存的 URL 参数
+    widget_states     = client_state.widget_states      ← 空！（SHUTDOWN 时没填）
+    page_script_hash  = client_state.page_script_hash   ← SHUTDOWN 时保存的页面
+    context_info      = client_state.context_info       ← SHUTDOWN 时保存的上下文
     ↓
 ScriptRunner._run_script_loop()
     ↓
-on_script_will_rerun(rerun_data.widget_states)  ← 用缓存的 widget 值恢复状态
-    ├─ _compact_state()       合并旧状态
-    ├─ set_widgets_from_proto() 加载缓存的 widget 值
-    └─ _call_callbacks()      执行值变化回调
+on_script_will_rerun(rerun_data.widget_states)  ← 参数是空 WidgetStates！
+    ├─ _compact_state()
+    │   └─ 遍历 _old_state（包含上一次压缩的所有 widget 值）
+    │       → _old_state[slider_1] = 8  ✅ 正确值
+    │       → _old_state[counter] = 4   ✅ 正确值
+    │   清空 _new_session_state 和 _new_widget_state
+    │
+    ├─ set_widgets_from_proto(latest_widget_states)  ← 空！所以啥都不做
+    │   （latest_widget_states 是热更新传入的，为空集合）
+    │
+    └─ _call_callbacks()  ← 没有 widget 值变化，无回调
     ↓
-用户脚本执行（使用上一次的 widget 状态 + 新代码）
+用户脚本执行 → register_widget(slider_1, ...)
+    ↓ widget_id in _old_state? → YES，值为 8
+    ↓ 脚本使用值 8 继续执行 ✅ 状态正确保留
 ```
 
-**关键理解**：
-- 热更新复用的 `_client_state` 是**上一次前端发来的 widget 状态快照**
-- 如果用户在两次前端交互之间修改了源码，热更新会使用**最近一次前端发送的** widget 值，而非实时值
-- 这意味着用户修改源码后自动 rerun 时，所有 widget 保持上次的值，用户不会丢失交互状态
-- 如果未开启 `runOnSave`，前端仅收到一个 `script_changed_on_disk` 通知，由用户决定是否手动 rerun
+**结论**：热更新不会错误地"复用浏览器先前上报的所有控件值"，因为：
+
+1. **Widget 状态不从 `_client_state.widget_states` 取**（该字段在 SHUTDOWN 时被刻意留空）
+2. **Widget 状态从 `SessionState._old_state` 取**（服务端内存中的持久化层）
+3. **热更新触发的 rerun 传入空的 `widget_states`**，不会覆盖或污染服务端状态
+4. **`_client_state` 只复用 URL 参数、页面哈希和上下文信息**——这些是纯"导航/环境"类数据，不是用户交互状态
+
+##### query_string（页面缓存）与交互状态的边界
+
+| 数据类型 | 保存位置 | 热更新复用方式 | 说明 |
+|---------|---------|--------------|------|
+| **Widget 值**（交互状态） | `SessionState._old_state` | 服务端内存对象 | 不通过 `_client_state`，始终存在 |
+| **URL 查询参数** | `_client_state.query_string` | SHUTDOWN → 热更新 → `request_rerun` | 作为页面"缓存"复用 |
+| **页面哈希** | `_client_state.page_script_hash` | SHUTDOWN → 热更新 → `request_rerun` | 保证 MPA 下停留在正确页面 |
+| **上下文信息** | `_client_state.context_info` | SHUTDOWN 保存 + 前端请求时增量更新 | 时区、语言、URL 等 |
+| **消息缓存哈希** | 不保存 | 每次前端请求时重新构造 | 不用缓存 |
+| **fragment_id** | 不保存 | 每次前端请求时指定 | 不用缓存 |
+
+##### 特殊情况：SCRIPT_STARTED 时的 page_script_hash 更新
+
+还有一个边缘更新路径：
+
+[app_session.py#L673-L678](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/runtime/app_session.py#L673-L678)
+
+```python
+if event == ScriptRunnerEvent.SCRIPT_STARTED:
+    # ...
+    if page_script_hash != self._client_state.page_script_hash:
+        self._client_state.page_script_hash = page_script_hash
+```
+
+这是为了处理一种边界情况：脚本在运行中通过 `st.navigation()` 切换了页面但没有正常 SHUTDOWN（例如调用了 `st.rerun()`）。此时 `page_script_hash` 会被及时更新，确保热更新时不会回到错误的页面。
 
 ---
 
