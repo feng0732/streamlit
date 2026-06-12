@@ -263,17 +263,40 @@ handleDeltaMsg = (deltaMsg, metadataMsg, elementHash) => {
 
 ### 5.3 AppRoot.applyDelta()
 
-[AppRoot.applyDelta](file:///d:/fz/0601/solo-dogfeeding/code/226-streamlit/frontend/lib/src/render-tree/AppRoot.tsx#L238-L301) 是渲染树更新的核心：
+[AppRoot.applyDelta](file:///d:/fz/0601/solo-dogfeeding/code/226-streamlit/frontend/lib/src/render-tree/AppRoot.ts#L238-L301) 是渲染树更新的核心，根据 `delta.type` 分三类处理：
 
-根据 `delta.type` 分三类处理：
+- **`newElement`**：先通过 `GetNodeByDeltaPathVisitor` 查找现有节点。如果 `elementHash` 匹配且元素类型相同且无 `oneShotEffect` 标志，则复用现有 Element 的 proto 对象（避免重复创建 element 实例）。然后创建新的 `ElementNode`，通过 `SetNodeByDeltaPathVisitor` **设置**到 `delta_path` 指定位置。
+- **`addBlock`**：先查找现有节点，若被 `TransientNode` 包裹则取其 anchor。如果现有节点是 `BlockNode` 且 `deltaBlock.type` 与新 Block 类型相同，则**继承旧 BlockNode 的 children 数组**（直接引用，不复制）。然后创建新的 `BlockNode`，通过 `SetNodeByDeltaPathVisitor` 设置到 `delta_path` 指定位置。
+- **`newTransient`**：创建 `TransientNode`（用于 spinner 等临时元素），通过 visitor 设置到指定位置。
 
-- **`newElement`**：创建 `ElementNode` 并通过 `SetNodeByDeltaPathVisitor` 插入/替换到 `delta_path` 指定位置。如果已有同 hash 同类型的节点，可复用 payload 避免重复传输。
-- **`addBlock`**：创建 `BlockNode`，如果同一位置已有同类型 Block，**继承其子节点**（保持 React 状态和 Widget 状态）。
-- **`newTransient`**：创建 `TransientNode`（用于 spinner 等临时元素）。
+**节点不可变性与更新路径**：
+- 所有节点实例本身是不可变的（immutable）。
+- `SetNodeByDeltaPathVisitor` 沿 delta_path 向下遍历时，每经过一个 BlockNode 都会创建该 BlockNode 的**新实例**（新引用），同时拷贝 children 数组。
+- 未被修改的兄弟节点保持原引用，只有目标路径上的节点被替换。
+- 这样 React 可以通过浅比较（`===`）快速判断哪些子树需要重新渲染。
 
-所有节点都是 **不可变的**（immutable），任何变更都产生新节点实例，沿路径向上递归创建新祖先节点，React 通过浅比较确定需要重新渲染的部分。
+### 5.4 SetNodeByDeltaPathVisitor — 节点设置的精确行为
 
-### 5.4 渲染树节点类型
+[SetNodeByDeltaPathVisitor](file:///d:/fz/0601/solo-dogfeeding/code/226-streamlit/frontend/lib/src/render-tree/visitors/SetNodeByDeltaPathVisitor.ts) 实现了 immutable 树的"设置"操作：
+
+**BlockNode 处理逻辑**（`visitBlockNode` L85-L168）：
+1. 若 `deltaPath.length === 0`：直接返回 `nodeToSet`（用新节点替换整个 BlockNode）。
+2. 取出 `currentIndex` 和 `remainingPath`，验证索引范围（允许 `currentIndex === children.length` 即末尾追加）。
+3. 若 `children[currentIndex]` 不存在（如追加到末尾）且 `remainingPath` 为空：直接插入新节点。
+4. 若子节点存在：递归调用子节点的 `accept(childVisitor)`，得到新的子节点。
+5. **特殊情况**：如果原节点不是 `TransientNode` 但结果是 `TransientNode` 且 anchor 不匹配原节点，则**插入**新 TransientNode 到原节点之前，而非替换。
+6. 最后返回新的 BlockNode 实例，携带更新后的 children 数组。
+
+**ElementNode 处理逻辑**（`visitElementNode` L42-L59）：
+1. 若 `deltaPath.length > 0`：抛出错误（ElementNode 是叶子，不能有子路径）。
+2. 否则：返回 `nodeToSet`（直接替换）。
+
+**TransientNode 处理逻辑**（`visitTransientNode` L61-L83）：
+1. TransientNode 在 delta_path 层级中是**透明**的——它不消耗路径索引。
+2. 若 `deltaPath.length === 0`：调用 `nodeToSet.replaceTransientNodeWithSelf(node)` 协商替换。
+3. 否则：递归访问 anchor 节点，然后用新 anchor 创建新的 TransientNode。
+
+### 5.5 渲染树节点类型
 
 ```
 AppRoot
@@ -286,6 +309,51 @@ AppRoot
 
 - [BlockNode](file:///d:/fz/0601/solo-dogfeeding/code/226-streamlit/frontend/lib/src/render-tree/BlockNode.ts)：容器节点，持有 `children: AppNode[]` 和 `deltaBlock: BlockProto`
 - [ElementNode](file:///d:/fz/0601/solo-dogfeeding/code/226-streamlit/frontend/lib/src/render-tree/ElementNode.ts)：叶子节点，持有 `element: Element` 和 `metadata: ForwardMsgMetadata`
+- [TransientNode](file:///d:/fz/0601/solo-dogfeeding/code/226-streamlit/frontend/lib/src/render-tree/TransientNode.ts)：瞬态包装节点，持有 `anchor: AppNode`（底层持久节点）和 `transientNodes: ElementNode[]`（瞬态元素列表）
+
+### 5.6 状态保持机制详解
+
+Streamlit 前端存在多层状态，各有独立的保持机制，不能混为一谈：
+
+**1. Widget 值状态（Widget State）**
+
+由 [WidgetStateManager](file:///d:/fz/0601/solo-dogfeeding/code/226-streamlit/frontend/lib/src/WidgetStateManager.ts) 独立管理，通过 `widgetId → WidgetState` 的 Map 存储。
+
+- **保持方式**：完全独立于渲染树。只要 widget ID 不变，即使元素节点被替换、组件被卸载重挂，widget 值仍然保留。
+- **清理时机**：脚本运行结束后，`removeInactive(activeIds)` 会清理掉不在当前活跃元素集合中的 widget 状态。
+- **与子节点继承的关系**：**无关**。即使 Block 类型变化导致子节点全部清空，只要后续同一 widget ID 再次出现，仍能从 WidgetStateManager 中读回值。
+
+**2. React 组件内部状态**
+
+组件通过 `useState`、`useReducer`、`useRef` 等持有内部状态。
+
+- **保持条件**：React key 相同 + 组件类型相同 → React 复用组件实例 → 内部状态保留。
+- **丢失场景**：key 变化 或 组件类型变化 → React 卸载旧组件、挂载新组件 → 内部状态丢失。
+- **与子节点继承的关系**：子节点继承直接引用旧的子节点对象 → React 渲染时 key 和类型都不变 → 组件实例被复用 → 内部状态保持。如果没有子节点继承，虽然 key 可能仍然相同（取决于 key 的计算方式），但子节点是新对象，React 仍会更新组件但不会卸载重挂（只要 key 相同）。
+
+**3. DOM 状态**
+
+浏览器 DOM 自带的状态，如输入框焦点、滚动位置、文本选中区域、视频播放进度等。
+
+- **保持条件**：DOM 元素不被销毁。
+- **与子节点继承的关系**：子节点继承 → 子节点引用相同 → React 不卸载组件 → DOM 元素保留 → DOM 状态保持。
+
+**4. 前端元素状态（Element State）**
+
+WidgetStateManager 中还提供了 `elementStates: Map<string, Map<string, unknown>>`，用于存储前端-only 的元素状态（不会发送到服务端）。
+
+- **用途**：存储需要跨组件重挂载恢复的纯前端状态。
+- **生命周期**：与 widget 状态类似，通过元素 ID 索引，`removeInactive` 时一并清理。
+
+**子节点继承的真正作用**：
+
+`addBlock` 时继承子节点，主要是为了**避免因父 Block 重建导致子组件不必要的卸载和重挂**。对于 rerun 场景，chat_message 容器本身会被重新创建（因为重新执行 `st.chat_message()` 会发一个新的 `addBlock` delta），如果没有子节点继承，容器内的所有子元素都会变成新节点对象，可能导致：
+
+- 子组件的 React key 若基于索引计算，可能因顺序变化导致状态错位
+- 瞬态动画、滚动位置等 DOM 状态丢失
+- 不必要的重渲染性能开销
+
+子节点继承通过直接引用旧 children，确保这些子树的组件实例和 DOM 都不被破坏。
 
 ---
 
@@ -439,12 +507,21 @@ empty 占位符的 LockedCursor (root=MAIN, parent_path=(N,), index=0)
 
 1. **Block vs Element 的二分法**：ChatMessage 是 Block（容器），不是 Element（叶子）。这使得它可以通过 `children` 承载任意内容，包括 markdown、chart、dataframe 等。
 
-2. **Immutable 渲染树 + 浅比较**：每个 delta 导致从修改点到根路径的全新节点链，React 通过引用比较只重渲染变化的部分，实现高效增量更新。
+2. **Immutable 渲染树 + 路径复制**：每个 delta 导致从修改点到根路径上的所有 BlockNode 被重新创建（新实例），但未被修改的兄弟节点保持原引用。React 通过引用比较快速跳过未变化的子树，实现高效增量更新。
 
-3. **LockedCursor 实现原地替换**：`st.empty()` 返回的 DeltaGenerator 绑定 LockedCursor，后续所有写入都在同一 delta_path 发送 new_element，前端 `SetNodeByDeltaPathVisitor` 直接替换该位置的节点。
+3. **LockedCursor 实现原地替换**：`st.empty()` 返回的 DeltaGenerator 绑定 LockedCursor，后续所有写入都在同一 delta_path 发送 new_element。前端 `SetNodeByDeltaPathVisitor` 在该位置直接替换 ElementNode，实现"原地更新"的效果。
 
-4. **Block 继承子节点**：`addBlock` 时如果同位置已有同类型 Block，新 BlockNode 会继承旧 BlockNode 的 children。这保证了 rerun 时 chat message 内的元素状态（如 widget 值）不会丢失。
+4. **addBlock 子节点继承机制**：`addBlock` 时，如果同位置已有同类型 Block（`existingNode.deltaBlock.type === block.type`），新 BlockNode 会**直接引用**旧 BlockNode 的 children 数组。这保持了：
+   - **React 组件实例状态**：子组件的 `useState`、`useRef` 等内部状态不会因为父 Block 重建而丢失
+   - **DOM 状态**：焦点、滚动位置、输入框光标位置等
+   - **避免不必要的重渲染**：子节点引用相同，React 可以跳过子树的重渲染
 
-5. **流式打字机效果的实现**：不是逐字追加 DOM 节点，而是在同一位置反复替换整个 markdown element，由前端 Markdown 组件自行 diff 渲染。`unterminated_parsing=True` 处理流式中未闭合的 Markdown 语法。
+   > **注意**：Widget 值（用户输入的数值、文本等）由 [WidgetStateManager](file:///d:/fz/0601/solo-dogfeeding/code/226-streamlit/frontend/lib/src/WidgetStateManager.ts) 独立管理，通过 widget ID 查找，**与渲染树节点继承无关**。即使 Block 类型变化导致子节点被清空，只要 widget ID 不变，WidgetStateManager 中仍然保留该 widget 的值。子节点继承主要保护的是 React 组件的内部状态和 DOM 状态。
 
-6. **消息有序保证**：前端 `WebsocketConnection` 通过 `messageQueue` + 递增 `lastDispatchedMessageIndex` 保证按序派发，即使解码完成顺序与到达顺序不同。
+5. **元素 payload 复用（去重）**：当 `newElement` delta 到达时，若 `elementHash` 与现有节点匹配、元素类型相同、且无 `hasOneShotEffect` 标志，则复用现有 Element 的 proto 对象，避免重复解码和传输。但**仍会创建新的 ElementNode 实例**，因为 metadata、scriptRunId 等可能不同。
+
+6. **流式打字机效果的实现**：不是逐字追加 DOM 节点，而是在同一 delta_path 位置反复用新的 markdown ElementNode 替换旧节点。每次替换都是一个完整的 ForwardMsg，前端 Markdown 组件收到新 props 后重新渲染。`unterminated_parsing=True` 处理流式中未闭合的 Markdown 语法，避免渲染抖动。
+
+7. **消息有序保证**：前端 `WebsocketConnection` 通过 `messageQueue` + 递增 `lastDispatchedMessageIndex` 保证按序派发，即使解码完成顺序与到达顺序不同。
+
+8. **TransientNode 的透明穿透**：TransientNode（如 spinner 进度条）在 delta_path 层级中是透明的——它不消耗路径索引。当向一个被 TransientNode 包裹的位置添加子元素时，visitor 会穿透到 anchor 节点进行操作，然后重新包裹 TransientNode。
