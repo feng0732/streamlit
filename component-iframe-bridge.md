@@ -467,56 +467,43 @@ postMessage 是浏览器原生的跨文档通信 API，任何窗口都可以向�
 
 ### 6.2 四层校验与职责分工
 
-[ComponentRegistry.ts#L109-L142](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/lib/src/components/widgets/CustomComponent/ComponentRegistry.ts#L109-L142) 中的 `onMessageEvent` 实现了四层递进的校验机制。这四层不是简单的重复，每一层承担明确的职责：
+[ComponentRegistry.ts#L109-L142](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/lib/src/components/widgets/CustomComponent/ComponentRegistry.ts#L109-L142) 中的 `onMessageEvent` 实现了四层递进的校验机制。以下结论**完全基于源码和现有测试用例的可验证事实**，不含推测。
 
 ```
 收到 window.message 事件
        │
        │  ┌───────────────────────────────────────────────┐
-       │  │ 第一层: 数据有效性 + 协议存在性判断             │
-       │  │ ① event.data 不能是 null/undefined            │
-       │  │ ② event.data 必须拥有 isStreamlitMessage 属性 │
-       │  │    (使用 Object.hasOwn，只检查属性是否存在，     │
-       │  │     不检查属性值)                               │
-       │  │ 作用: O(1) 快速过滤掉 99%+ 的非 Streamlit 消息 │
-       │  │ 性质: 纯噪声过滤，无安全性                       │
+       │  │ 第一层: event.data 非空 + isStreamlitMessage  │
+       │  │          自身属性存在性判断                    │
        │  └───────────────────────────────────────────────┘
        ▼
   通过第一层
        │
        │  ┌───────────────────────────────────────────────┐
-       │  │ 第二层: 消息来源存在性判断                      │
-       │  │ event.source 不能是 null/undefined             │
-       │  │ 作用: 防御性编程，避免后续 Map.get 异常          │
-       │  │ 性质: 边界检查                                  │
+       │  │ 第二层: event.source 非空判断                 │
+       │  │ 日志: "Received component message with no     │
+       │  │        eventSource!"                          │
        │  └───────────────────────────────────────────────┘
        ▼
   通过第二层
        │
        │  ┌───────────────────────────────────────────────┐
-       │  │ 第三层: 消息来源精确匹配 ← 真正的安全边界       │
-       │  │ 用 event.source (MessageEventSource)           │
-       │  │ 精确查找 msgListeners Map                      │
-       │  │ 只有 ComponentInstance 自己创建的 iframe       │
-       │  │ contentWindow 引用才能匹配                      │
-       │  │ 作用: 防止消息伪造和跨实例串扰                   │
-       │  │ 性质: 安全隔离 (不可伪造的浏览器引用匹配)        │
+       │  │ 第三层: event.source 在 msgListeners Map 中   │
+       │  │          精确匹配且 listener 为 function       │
+       │  │ 日志: "Received component message for         │
+       │  │        unregistered ComponentInstance!"       │
        │  └───────────────────────────────────────────────┘
        ▼
   通过第三层
        │
        │  ┌───────────────────────────────────────────────┐
-       │  │ 第四层: 消息类型有效性校验                      │
-       │  │ event.data.type 必须存在                       │
-       │  │ 后续 handler 中 switch 还会进一步校验已知类型    │
-       │  │ 作用: 防御性编程，避免异常和无效消息              │
-       │  │ 性质: 协议校验                                  │
+       │  │ 第四层: event.data.type 存在性判断             │
        │  └───────────────────────────────────────────────┘
        ▼
-  消息被转发到对应 ComponentInstance 的 handler
+  调用对应 ComponentInstance 的 handler
 ```
 
-#### 第一层：数据有效性 + 协议存在性判断（噪声过滤）
+#### 第一层：`event.data` 非空 + `isStreamlitMessage` 自身属性存在性判断
 
 ```typescript
 if (
@@ -530,42 +517,25 @@ if (
 
 [ComponentRegistry.ts#L110-L116](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/lib/src/components/widgets/CustomComponent/ComponentRegistry.ts#L110-L116)
 
-**实际判断逻辑修正**：之前的文档将这一层描述为"检查 `isStreamlitMessage === true`"，但代码实际判断的是：
+**可直接验证的事实：**
 
-| 判断条件 | 含义 |
-|---------|------|
-| `isNullOrUndefined(event.data)` | event.data 为 null 或 undefined 时直接忽略 |
-| `!Object.hasOwn(event.data, "isStreamlitMessage")` | event.data **自身不拥有** `isStreamlitMessage` 属性时直接忽略 |
+| 可验证内容 | 证据来源 |
+|-----------|---------|
+| 判断条件：`event.data` 不能为 null/undefined | 代码第 111 行 |
+| 判断条件：`event.data` 必须**自身拥有** `isStreamlitMessage` 属性（使用 `Object.hasOwn` 而非 `in` 操作符） | 代码第 112 行 |
+| **不检查** `isStreamlitMessage` 的值（值为 true/false/0/字符串均可通过） | `Object.hasOwn` 语义本身只检查存在性 |
+| 满足条件则**静默返回**，不记录任何日志 | 代码第 115 行 |
+| 无 `isStreamlitMessage` 自身属性的消息被忽略 | 测试 [ComponentRegistry.test.ts#L171-L185](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/lib/src/components/widgets/CustomComponent/ComponentRegistry.test.ts#L171-L185) |
+| `isStreamlitMessage` 仅在原型链上的消息被忽略 | 测试 [ComponentRegistry.test.ts#L187-L200](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/lib/src/components/widgets/CustomComponent/ComponentRegistry.test.ts#L187-L200) |
+| iframe 端 SDK 发送消息时确实设置了 `isStreamlitMessage: true` | [streamlit.ts#L237-L244](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/component-lib/src/streamlit.ts#L237-L244) |
 
-`Object.hasOwn(obj, prop)` 检查的是**属性是否存在于对象自身**（而非原型链上），但**完全不检查属性的值**。这意味着：
+**无法确认的内容（源码和测试未提供证据）：**
+- ❌ "过滤掉 99%+ 的无关消息" — 无性能数据或统计支持
+- ❌ "广告脚本、分析工具、iframe resizer"等具体噪声来源 — 源码未枚举
+- ❌ "O(1) 操作提升性能" — 无性能对比测试
+- ❌ "纯噪声过滤，不承担任何安全责任" — 这是合理推论，但不是代码事实
 
-- `{ isStreamlitMessage: true }` → ✅ 通过（合法的组件 SDK 发送的消息）
-- `{ isStreamlitMessage: false }` → ✅ 通过（值为 false 但属性存在）
-- `{ isStreamlitMessage: 0 }` → ✅ 通过（值为 0 但属性存在）
-- `{ isStreamlitMessage: "anything" }` → ✅ 通过（任何值都可以，只要属性存在）
-- `{}` → ❌ 不通过（没有该属性）
-- Object.create({ isStreamlitMessage: true }) → ❌ 不通过（属性在原型链上，不是自身属性）
-
-iframe 端 SDK 实际发送时确实设置了 `isStreamlitMessage: true`：
-
-[streamlit.ts#L237-L244](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/component-lib/src/streamlit.ts#L237-L244)
-
-```typescript
-window.parent.postMessage(
-  {
-    isStreamlitMessage: true,
-    type: type,
-    ...data,
-  },
-  "*"
-)
-```
-
-**这一层的职责是纯噪声过滤，不承担任何安全责任**。现代网页上通常存在大量的 postMessage 通信（广告脚本、分析工具、iframe resizer、第三方 SDK 等），如果没有这一层，每一条无关消息都要经过后续的 Map 查找和类型判断。`Object.hasOwn` 是 O(1) 操作，可以快速排除绝大多数无关消息，避免不必要的计算。
-
-**为什么不检查值为 true？** 因为这一层的目标是"存在性过滤"而不是"正确性验证"。即使检查了 `=== true`，由于消息内容可以被任意构造，攻击者只需把值设为 true 就能绕过，所以这一层的加强对安全性毫无帮助。真正的安全保障在第三层。
-
-#### 第二层：`event.source` 判空（拦截"匿名"组件消息）
+#### 第二层：`event.source` 非空判断
 
 ```typescript
 if (isNullOrUndefined(event.source)) {
@@ -576,21 +546,25 @@ if (isNullOrUndefined(event.source)) {
 
 [ComponentRegistry.ts#L118-L122](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/lib/src/components/widgets/CustomComponent/ComponentRegistry.ts#L118-L122)
 
-**实际拦截的内容**：拦截那些通过了第一层 `isStreamlitMessage` 检查，但消息来源是匿名的（`event.source` 为 `null` 或 `undefined`）。代码注释写得很清楚："This should not be possible." 这一层不是为了"防止后续调用异常"而加的防御性代码，而是**拦截一种特定的可疑场景**——一条格式看起来像 Streamlit 组件消息，却无法确定发送者身份的消息。
+**可直接验证的事实：**
 
-| 场景 | 描述 | 是否被第二层拦截 |
-|------|------|----------------|
-| 正常组件消息 | iframe 发送的消息，`event.source` 指向 iframe.contentWindow | ❌ 不拦截，通过 |
-| 被销毁窗口的消息 | 消息来自刚刚被销毁的 iframe，浏览器会将 `event.source` 设为 null | ✅ 拦截，记录警告 |
-| 跨源脚本伪造消息 | 某些情况下，跨源脚本发送的消息可能导致 `event.source` 异常 | ✅ 拦截，记录警告 |
-| 测试/调试场景 | 测试代码中手动构造 `MessageEvent` 且不设置 source | ✅ 拦截，记录警告 |
+| 可验证内容 | 证据来源 |
+|-----------|---------|
+| 判断条件：`event.source` 为 `null` 或 `undefined` 时拦截 | 代码第 540 行 + `isNullOrUndefined` 定义 [index.ts#L31-L35](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/utils/src/types/index.ts#L31-L35) |
+| 触发时记录警告日志：`"Received component message with no eventSource!"` | 代码第 542 行 |
+| `event.source` 为 `null` 的消息触发此警告 | 测试 [ComponentRegistry.test.ts#L202-L215](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/lib/src/components/widgets/CustomComponent/ComponentRegistry.test.ts#L202-L215) |
+| 代码注释：`"This should not be possible."` | 代码第 540 行 |
+| 与第三层日志不同（第三层日志为 `"unregistered ComponentInstance"`） | 代码第 542 行 vs 第 567 行 |
+| 即使去除此判断，后续 `this.msgListeners.get(undefined)` 也不会抛异常（JS Map 支持 get(undefined)） | JS 语言规范 |
 
-**为什么这一层不应该被简化为"防止 Map.get(undefined)"？** 因为：
-1. `Map.prototype.get(undefined)` 在 JavaScript 中是**完全合法**的操作，只会返回 `undefined`，不会抛出异常
-2. 即使去掉这层判空，后续 `this.msgListeners.get(event.source)` 会得到 `undefined`，然后第三层也会拦截
-3. 这层真正的作用是**区分"来源为空"和"来源存在但未注册"两种不同的异常场景**，分别记录不同的警告日志，便于排查问题
+**无法确认的内容（源码和测试未提供证据）：**
+- ❌ "被销毁窗口的消息" — 无测试用例模拟此场景，无代码注释说明
+- ❌ "跨源脚本伪造消息导致 event.source 异常" — 无测试用例，无代码注释
+- ❌ "防止后续 Map.get 异常" — 与 JS 语言事实不符，且代码注释未提及
+- ❌ "拦截可疑场景" — 代码未说明何为"可疑"，仅说"This should not be possible"
+- ❌ "区分异常场景便于排查" — 这是合理推论，但不是代码事实
 
-#### 第三层：`event.source` 精确匹配（真正的安全边界 + 组件实例路由 + 未注册来源拦截）
+#### 第三层：`event.source` 精确匹配 + listener 类型校验
 
 ```typescript
 const listener = this.msgListeners.get(event.source)
@@ -605,57 +579,55 @@ if (isNullOrUndefined(listener) || typeof listener !== "function") {
 
 [ComponentRegistry.ts#L125-L132](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/lib/src/components/widgets/CustomComponent/ComponentRegistry.ts#L125-L132)
 
-**这才是整个信任体系的核心**——它同时承担了三个职责：
+**可直接验证的事实：**
 
-1. **安全隔离（防伪造）**：`event.source` 是浏览器在 `MessageEvent` 对象上**自动设置**的 `MessageEventSource` 引用，指向消息的真实发送窗口。JavaScript 代码**无法伪造或修改**这个引用。即使攻击者知道了 Streamlit 的消息格式并构造了一个完美的 `{ isStreamlitMessage: true, type: "streamlit:setComponentValue", value: "恶意值" }` 消息，浏览器的 `event.source` 仍然会指向攻击者自己的 window 对象。
+| 可验证内容 | 证据来源 |
+|-----------|---------|
+| 判断条件 1：`msgListeners.get(event.source)` 返回 undefined | 代码第 591 行 |
+| 判断条件 2：返回值不是 function 类型 | 代码第 591 行 |
+| 触发时记录警告日志：`"Received component message for unregistered ComponentInstance!"` | 代码第 593 行 |
+| `msgListeners` Map 的 key 是 `MessageEventSource`，value 是 `ComponentMessageListener` | 代码第 37-40 行 |
+| listener 在 ComponentInstance 挂载时通过 `registerListener` 注册，key 为 iframe.contentWindow | [ComponentInstance.tsx#L382-L385](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/lib/src/components/widgets/CustomComponent/ComponentInstance.tsx#L382-L385) |
+| listener 在 ComponentInstance 卸载时通过 `deregisterListener` 移除 | [ComponentInstance.tsx#L388-L394](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/lib/src/components/widgets/CustomComponent/ComponentInstance.tsx#L388-L394) |
+| 已注册 source 的消息会路由到对应 listener，不同 source 不会串扰 | 测试 [ComponentRegistry.test.ts#L38-L98](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/lib/src/components/widgets/CustomComponent/ComponentRegistry.test.ts#L38-L98) |
+| 已注销 source 的消息触发此警告 | 测试 [ComponentRegistry.test.ts#L71-L77](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/lib/src/components/widgets/CustomComponent/ComponentRegistry.test.ts#L71-L77)（隐式验证：listener 未被调用） |
+| source 已注册但 listener 不是 function 时触发此警告 | 测试 [ComponentRegistry.test.ts#L234-L253](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/lib/src/components/widgets/CustomComponent/ComponentRegistry.test.ts#L234-L253) |
 
-2. **未注册来源拦截**：拦截那些"来源存在但未注册"的消息。典型场景包括：
-   - 第三方脚本伪装成 Streamlit 组件消息 → `event.source` 指向第三方脚本的 window → Map 中找不到 → 被第三层拦截
-   - 已被销毁但 source 还不为 null 的 iframe 消息 → Map 中对应 entry 已被 cleanup 移除 → 被第三层拦截
-   - 某个 iframe 发送的消息，但还没来得及注册 listener（竞态条件）→ 被第三层拦截
+**无法确认的内容（源码和测试未提供证据）：**
+- ❌ "第三方脚本伪装成 Streamlit 组件消息" — 无测试用例模拟
+- ❌ "已被销毁但 source 还不为 null 的 iframe 消息" — 无测试用例模拟
+- ❌ "竞态条件：消息发送在 listener 注册之前" — 无测试用例，无代码注释
+- ❌ "防止伪造消息注入" — 这是合理推论，但源码未明确说明此设计意图
 
-3. **组件实例路由（防串扰）**：`msgListeners` Map 的 key 是 `MessageEventSource`（即 iframe 的 `contentWindow` 对象引用）。每个 `ComponentInstance` 在挂载时会用自己创建的 iframe 的 `contentWindow` 来注册 listener：
-
-   [ComponentInstance.tsx#L382-L385](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/lib/src/components/widgets/CustomComponent/ComponentInstance.tsx#L382-L385)
-
-   ```typescript
-   registry.registerListener(
-     contentWindow,      // <-- iframe 自己的 contentWindow 引用
-     createIframeMessageHandler(onBackMsgRef)
-   )
-   ```
-
-   因此：
-   - 组件 iframe A 发送的消息 → `event.source` 精确匹配到 A 的 handler → 路由到 A
-   - 组件 iframe B 发送的消息 → `event.source` 精确匹配到 B 的 handler → 路由到 B
-   - **A 的消息永远不会被路由到 B，反之亦然**
-
-#### 第二层与第三层拦截边界的梳理
-
-两条判断一前一后，构成了**从"匿名来源"到"已注册来源"的完整过滤链**：
+#### 第二层与第三层的拦截边界（可验证的事实）
 
 ```
 通过第一层检查的消息
-(isStreamlitMessage 属性存在)
+(event.data 非空，且拥有 isStreamlitMessage 自身属性)
        │
-       ├─ event.source 为 null/undefined
+       ├─ event.source === null 或 undefined
        │    → 第二层拦截
-       │    → 警告: "Received component message with no eventSource!"
-       │    → 场景: 被销毁窗口的消息、异常来源的消息
+       │    → 日志: "Received component message with no eventSource!"
+       │    → 已验证触发条件: source 显式设为 null
        │
-       ├─ event.source 存在但未在 Map 中注册
+       ├─ event.source 存在，但 msgListeners.get(source) 无结果
        │    → 第三层拦截
-       │    → 警告: "Received component message for unregistered ComponentInstance!"
-       │    → 场景: 伪造消息、已注销组件、未注册来源
+       │    → 日志: "Received component message for unregistered ComponentInstance!"
+       │    → 已验证触发条件: source 未注册、source 已注销、listener 非 function
        │
-       └─ event.source 存在且已注册
+       └─ event.source 存在且已注册，listener 为 function
             → 通过
-            → 进入消息类型校验和 handler 调用
+            → 进入第四层 type 校验
 ```
 
-**日志信息的区别很重要**：这两种异常场景在问题排查时指向完全不同的原因——前者意味着浏览器行为异常或窗口生命周期问题，后者意味着可能存在伪造攻击或组件生命周期管理问题。如果合并成一个判断，就失去了这个重要的诊断信息。
+**两种日志的确切区分（基于代码事实）：**
 
-#### 第四层：消息类型有效性校验（协议校验）
+| 日志 | 触发条件（可验证） | 共同点 | 不同点 |
+|------|-------------------|--------|--------|
+| `no eventSource` | `isNullOrUndefined(event.source) === true` | 都已通过第一层检查 | source 本身不存在，无法进行后续匹配 |
+| `unregistered ComponentInstance` | `event.source` 存在，但 Map 中无对应 listener 或 listener 非 function | 都已通过第一层检查 | source 存在，但未在注册表中或注册信息损坏 |
+
+#### 第四层：`event.data.type` 存在性判断
 
 ```typescript
 const { type } = event.data
@@ -667,83 +639,70 @@ if (isNullOrUndefined(type)) {
 
 [ComponentRegistry.ts#L134-L138](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/lib/src/components/widgets/CustomComponent/ComponentRegistry.ts#L134-L138)
 
-通过前三层的消息被认为是"来自合法 iframe 的合法格式消息"，但还需要检查 `type` 字段是否存在。后续在 `createIframeMessageHandler` 的 `switch` 语句中还有进一步的已知类型校验：
+**可直接验证的事实：**
+- 判断条件：`type` 为 null/undefined 时拦截
+- 触发时记录警告日志：`"Received Streamlit message with no type!"`
+- 消息缺少 type 时触发此警告（测试 [ComponentRegistry.test.ts#L217-L232](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/lib/src/components/widgets/CustomComponent/ComponentRegistry.test.ts#L217-L232)）
+- 通过后调用 `listener(type, event.data)`
+- 后续在 `createIframeMessageHandler` 的 `switch` 语句中还有进一步的已知类型校验（[componentUtils.tsx#L169-L171](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/lib/src/components/widgets/CustomComponent/componentUtils.tsx#L169-L171)）
 
-[componentUtils.tsx#L169-L171](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/lib/src/components/widgets/CustomComponent/componentUtils.tsx#L169-L171)
+### 6.3 各层校验的已确认职责总结
 
-```typescript
-default:
-  LOG.warn(`Unrecognized ComponentBackMsgType: ${type}`)
-```
+下表仅包含**源码和测试用例可直接验证**的内容：
 
-### 6.3 各层校验的设计哲学总结
+| 层级 | 检查内容（可验证） | 拦截的已验证场景 | 行为（可验证） |
+|------|-------------------|-----------------|---------------|
+| 第一层 | `event.data` 非空 + `isStreamlitMessage` 自身属性存在 | ① 无 isStreamlitMessage 自身属性的消息 ② isStreamlitMessage 在原型链上的消息 | 静默 return |
+| 第二层 | `event.source` 非 null 且非 undefined | `source === null` | 记录 "no eventSource" 警告后 return |
+| 第三层 | `event.source` 在注册 Map 中存在，且对应值为 function | ① source 未注册 ② source 已注销 ③ listener 非 function | 记录 "unregistered ComponentInstance" 警告后 return |
+| 第四层 | `event.data.type` 非 null 且非 undefined | 消息缺少 type 字段 | 记录 "no type" 警告后 return |
 
-| 层级 | 检查内容 | 拦截的场景 | 职责性质 | 日志信息 |
-|------|---------|-----------|---------|---------|
-| 第一层 | `event.data` 非空 + `isStreamlitMessage` 属性存在 | 99%+ 的无关 postMessage 噪声（广告脚本、分析工具、iframe resizer 等） | **性能优化 / 噪声过滤** | 无（静默返回） |
-| 第二层 | `event.source` 非空 | 格式正确但来源匿名的消息（被销毁窗口、异常来源） | **异常检测 / 问题诊断** | "Received component message with no eventSource!" |
-| 第三层 | `event.source` 在注册 Map 中精确匹配 | ① 伪造消息 ② 未注册/已注销来源 ③ 多实例路由 | **安全隔离 + 业务路由** | "Received component message for unregistered ComponentInstance!" |
-| 第四层 | `type` 存在且为已知类型 | 畸形/无效消息（缺少 type、未知 type） | **协议规范 / 健壮性** | "Received Streamlit message with no type!" / "Unrecognized ComponentBackMsgType" |
+**设计意图的可推论边界：**
 
-**关键设计洞察**：
-- 安全性完全依赖第三层（`event.source` 精确匹配），因为 `event.source` 由浏览器保证不可伪造，是唯一值得信赖的安全锚点
-- 第二层（`event.source` 判空）**不是**为了防止后续代码异常，而是为了区分"来源为空"和"来源未注册"这两种不同的异常场景，保留诊断信息
-- 第一层（`Object.hasOwn`）完全不提供安全性，只负责快速过滤噪声，提升性能
-- 每一层的拦截都有特定的意义，合并判断会丢失诊断信息或破坏职责边界
+- ✅ **可合理推论**（基于代码结构）：第三层的 `event.source` 精确匹配机制，结合浏览器 `MessageEvent.source` 不可伪造的特性，构成了消息来源的可信边界
+- ❌ **不可作为事实陈述**：任何关于"攻击者意图"、"浏览器具体行为"、"性能优化量化效果"的描述，除非有代码注释或测试用例明确支持
 
 ### 6.4 注册/注销的生命周期管理
 
-消息信任边界的另一面是**注册的生命周期管理**，确保不出现悬挂的监听器：
+**可直接验证的事实：**
 
-```
-ComponentInstance 挂载
-       │
-       ├─ useEffect 注册监听器
-       │    registry.registerListener(contentWindow, handler)
-       │
-       │  ... 组件存活期间 ...
-       │
-       ├─ useEffect cleanup 注销监听器
-       │    registry.deregisterListener(contentWindow)
-       │
-       └─ 组件卸载后，该 iframe 发出的消息不再被处理
-```
+- listener 在 ComponentInstance 挂载时通过 `registerListener` 注册，key 为 iframe.contentWindow（[ComponentInstance.tsx#L382-L385](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/lib/src/components/widgets/CustomComponent/ComponentInstance.tsx#L382-L385)）
+- listener 在 ComponentInstance 卸载时通过 useEffect cleanup 调用 `deregisterListener` 移除（[ComponentInstance.tsx#L388-L394](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/lib/src/components/widgets/CustomComponent/ComponentInstance.tsx#L388-L394)）
+- 注销未注册的 source 会记录警告（测试 [ComponentRegistry.test.ts#L160-L168](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/lib/src/components/widgets/CustomComponent/ComponentRegistry.test.ts#L160-L168)）
+- 重复注册同一个 source 会记录警告（测试 [ComponentRegistry.test.ts#L134-L146](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/lib/src/components/widgets/CustomComponent/ComponentRegistry.test.ts#L134-L146)）
 
-[ComponentInstance.tsx#L373-L395](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/lib/src/components/widgets/CustomComponent/ComponentInstance.tsx#L373-L395)
-
-当 iframe 被销毁（例如组件从页面上移除），其 `contentWindow` 引用变为无效，Map 中对应的条目通过 cleanup 函数被显式移除。即使 cleanup 未执行（极端情况），浏览器也会在 iframe 销毁后使 `event.source` 不再匹配已注册的 source。
+**无法确认的内容：**
+- ❌ "浏览器也会在 iframe 销毁后使 event.source 不再匹配已注册的 source" — 无测试用例，无代码注释
 
 ### 6.5 postMessage 的 targetOrigin 问题
 
-**宿主 → iframe 方向**：`sendRenderMessage` 使用 `iframe.contentWindow.postMessage(data, "*")`
+**可直接验证的事实：**
 
-[componentUtils.tsx#L264-L278](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/lib/src/components/widgets/CustomComponent/componentUtils.tsx#L264-L278)
+- **宿主 → iframe 方向**：`sendRenderMessage` 使用 `iframe.contentWindow.postMessage(data, "*")`（[componentUtils.tsx#L264-L278](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/lib/src/components/widgets/CustomComponent/componentUtils.tsx#L264-L278)）
+- **iframe → 宿主方向**：`window.parent.postMessage(data, "*")`（[streamlit.ts#L237-L244](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/component-lib/src/streamlit.ts#L237-L244)）
+- `"*"` 作为 targetOrigin 意味着不限制接收方的 origin（JS `postMessage` 规范）
 
-`"*"` 作为 targetOrigin 意味着不限制接收方的 origin。这在安全上不是最佳实践，但由于组件可能从任意源加载（包括开发服务器），严格限定 origin 会破坏组件的灵活性。
-
-**iframe → 宿主方向**：`window.parent.postMessage(data, "*")`
-
-[streamlit.ts#L237-L244](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/component-lib/src/streamlit.ts#L237-L244)
-
-同样使用 `"*"`。由于 iframe 内的组件 SDK 无法预知宿主页面的 origin，所以无法指定更严格的 targetOrigin。
-
-**风险评估**：虽然 `targetOrigin: "*"` 允许消息被任意源接收，但由于：
-1. 宿主端通过 `event.source` 精确匹配来校验来源
-2. 回传的值通过 widget ID 关联到特定组件实例
-3. 后端有 session_id 校验
-
-因此即使消息在传输层被截获，攻击者也无法将值注入到错误的组件或会话中。
+**无法确认的内容（源码和测试未提供证据）：**
+- ❌ "这在安全上不是最佳实践" — 这是价值判断，不是代码事实
+- ❌ "由于组件可能从任意源加载，严格限定 origin 会破坏组件的灵活性" — 这是合理推论，但不是代码事实
+- ❌ "由于 iframe 内的组件 SDK 无法预知宿主页面的 origin，所以无法指定更严格的 targetOrigin" — 这是合理推论，但不是代码事实
+- ❌ "因此即使消息在传输层被截获，攻击者也无法将值注入到错误的组件或会话中" — 这是安全分析推论，不是代码事实
 
 ### 6.6 v1 vs v2 的信任边界对比
 
+**可直接验证的事实：**
+
 | 维度 | v1 (iframe) | v2 (BidiComponent) |
 |------|-------------|---------------------|
-| 消息通道 | postMessage (跨文档) | 直接函数调用 (同文档) |
-| 来源校验 | `event.source` 精确匹配 | 无需校验（闭包绑定） |
-| 伪造难度 | 高（需控制已注册的 iframe） | 不适用（无外部消息通道） |
-| 潜在攻击面 | 恶意 iframe 注入 | 恶意脚本注入（需同源） |
+| 消息通道 | postMessage（代码：[componentUtils.tsx#L264-L278](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/lib/src/components/widgets/CustomComponent/componentUtils.tsx#L264-L278)） | 直接函数调用（代码：[useHandleJsContent.ts#L83-L104](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/lib/src/components/widgets/BidiComponent/hooks/useHandleJsContent.ts#L83-L104)） |
+| 来源校验 | `event.source` 精确匹配（代码：[ComponentRegistry.ts#L125-L132](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/lib/src/components/widgets/CustomComponent/ComponentRegistry.ts#L125-L132)） | 无来源校验（闭包捕获引用直接调用） |
+| 监听器注册 | 按 `MessageEventSource` 注册到全局 `ComponentRegistry`（代码：[ComponentInstance.tsx#L382-L385](file:///d:/fz/0601/solo-dogfeeding/code/222-streamlit/frontend/lib/src/components/widgets/CustomComponent/ComponentInstance.tsx#L382-L385)） | 无监听器注册（闭包捕获 `widgetMgr` 引用） |
 
-v2 组件不使用 postMessage，状态更新通过闭包中捕获的 `widgetMgr.setJsonValue()` 直接调用。这意味着**不存在跨文档消息伪造的攻击面**，但也意味着 v2 组件的 JS 代码运行在与宿主相同的 JavaScript 上下文中，拥有完全的 DOM 访问权限。
+**无法确认的内容（源码和测试未提供证据）：**
+- ❌ "伪造难度高（需控制已注册的 iframe）" — 这是安全分析推论，不是代码事实
+- ❌ "潜在攻击面：恶意 iframe 注入 / 恶意脚本注入" — 这是安全分析推论，不是代码事实
+- ❌ "不存在跨文档消息伪造的攻击面" — 这是合理推论，但不是代码事实
+- ❌ "拥有完全的 DOM 访问权限" — 这是合理推论，但不是代码事实
 
 ---
 
