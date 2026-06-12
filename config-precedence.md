@@ -2,129 +2,202 @@
 
 ## 总览
 
-Streamlit 的配置系统采用**多层级覆盖**策略：高优先级来源的配置值会覆盖低优先级来源的值。整个加载流程由 [config.py](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config.py) 中的 `get_config_options()` 函数统一调度。
+Streamlit 配置系统采用 **7 层覆盖**策略，高层级的值会覆盖低层级的值。加载入口是 `get_config_options()` 函数，位于 [config.py#L2751-L2834](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config.py#L2751-L2834)。
+
+**特别注意：环境变量有**两套独立机制**（敏感选项和非敏感选项走完全不同的路径，这也是最容易混淆的地方。
 
 ---
 
 ## 一、优先级总表（从低到高）
 
-| 优先级 | 来源 | 说明 | `where_defined` 标识 |
-|--------|------|------|---------------------|
-| 1（最低） | 默认值 | 代码内通过 `_create_option()` 硬编码的 `default_val` 或装饰器函数返回值 | `"<default>"` |
-| 2 | 全局配置文件 | `~/.streamlit/config.toml` | 文件绝对路径 |
-| 3 | 项目级配置文件 | `$CWD/.streamlit/config.toml`（当前工作目录） | 文件绝对路径 |
-| 4 | 脚本级配置文件 | 主脚本所在目录下的 `.streamlit/config.toml` | 文件绝对路径 |
-| 5 | 环境变量 | `STREAMLIT_*` 系列环境变量，以及 config.toml 内的 `env:VAR` 引用 | `"environment variable"` |
-| 6 | 命令行参数 | `streamlit run --server.port 8502` 等 CLI flag | `"command-line argument or environment variable"` |
-| 7（最高） | 运行时覆盖 | 用户脚本内调用 `st.set_option()` | `"<user defined>"` |
-
-> **注意**：并非所有配置项都允许在运行时修改，只有 `scriptable=True` 的选项（如 `client.showErrorDetails`）才能通过 `st.set_option()` 动态设置。
+| 优先级 | 层级 | 来源 | 适用范围 | where_defined 标识 |
+|--------|------|------|----------|--------------------|
+| 1（最低） | 默认值层 | 代码内 `_create_option()` 定义的 `default_val` 或装饰器函数 | 所有配置项 | `"<default>"` |
+| 2 | 全局配置文件 | `~/.streamlit/config.toml | 所有非 sensitive 的选项 | 文件绝对路径 |
+| 3 | 项目配置文件 | `$CWD/.streamlit/config.toml | 同上 | 文件绝对路径 |
+| 4 | 脚本配置文件 | 主脚本目录下 `.streamlit/config.toml` | 同上 | 文件绝对路径 |
+| 5 | 敏感环境变量层 | `STREAMLIT_* 环境变量 | 仅 `sensitive=True` 的选项 | `"environment variable"` |
+| 6 | CLI / 非敏感环境变量层 | CLI flag + Click 解析的 `envvar` 机制 | 仅 `sensitive=False` 的选项 | `"command-line argument or environment variable"` |
+| 7（最高） | 运行时层 | `st.set_option()` | 仅 `scriptable=True` 的选项 | `"<user defined>"` |
 
 ---
 
-## 二、核心加载流程代码解析
+## 二、各层级边界与代码路径详解
 
-### 2.1 入口函数 `get_config_options()`
+### 2.1 第 1 层：默认值
 
-位于 [config.py#L2751-L2834](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config.py#L2751-L2834)，是所有配置合并的起点：
-
-```python
-def get_config_options(force_reparse=False, options_from_flags=None):
-    # Step 1: 从模板深拷贝，初始化所有选项为默认值
-    _config_options = copy.deepcopy(_config_options_template)
-
-    # Step 2-4: 按顺序加载 3 个层级的 config.toml 文件
-    config_files = get_config_files("config.toml")  # 返回 [全局, 项目, 脚本]
-    for filename in config_files:
-        if os.path.exists(filename):
-            _update_config_with_toml(file_contents, filename)
-
-    # Step 5: 加载敏感配置的环境变量覆盖
-    _update_config_with_sensitive_env_var(_config_options)
-
-    # Step 6: 加载 CLI flag 覆盖
-    for opt_name, opt_val in options_from_flags.items():
-        _set_option(opt_name, opt_val, _DEFINED_BY_FLAG)
-
-    # Step 额外: 处理 theme.base 主题继承（见第四节）
-    config_util.process_theme_inheritance(...)
-```
-
-**关键点**：每一层都调用 `_set_option()`，后者会**直接覆盖**已有值，并更新 `where_defined` 字段记录来源。
-
-### 2.2 默认值的定义方式
-
-默认值通过 `_create_option()` 注册到 `_config_options_template`，有两种形式：
+默认值注册在 `_config_options_template` 字典中，有两种定义方式：
 
 **形式 A：静态默认值**
+
 ```python
-# config.py#L400-L408
+# config.py#L386-L397
 _create_option(
-    "global.showWarningOnDirectExecution",
-    default_val=True,   # 静态默认值
+    "global.disableWidgetStateDuplicationWarning",
+    default_val=False,
     type_=bool,
 )
 ```
 
 **形式 B：动态计算默认值（装饰器语法）**
+
 ```python
 # config.py#L411-L424
 @_create_option("global.developmentMode", visibility="hidden", type_=bool)
 @util.memoize
 def _global_development_mode() -> bool:
-    return "site-packages" not in __file__  # 运行时动态判断
+    return "site-packages" not in __file__
 ```
 
-装饰器返回的函数会保存在 `ConfigOption._get_val_func` 中，每次访问 `.value` 时调用（除非用 `@util.memoize` 缓存）。
+装饰器函数保存在 `ConfigOption._get_val_func` 中，每次访问 `.value` 时调用（可通过 `@util.memoize` 可缓存结果）。
 
-### 2.3 配置文件的查找顺序
+> 边界：默认值是所有其他层的基础，每次重新解析都会从 `_config_options_template` 深拷贝出一份全新的 `_config_options`。
 
-`get_config_files()` 位于 [config.py#L2726-L2748](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config.py#L2726-L2748)，返回列表顺序决定了加载顺序（后者覆盖前者）：
+---
+
+### 2.2 第 2-4 层：三层 config.toml 文件
+
+#### 加载顺序
+
+由 `get_config_files()` 在 [config.py#L2726-L2748](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config.py#L2726-L2748) 返回文件列表，按顺序加载，后加载的覆盖先加载的：
 
 ```python
 def get_config_files(file_name):
     config_files = [
-        file_util.get_streamlit_file_path(file_name),       # ~/.streamlit/
-        file_util.get_project_streamlit_file_path(file_name), # $CWD/.streamlit/
+        file_util.get_streamlit_file_path(file_name),       # 全局: ~/.streamlit/
+        file_util.get_project_streamlit_file_path(file_name), # 项目: $CWD/.streamlit/
     ]
     if _main_script_path is not None:
-        # 主脚本目录下的 .streamlit/ （如果与上不同）
+        # 脚本: 主脚本目录/.streamlit/ （如果与上不同）
         config_files.append(script_level_config)
     return config_files
 ```
 
-### 2.4 config.toml 内的环境变量引用
+每层都调用 `_update_config_with_toml()` 解析，内部递归遍历 TOML 结构并调用 `_set_option()` 直接覆盖。
 
-在 config.toml 中可以使用 `env:VAR_NAME` 语法引用外部环境变量，由 `_maybe_read_env_variable()` 在 [config.py#L2672-L2703](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config.py#L2672-L2703) 解析：
+#### config.toml 中的 `env:` 引用
+
+在 config.toml 内可以使用 `env:VAR_NAME` 语法引用外部环境变量，由 `_maybe_read_env_variable()` 在 [config.py#L2672-L2703](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config.py#L2672-L2703) 解析：
 
 ```toml
 [server]
 port = "env:MY_APP_PORT"
 ```
 
-这个引用发生在 TOML 解析阶段（优先级 2-4 之间），**早于**专门的环境变量加载（优先级 5），但因为是写在 config.toml 内的，其整体优先级等同于所在的 config.toml 文件层级。
+```python
+def _maybe_read_env_variable(value):
+    if isinstance(value, str) and value.startswith("env:"):
+        var_name = value[len("env:"):]
+        env_var = os.environ.get(var_name)
+        if env_var is not None:
+            return _maybe_convert_to_number(env_var)
+    return value
+```
 
-### 2.5 敏感配置的环境变量加载
+> **边界要点**：
+> - `env:` 引用是 **所在 config.toml 层级的一部分**，不是独立的环境变量层。
+> - 它发生在 TOML 解析阶段，和所在文件同优先级。例如全局 config.toml 里的 `env:` 引用，优先级仍然低于项目级 config.toml 的普通值。
+> - 解析失败（环境变量不存在）时，保留 `env:xxx` 字符串原样作为值（不会报错，只是值就是字符串）。
+> - 只在 config.toml 中可用，CLI 层没有这个语法。
 
-`_update_config_with_sensitive_env_var()` 在 [config.py#L2537-L2550](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config.py#L2537-L2550) 专门处理 `sensitive=True` 的选项（如 `server.cookieSecret`）。环境变量名规则：
+---
+
+### 2.3 第 5 层：敏感选项的环境变量
+
+**只适用于 `sensitive=True` 的配置项，由 `_update_config_with_sensitive_env_var()` 在 [config.py#L2537-L2550](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config.py#L2537-L2550) 处理。
 
 ```python
-# ConfigOption.env_var 属性 - config_option.py#L309-L312
+def _update_config_with_sensitive_env_var(config_options):
+    for opt_name, opt_val in config_options.items():
+        if not opt_val.sensitive:
+            continue
+        env_var_value = os.environ.get(opt_val.env_var)
+        if env_var_value is None:
+            continue
+        _set_option(opt_name, env_var_value, _DEFINED_BY_ENV_VAR)
+```
+
+环境变量名规则（`ConfigOption.env_var` 属性，定义在 [config_option.py#L309-L312](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config_option.py#L309-L312)：
+
+```python
 @property
 def env_var(self) -> str:
     name = self.key.replace(".", "_")
     return f"STREAMLIT_{to_snake_case(name).upper()}"
 ```
 
-例如 `server.cookieSecret` → `STREAMLIT_SERVER_COOKIE_SECRET`。
+例如 `server.cookieSecret` → `STREAMLIT_SERVER_COOKIE_SECRET`
 
-### 2.6 命令行参数
+> **边界要点**：
+> - 仅 `sensitive=True` 的选项才能通过环境变量设置（如 `server.cookieSecret`、`mapbox.token`）。
+> - 这层在三层 config.toml **之后**，CLI flag **之前**。
+> - 敏感选项**不能通过 CLI flag 设置**（会直接报错退出）。
+> - `where_defined` 标记为 `"environment variable"`。
 
-CLI 参数（`--server.port` 等）在 `streamlit run` 命令解析后，通过 `options_from_flags` 传入 `get_config_options()`，逐一覆盖。标识为 `_DEFINED_BY_FLAG`。
+---
 
-### 2.7 运行时用户覆盖
+### 2.4 第 6 层：CLI flag 与非敏感环境变量
 
-`st.set_option()` 最终调用 [set_user_option()](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config.py#L146-L191)，只有 `scriptable=True` 的选项允许修改：
+这一层最容易误解：**非敏感选项的环境变量不是在 config.py 里处理，而是在 CLI 层通过 Click 库的 `envvar` 机制处理**。
+
+#### 机制代码在 [cli.py#L86-L110](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/web/cli.py#L86-L110) 的 `configurator_options()` 装饰器：
+
+```python
+def configurator_options(func):
+    for _, value in reversed(_config._config_options_template.items()):
+        parsed_parameter = _convert_config_option_to_click_option(value)
+        if value.sensitive:
+            # 敏感选项：不允许通过 CLI 设置
+            click_option_kwargs = {
+                "expose_value": False,
+                "hidden": True,
+                "is_eager": True,
+                "callback": _make_sensitive_option_callback(value),
+            }
+        else:
+            # 非敏感选项：同时支持 CLI flag 和环境变量
+            click_option_kwargs = {
+                "show_envvar": True,
+                "envvar": parsed_parameter["envvar"],  # 关键：Click 自动从环境变量读
+            }
+        config_option = click.option(...)
+```
+
+Click 的 `envvar` 参数意味着：
+- 如果用户传了 CLI flag，用 CLI flag 的值
+- 如果用户没传 CLI flag，但设置了对应环境变量，用环境变量的值
+- 两者都没传，用 None（不覆盖）
+
+解析后的值通过 `flag_options` → options_from_flags` 传入 `get_config_options()`：
+
+```python
+# bootstrap.py#L286-L294
+options_from_flags = {
+    name.replace("_", "."): val
+    for name, val in flag_options.items()
+    if val is not None and val != ()
+}
+config.get_config_options(force_reparse=True, options_from_flags=options_from_flags)
+```
+
+然后在 `get_config_options()` 内循环设置：
+
+```python
+for opt_name, opt_val in options_from_flags.items():
+    _set_option(opt_name, opt_val, _DEFINED_BY_FLAG)
+```
+
+> **边界要点**：
+> - 非敏感选项的环境变量**和 CLI flag 是同一层**，由 Click 统一解析，CLI flag 优先级高于环境变量（Click 默认行为）。
+> - 非敏感选项的环境变量 **优先级高于 config.toml 和敏感环境变量层**。
+> - 不管是 CLI flag 还是环境变量触发，`where_defined` 都标记为 `"command-line argument or environment variable"`，无法区分来源。
+> - 敏感选项走第 层生效，非敏感选项走第 6 层。这是两套完全独立的环境变量机制。
+
+---
+
+### 2.5 第 7 层：运行时修改（st.set_option()）
+
+用户脚本调用 `st.set_option()`，最终调用 `set_user_option()` 在 [config.py#L146-L191](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config.py#L146-L191)：
 
 ```python
 def set_user_option(key, value):
@@ -135,11 +208,19 @@ def set_user_option(key, value):
     raise StreamlitAPIException(...)
 ```
 
+`where_defined` 标记为 `"<user defined>"`。
+
+> **边界要点**：
+> - 只有 `scriptable=True` 的选项可以运行时修改。
+> - 当前可运行时修改的选项：`client.showErrorDetails`、`client.toolbarMode`、`client.showSidebarNavigation`、`logger.enableRich`、`server.enableArrowTruncation` 等。
+> - 运行时修改只影响当前运行的脚本实例，不会写入配置文件。
+> - 某些 server 相关选项运行时修改无效（会导致警告：如果 server 选项变更需要重启）。
+
 ---
 
-## 三、配置来源追踪：`where_defined`
+## 三、配置来源追踪：where_defined
 
-每个 `ConfigOption` 对象都有 `where_defined` 字段，用于记录当前值的来源。在 [config_option.py#L242-L260](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config_option.py#L242-L260) 的 `set_value()` 中每次更新：
+每个 `ConfigOption` 的 `where_defined` 字段记录当前值的最终来源。在 `set_value()` 中每次更新，见 [config_option.py#L242-L260](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config_option.py#L242-L260)：
 
 ```python
 def set_value(self, value, where_defined=None):
@@ -148,33 +229,36 @@ def set_value(self, value, where_defined=None):
     self.is_default = value == self.default_val
 ```
 
-特殊常量定义：
-- `ConfigOption.DEFAULT_DEFINITION = "<default>"` — 未被覆盖
-- `ConfigOption.STREAMLIT_DEFINITION = "<streamlit>"` — Streamlit 内部设置
-- `config._USER_DEFINED = "<user defined>"` — `st.set_option()` 设置
-- `config._DEFINED_BY_FLAG = "command-line argument or environment variable"`
-- `config._DEFINED_BY_ENV_VAR = "environment variable"`
+特殊常量汇总：
 
-可通过 `config.get_where_defined("server.port")` 查询来源。
+| 常量 | 值 | 含义 |
+|------|----|------|
+| `ConfigOption.DEFAULT_DEFINITION` | `"<default>"` | 使用默认值，未被覆盖 |
+| `ConfigOption.STREAMLIT_DEFINITION` | `"<streamlit>"` | Streamlit 内部代码设置 |
+| `config._USER_DEFINED` | `"<user defined>"` | `st.set_option()` 设置 |
+| `config._DEFINED_BY_FLAG` | `"command-line argument or environment variable"` | CLI flag 或非敏感环境变量 |
+| `config._DEFINED_BY_ENV_VAR` | `"environment variable"` | 敏感环境变量 |
+
+可通过 `config.get_where_defined("server.port")` 查询。
 
 ---
 
 ## 四、特殊机制：主题继承（theme.base）
 
-主题配置有额外的**继承/合并**流程，由 `process_theme_inheritance()` 在 [config_util.py#L744-L887](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config_util.py#L744-L887) 处理。这发生在所有常规配置源加载完成**之后**。
+当 `theme.base` 指向本地 TOML 文件或 URL（非简单的 `"light"` / `"dark"`）时，会触发主题继承流程。由 `process_theme_inheritance()` 在 [config_util.py#L744-L887](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config_util.py#L744-L887) 处理，发生在所有常规配置源加载完成**之后**。
 
-### 4.1 主题优先级扩展
+### 4.1 主题继承的子优先级链
 
-当 `theme.base` 指向一个本地 TOML 文件或 URL 时（而非简单的 `"light"` / `"dark"`），会触发主题继承，形成以下**扩展优先级链**（从低到高）：
+主题继承内部也遵循整体优先级（从低到高）：
 
-| 层级 | 来源 |
-|------|------|
-| T1 | 主题文件（theme.base 引用的文件） |
-| T2 | 全局 config.toml 的主题选项 |
-| T3 | 项目级 config.toml 的主题选项 |
-| T4 | 脚本级 config.toml 的主题选项 |
-| T5 | 环境变量的主题选项 |
-| T6 | CLI 参数的主题选项 |
+| 子层级 | 来源 | 对应常规层级 |
+|--------|------|---------------|
+| T1 | theme.base 引用的主题文件 | （最低） |
+| T2 | 全局 config.toml 的主题选项 | 第 2 层 |
+| T3 | 项目级 config.toml 的主题选项 | 第 3 层 |
+| T4 | 脚本级 config.toml 的主题选项 | 第 4 层 |
+| T5 | 敏感环境变量的主题选项 | 第 5 层（一般主题选项不 sensitive） |
+| T6 | CLI / 非敏感环境变量的主题选项 | 第 6 层 |
 
 ### 4.2 主题继承执行流程
 
@@ -183,17 +267,15 @@ def process_theme_inheritance(config_options, ...):
     # 1. 加载 theme.base 指向的主题文件
     theme_file_content = _load_theme_file(base_value, ...)
 
-    # 2. 提取当前 config.toml / env / CLI 已设置的主题覆盖值
-    current_theme_options = _extract_current_theme_config(config_options)
-    #    并记录来自 env var / CLI 的高优先级覆盖
-    high_precedence_theme_options = {...}   # env var, CLI
-    config_theme_overrides = {...}           # config.toml 各层级
+    # 2. 记录当前已设置的主题覆盖值（按来源分类）
+    high_precedence_theme_options = {...}   # env var / CLI 的主题选项
+    config_theme_overrides = {...}           # 各层 config.toml 的主题选项
 
-    # 3. 清空现有主题选项（除 theme.base 外）
+    # 3. 清空所有主题选项（除 theme.base 外）
     for opt_name in theme_options_to_remove:
         set_option_func(opt_name, None, "reset for theme inheritance")
 
-    # 4. 设置主题文件中的值（最低优先级 T1）
+    # 4. 设置主题文件中的值（最低 T1）
     _set_theme_options_recursive(theme_section, "theme", set_option_func,
                                  f"base theme file: {base_value}")
 
@@ -201,43 +283,69 @@ def process_theme_inheritance(config_options, ...):
     for opt_name, opt_data in config_theme_overrides.items():
         set_option_func(opt_name, opt_data["value"], opt_data["where_defined"])
 
-    # 6. 恢复环境变量和 CLI 的覆盖值（T5-T6，最高优先级）
+    # 6. 恢复环境变量和 CLI 的覆盖值（T5-T6，最高）
     for opt_name, opt_data in high_precedence_theme_options.items():
         set_option_func(opt_name, opt_data["value"], opt_data["where_defined"])
 ```
 
-主题选项的深层合并使用 `_deep_merge_theme_dicts()`（[config_util.py#L684-L701](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config_util.py#L684-L701)）进行递归字典合并。
+深层合并使用 `_deep_merge_theme_dicts()` 递归字典合并，见 [config_util.py#L684-L701](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config_util.py#L684-L701)。
 
 ---
 
 ## 五、冲突检测与自动修正
 
-配置加载完成后，通过 `on_config_parsed` 信号触发 `_check_conflicts()`（[config.py#L2837-L2879](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config.py#L2837-L2879)）：
+配置加载完成后，通过 `on_config_parsed` 信号触发 `_check_conflicts()` 在 [config.py#L2837-L2879](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config.py#L2837-L2879) 检查冲突：
 
-1. **开发模式端口冲突**：`global.developmentMode=true` 时不能设置 `server.port` 或 `browser.serverPort`
+1. **开发模式端口冲突**：`global.developmentMode=true` 时，不能设置 `server.port` 或 `browser.serverPort`（直接抛异常）
+
 2. **XSRF/CORS 冲突**：若 `server.enableXsrfProtection=true` 但 `server.enableCORS=false`，会**自动将 `server.enableCORS` 覆盖为 true** 并打印警告
 
-这是唯一的"隐性覆盖"机制——配置系统会在加载后主动修改某个选项值。
+这是唯一的"隐性覆盖"机制 —— 配置系统会在加载后主动修改选项值。
 
 ---
 
-## 六、示例：多层覆盖场景
+## 六、综合示例
 
-假设同时存在以下配置：
+### 场景 1：环境变量两套机制对比
 
-| 来源 | `server.port` | `theme.primaryColor` |
-|------|---------------|----------------------|
-| 默认值 | 8501 | `None` |
-| 全局 `~/.streamlit/config.toml` | 8502 | `#ff0000` |
-| 项目 `.streamlit/config.toml` | — | `#00ff00` |
-| 环境变量 `STREAMLIT_SERVER_PORT` | 8503 | — |
-| CLI `--theme.primaryColor="#0000ff"` | — | `#0000ff` |
-| 脚本 `st.set_option("client.showErrorDetails", False)` | — | — |
+假设 `server.port`（非 sensitive）和 `server.cookieSecret`（sensitive）：
 
-**最终生效值**：
-- `server.port = 8503`（环境变量覆盖了 config.toml）
-- `theme.primaryColor = "#0000ff"`（CLI 覆盖了 config.toml）
-- `client.showErrorDetails = False`（运行时覆盖，仅 scriptable 选项）
+| 配置项 | 来源 | 值 | 生效层级 | 说明 |
+|--------|------|----|----------|------|
+| `server.port` | 默认值 | 8501 | 1 | 静态默认 |
+| `server.port` | 全局 config.toml | 8502 | 2 | 覆盖默认 |
+| `server.port` | 环境变量 `STREAMLIT_SERVER_PORT=8503 | 8503 | 6 | **非敏感选项走 CLI 层 envvar |
+| `server.cookieSecret` | 默认值 | 随机生成 | 1 | 动态默认 |
+| `server.cookieSecret` | 全局 config.toml | abc123 | 2 | 覆盖默认 |
+| `server.cookieSecret` | 环境变量 `STREAMLIT_SERVER_COOKIE_SECRET=xyz789 | xyz789 | 5 | **敏感选项走独立 env var 层** |
+
+注意：虽然都是环境变量，但 `server.port` 在第 6 层、`server.cookieSecret` 在第 5 层。如果项目级 config.toml 中的 `server.port` 会被环境变量覆盖（第 3 层 < 第 6 层），但 `server.cookieSecret` 也会被环境变量覆盖（第 2 层 < 第 5 层）。
+
+### 场景 2：config.toml 中的 env: 引用
+
+全局 config.toml：
+
+```toml
+[server]
+port = "env:MY_PORT"  # env: 引用，和全局文件同优先级
+```
+
+项目级 config.toml：
+
+```toml
+[server]
+port = 9000
+```
+
+如果环境变量 `MY_PORT=8888`。
+
+**最终结果**：`server.port = 9000` —— 项目级文件的值覆盖了全局文件的 env: 引用值，因为项目级优先级更高。
+
+### 场景 3：CLI flag vs 环境变量（非敏感选项）
+
+环境变量 `STREAMLIT_SERVER_PORT=8888`，同时 CLI 传 `--server.port 9999`。
+
+**最终结果**：`server.port = 9999` —— CLI flag 优先级高于环境变量（Click 的默认行为），`where_defined` 都是 `"command-line argument or environment variable"`。
 
 ---
 
@@ -245,7 +353,9 @@ def process_theme_inheritance(config_options, ...):
 
 | 文件 | 作用 |
 |------|------|
-| [config.py](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config.py) | 配置系统主模块，定义所有选项、加载合并逻辑 |
+| [config.py](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config.py) | 配置系统主模块，定义所有选项、加载合并逻辑、敏感环境变量处理 |
 | [config_option.py](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config_option.py) | `ConfigOption` 类，存储单个配置项的元数据和值 |
 | [config_util.py](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/config_util.py) | 配置工具函数，含主题继承处理、`config show` 输出 |
-| [config_test.py](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/tests/streamlit/config_test.py) | 覆盖优先级的单元测试用例（见 `test_load_global_local_flag_config` 等） |
+| [cli.py](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/web/cli.py) | CLI 入口，非敏感选项的环境变量由 Click 的 envvar 机制处理 |
+| [bootstrap.py](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/streamlit/web/bootstrap.py) | 启动引导，将 CLI flag 传入 config 系统 |
+| [config_test.py](file:///d:/fz/0601/solo-dogfeeding/code/234-streamlit/lib/tests/streamlit/config_test.py) | 覆盖优先级的单元测试用例 |
