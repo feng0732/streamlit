@@ -320,7 +320,6 @@ Streamlit 前端存在多层状态，各有独立的保持机制，不能混为�
 由 [WidgetStateManager](file:///d:/fz/0601/solo-dogfeeding/code/226-streamlit/frontend/lib/src/WidgetStateManager.ts) 独立管理，通过 `widgetId → WidgetState` 的 Map 存储。
 
 - **保持方式**：完全独立于渲染树。只要 widget ID 不变，即使元素节点被替换、组件被卸载重挂，widget 值仍然保留。
-- **清理时机**：脚本运行结束后，`removeInactive(activeIds)` 会清理掉不在当前活跃元素集合中的 widget 状态。
 - **与子节点继承的关系**：**无关**。即使 Block 类型变化导致子节点全部清空，只要后续同一 widget ID 再次出现，仍能从 WidgetStateManager 中读回值。
 
 **2. React 组件内部状态**
@@ -329,7 +328,7 @@ Streamlit 前端存在多层状态，各有独立的保持机制，不能混为�
 
 - **保持条件**：React key 相同 + 组件类型相同 → React 复用组件实例 → 内部状态保留。
 - **丢失场景**：key 变化 或 组件类型变化 → React 卸载旧组件、挂载新组件 → 内部状态丢失。
-- **与子节点继承的关系**：子节点继承直接引用旧的子节点对象 → React 渲染时 key 和类型都不变 → 组件实例被复用 → 内部状态保持。如果没有子节点继承，虽然 key 可能仍然相同（取决于 key 的计算方式），但子节点是新对象，React 仍会更新组件但不会卸载重挂（只要 key 相同）。
+- **与子节点继承的关系**：子节点继承直接引用旧的子节点对象 → React 渲染时 key 和类型都不变 → 组件实例被复用 → 内部状态保持。
 
 **3. DOM 状态**
 
@@ -349,11 +348,169 @@ WidgetStateManager 中还提供了 `elementStates: Map<string, Map<string, unkno
 
 `addBlock` 时继承子节点，主要是为了**避免因父 Block 重建导致子组件不必要的卸载和重挂**。对于 rerun 场景，chat_message 容器本身会被重新创建（因为重新执行 `st.chat_message()` 会发一个新的 `addBlock` delta），如果没有子节点继承，容器内的所有子元素都会变成新节点对象，可能导致：
 
-- 子组件的 React key 若基于索引计算，可能因顺序变化导致状态错位
+- 子组件的 React key 若基于位置索引计算，可能因顺序变化导致状态错位
 - 瞬态动画、滚动位置等 DOM 状态丢失
 - 不必要的重渲染性能开销
 
 子节点继承通过直接引用旧 children，确保这些子树的组件实例和 DOM 都不被破坏。
+
+### 5.7 Widget 状态的 inactive 清理：去留条件
+
+Widget 状态的清理并非简单地"脚本跑完就清理所有"，而是一个精确的集合运算过程，涉及多个边界条件。
+
+#### 清理触发时机
+
+清理由 [handleScriptFinished](file:///d:/fz/0601/solo-dogfeeding/code/226-streamlit/frontend/app/src/App.tsx#L1593-L1658) 触发，分两步执行：
+
+```
+Step 1: clearStaleNodes(scriptRunId, fragmentIdsThisRun)  →  清理过期的渲染树节点
+Step 2: removeInactiveWidgetState()                        →  清理不在活跃集合中的 widget 状态
+```
+
+**关键：不是所有脚本结束都触发清理。**
+
+| ScriptFinishedStatus | 触发 clearStaleNodes? | 触发 removeInactive? |
+|---|---|---|
+| `FINISHED_SUCCESSFULLY` | ✅ | ✅ |
+| `FINISHED_FRAGMENT_RUN_SUCCESSFULLY` | ✅ | ✅ |
+| `FINISHED_EARLY_FOR_RERUN` | ❌ | ❌ |
+| 编译错误 / 未完成 | ❌ | ❌ |
+
+`FINISHED_EARLY_FOR_RERUN` 时不清理，是为了避免闪烁：旧元素瞬间消失后又被新 session 重新添加。
+
+#### activeIds 的构造
+
+[removeInactiveWidgetState](file:///d:/fz/0601/solo-dogfeeding/code/226-streamlit/frontend/app/src/App.tsx#L1696-L1705) 构造活跃 ID 集合：
+
+```typescript
+const { elements, blockIds } = this.state.elements.getActiveIds()
+const activeIds = new Set([
+  ...Array.from(elements)
+    .map(element => getElementId(element))   // 提取每个 Element 的 id 字段
+    .filter(notUndefined),                    // 过滤掉 undefined（非 widget 元素没有 id）
+  ...blockIds,                                // 带 id 的 Block（keyed containers）
+])
+this.widgetMgr.removeInactive(activeIds)
+```
+
+**活跃集合由两部分组成**：
+
+1. **elementIds**：从渲染树中所有 ElementNode 提取 `element.{type}.id` 字段。只有 widget 类型的元素（button、slider、checkbox 等）和部分带 ID 的非 widget（dataframe、audio、video 等）拥有有效的 `id`。普通 markdown、text 等元素**没有 id**，不会被加入活跃集合——但这不影响，因为它们本来就没有 widget 状态需要保留。
+
+2. **blockIds**：从渲染树中所有 `deltaBlock.id` 非空的 BlockNode 收集。只有带 `key` 参数的容器（`st.container(key=...)`、`st.tabs`、`st.expander(key=...)` 等）拥有 `id`。chat_message Block **没有 id 字段**，所以不会出现在 blockIds 中。
+
+#### 去留判断规则
+
+[WidgetStateManager.removeInactive](file:///d:/fz/0601/solo-dogfeeding/code/226-streamlit/frontend/lib/src/WidgetStateManager.ts#L858-L866)：
+
+```typescript
+removeInactive(activeIds: Set<string>): void {
+  this.widgetStates.removeInactive(activeIds)      // 清理顶层 widget 状态
+  this.forms.forEach(form => form.widgetStates.removeInactive(activeIds))  // 清理 form 内 widget
+  this.elementStates.forEach((_, elementId) => {    // 清理前端-only 元素状态
+    if (!activeIds.has(elementId)) {
+      this.deleteElementState(elementId)
+    }
+  })
+}
+```
+
+[WidgetStateDict.removeInactive](file:///d:/fz/0601/solo-dogfeeding/code/226-streamlit/frontend/lib/src/WidgetStateManager.ts#L170-L176)：
+
+```typescript
+removeInactive(activeIds: Set<string>): void {
+  this.widgetStates.forEach((_value, key) => {
+    if (!activeIds.has(key)) {
+      this.widgetStates.delete(key)
+    }
+  })
+}
+```
+
+**去留规则**：`widgetId ∈ activeIds` → 保留；`widgetId ∉ activeIds` → 删除。
+
+#### Fragment 运行的特殊清理
+
+Fragment 运行（`@st.fragment` 装饰的函数的增量 rerun）时，`clearStaleNodes` 的行为不同：
+
+- **非 fragment 运行**：任何 `scriptRunId !== currentScriptRunId` 的 BlockNode 都被标记为 stale 并删除。
+- **Fragment 运行**：[ClearStaleNodeVisitor](file:///d:/fz/0601/solo-dogfeeding/code/226-streamlit/frontend/lib/src/render-tree/visitors/ClearStaleNodeVisitor.ts) 不会删除非当前 run 的 Block，除非该 Block 处于当前 fragment 的修改路径内。这意味着 **fragment 运行不会影响其他 fragment 或主脚本区域的元素**，这些区域的 widget 状态自然也不会被误删。
+
+#### 容易混淆的边界
+
+1. **"元素从渲染树消失但 widget 状态仍在"**：如果某个 widget 在某次 rerun 中没有被创建（例如被 `if` 条件跳过），但脚本还未结束，该 widget 的状态**仍然保留在 WidgetStateManager 中**。只有脚本结束后的 `removeInactive` 才会清理它。
+
+2. **"元素 ID 为空则不影响清理"**：非 widget 元素（如 markdown）没有 `id`，不会出现在 `activeIds` 中，但它们也**没有 widget 状态**，所以不会被清理——这不会产生问题。
+
+3. **"blockId 防止 elementStates 误删"**：`blockIds` 被加入 `activeIds` 的目的是保护 `elementStates` 中的条目不被过早垃圾回收。某些前端-only 状态（如布局容器的滚动位置）关联的是 block ID 而非 element ID，如果 block 有 `id`，则其对应的 `elementStates` 条目在清理时不会被删除。
+
+4. **"chat_message 没有 block id"**：chat_message Block 没有 `id` 字段，因此其内部的 `elementStates` 条目只能通过子元素的 element ID 来保护。如果 chat_message 内的 widget 被移除，其 widget 状态和 element 状态都会在下次 `removeInactive` 时被清理。
+
+### 5.8 渲染节点的 React Key 来源与位置回退
+
+[RenderNodeVisitor](file:///d:/fz/0601/solo-dogfeeding/code/226-streamlit/frontend/lib/src/components/core/Block/RenderNodeVisitor.tsx) 为每个节点生成 React key，key 的来源有优先级回退逻辑。
+
+#### Key 生成规则
+
+```typescript
+private getCurrentKey(elementId?: string): string {
+  return this.elementKeyOverride || elementId || this.index.toString()
+}
+```
+
+三个优先级层级：
+
+| 优先级 | 来源 | 适用场景 |
+|-------|------|---------|
+| 1 (最高) | `elementKeyOverride` | TransientNode 的子元素、锚点渲染时由外层传入的 key 前缀 |
+| 2 | `elementId` / `blockId` | Widget 元素的 `element.{type}.id`，或 Block 的 `deltaBlock.id` |
+| 3 (最低) | `this.index.toString()` | 无 ID 的元素 / 无 ID 的 Block，使用递增索引 |
+
+#### BlockNode 的 Key
+
+```typescript
+const key = this.getCurrentKey(node.deltaBlock?.id || undefined)
+```
+
+- 若 Block 有 `id`（如 `st.container(key="my_key")`），使用 `id` 作为 key → **位置无关的稳定身份**，即使该容器在兄弟列表中的位置变化（如上方条件元素出现/消失），React 仍能正确匹配组件实例。
+- 若 Block 没有 `id`（如 chat_message、普通 vertical Block），使用递增索引 `0, 1, 2...` → **位置相关的 key**，如果上方的兄弟元素数量变化，该容器的索引可能变化，导致 React 认为是不同组件。
+
+#### ElementNode 的 Key
+
+```typescript
+const key = this.getCurrentKey(getElementId(node.element))
+```
+
+[getElementId](file:///d:/fz/0601/solo-dogfeeding/code/226-streamlit/frontend/lib/src/util/utils.ts#L397-L407) 从 `element.{type}.id` 字段提取，且必须通过 [isValidElementId](file:///d:/fz/0601/solo-dogfeeding/code/226-streamlit/frontend/lib/src/util/utils.ts#L381-L392) 校验（格式为 `$$ID-{hash}-{userKey}`，至少 3 段）。
+
+- Widget 元素（button、slider、text_input 等）：Python 端通过 [compute_and_register_element_id](file:///d:/fz/0601/solo-dogfeeding/code/226-streamlit/lib/streamlit/elements/lib/utils.py#L181-L258) 计算 ID，基于 `element_type + user_key + command_kwargs + active_script_hash + form_id + root_container` 的确定性哈希 → **内容相关的稳定 key**，同参数同位置的 widget 总是得到相同 ID。
+- 非 widget 元素（markdown、text、chart 等）：没有 `id` 字段，`getElementId` 返回 `undefined` → **回退到位置索引**。
+
+#### 重复 Key 去重
+
+```typescript
+if (this.elementKeySet.has(key)) {
+  return null   // 跳过重复渲染
+}
+this.elementKeySet.add(key)
+```
+
+如果同一个 key 出现两次（例如 stale widget 和新 widget 短暂共存），只渲染第一次出现的，跳过后续的。这与 `SetNodeByDeltaPathVisitor` 中"旧节点被新节点替换"的语义配合：新节点出现在旧节点之前（因为 `setIn` 逻辑会把新节点放在更前面的位置）。
+
+#### 对聊天场景的影响
+
+典型聊天应用中，chat_message 内的子元素通常是 markdown（流式文本），它们没有 element ID，因此使用位置索引作为 key：
+
+```
+chat_message Block  →  key = "0" (位置索引，无 block id)
+  ├── markdown #0   →  key = "0" (位置索引，无 element id)
+  ├── markdown #1   →  key = "1" (位置索引，无 element id)
+  └── button        →  key = "$$ID-a1b2c3-copy" (有 element id)
+```
+
+**位置 key 的风险**：如果聊天消息内的元素顺序在 rerun 间发生变化（虽然罕见），位置 key 会导致 React 错误匹配组件实例。但流式场景中 `st.empty()` 使用 `LockedCursor` 保持位置不变，所以这个风险实际上被规避了——markdown 始终在同一 `delta_path` 上替换，不会产生位置偏移。
+
+如果 chat_message 内包含 widget（如 `st.button("复制")`），该 widget 有稳定的 element ID 作为 key，不受位置影响。
 
 ---
 
