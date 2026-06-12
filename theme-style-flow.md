@@ -532,46 +532,77 @@ p, ol, ul, dl {
 
 ### 7.4 侧边栏独立主题注入机制
 
-**容易混淆的点**：侧边栏使用的不是 `RootStyleProvider`，而是轻量的 `ThemeProvider`。
+**容易混淆的点**：侧边栏使用的不是 `RootStyleProvider`，而是轻量的 `ThemeProvider`。但「轻量」指的是不创建新的 emotion cache、不重复注入全局样式，**两个主题系统（baseui + Emotion）的 context 都会被完整替换**。
 
-**真实的侧边栏主题注入链路**：
+#### 真实的 Provider 嵌套链
 
 ```
-ThemedSidebar 组件 [ThemedSidebar.tsx]
+RootStyleProvider（主应用）
   │
-  ├─ useContext(ThemeContext) → 获取 activeTheme
+  ├─ baseui.BaseProvider  ───────────────────── 根级 baseui 上下文
+  │    （= baseui.ThemeProvider + LayersManager）
   │
-  ├─ createSidebarTheme(activeTheme)  [utils.ts L1562]
-  │   ├─ 提取 sidebarThemeInput = activeTheme.themeInput?.sidebar
-  │   ├─ 计算背景色：sidebarThemeInput.backgroundColor || secondaryBg
-  │   ├─ 合并配置：mergeWith(主主题themeInput, sidebar配置, 强制覆盖项)
-  │   └─ createTheme("Sidebar", mergedSidebarThemeInput, undefined, inSidebar=true)
-  │       └─ 完整的 Emotion + BaseWeb 主题构建
-  │
-  └─ <ThemeProvider theme={sidebarTheme.emotion} baseuiTheme={sidebarTheme.basewebTheme}>
-       │  └─ 内部: <baseui.ThemeProvider> + <EmotionThemeProvider>
-       └─ <SidebarWithProvider>  ← Sidebar.tsx 的默认导出
-            └─ <IsSidebarContext.Provider value={true}>
-                 └─ <Sidebar> ... </Sidebar>
-     </ThemeProvider>
+  └─ emotion.CacheProvider
+       └─ emotion.ThemeProvider（主主题 emotion）
+            └─ Global(globalStyles)
+            └─ FontSources / FontFaceDeclaration
+            │
+            └─ ThemedSidebar
+                 │
+                 └─ ThemeProvider（侧边栏，[ThemeProvider.tsx]）
+                      │
+                      ├─ baseui.ThemeProvider（侧边栏 baseuiTheme） ← 替换 baseui context
+                      │    ⚠️ 注意：不再有 LayersManager，共享外层 BaseProvider 的弹层层级
+                      │
+                      └─ emotion.ThemeProvider（侧边栏 emotion） ← 替换 emotion context
+                           └─ SidebarWithProvider
+                                └─ IsSidebarContext.Provider
+                                     └─ <Sidebar> 组件
 ```
 
-**ThemeProvider vs RootStyleProvider 对比**：
+#### 两个 baseui Provider 的职责分工
+
+根据 baseweb 官方文档的推荐用法：
+
+| 组件 | 职责 | Streamlit 中的使用位置 |
+|------|------|---------------------|
+| **`baseui.BaseProvider`** | `ThemeProvider` + `LayersManager`（弹层 z-index 管理） | `RootStyleProvider`（应用根，只创建一次） |
+| **`baseui.ThemeProvider`** | 仅替换 baseui 主题 context | `ThemeProvider`（侧边栏子树，切换主题用） |
+
+**关键效果**：
+- 侧边栏的 baseui 组件用侧边栏主题（颜色、字体、边框等）
+- 但侧边栏弹出的 Modal / Tooltip / Dropdown 等**共享应用弹层层级**（由外层 `BaseProvider` 的 `LayersManager` 统一管理，避免弹层层级错乱）
+
+#### 主题替换 vs 主题合并
+
+文档中出现"主题覆盖/继承"的表述容易引起误解。从 React context 的工作机制来看：
+
+| 主题系统 | 替换方式 | 是否合并父主题值 |
+|---------|---------|:---:|
+| **baseui** | `baseui.ThemeProvider` 替换整个 context | ❌ 完全替换（由 `createTheme` 生成完整 theme 对象） |
+| **Emotion** | `EmotionThemeProvider` 替换整个 context | ❌ 完全替换（由 `createEmotionTheme` 生成完整 theme 对象） |
+
+"继承"发生在**数据构造阶段**，不是 React context 层：
+- `createSidebarTheme` 内部用 `mergeWith(主主题themeInput, sidebarThemeInput, ...)` 合并两个配置对象，再调用 `createTheme` 生成完整的侧边栏主题
+- 所以侧边栏主题"继承"了主主题未显式覆盖的部分，但 context 层面是**完全替换**的完整对象
+
+#### ThemeProvider vs RootStyleProvider 完整对比
 
 | 特性 | RootStyleProvider（主应用） | ThemeProvider（侧边栏） |
 |------|---------------------------|----------------------|
-| baseui 上下文 | `BaseProvider`（from "baseui"） | `ThemeProvider`（from "baseui"） |
-| CacheProvider | ✅ 有（创建 `st-emotion-cache`） | ❌ 无（复用外层 cache） |
-| EmotionThemeProvider | ✅ 有 | ✅ 有 |
-| Global (全局样式) | ✅ 有（html/body/滚动条等） | ❌ 无（不重复注入） |
-| FontSources / FontFaceDeclaration | ✅ 有 | ❌ 无（依赖外层加载） |
+| baseui 弹层层级管理 | ✅ `BaseProvider` 含 `LayersManager` | ❌ 复用外层（共享弹层栈） |
+| baseui 主题上下文 | ✅ `BaseProvider` 的 Theme 部分 | ✅ `baseui.ThemeProvider`（完整替换） |
+| Emotion 缓存 | ✅ `CacheProvider` 创建 `st-emotion-cache` | ❌ 复用外层 cache |
+| Emotion 主题上下文 | ✅ `EmotionThemeProvider` | ✅ `EmotionThemeProvider`（完整替换） |
+| Global 全局样式 | ✅ 注入 html/body/滚动条 | ❌ 不重复注入 |
+| FontSources / FontFaceDeclaration | ✅ 注入字体 | ❌ 依赖外层加载 |
 | IsSidebarContext | ❌ | ✅（由 SidebarWithProvider 设置） |
 
 **关键洞察**：
-- 侧边栏主题是"嵌套主题"模式：外层主主题 + 内层侧边栏主题
-- 两个 EmotionThemeProvider 嵌套，内层覆盖外层的 theme 值
-- 共享同一个 emotion cache（`st-emotion-cache`），避免样式重复
-- 全局样式（`html { font-size }` / `body` 等）只在外层注入一次
+- 侧边栏主题是"**嵌套 Provider + 完整替换 context + 共享基础设施**"模式
+- 基础设施（emotion cache、LayersManager、字体加载、全局 CSS）**共享外层**，避免重复
+- 主题上下文（baseui theme、emotion theme）**完全替换**，实现内外视觉隔离
+- 全局样式只在外层注入一次，内层 `body` 规则对侧边栏内容仍生效（因为 DOM 在同一个 body 内）
 - **侧边栏 ThemeProvider 不注入 FontSources / FontFaceDeclaration**，侧边栏的字体文件依赖外层 ThemedApp 加载
 
 **核心文件**：
@@ -639,12 +670,17 @@ export const StyledErrorMessage = styled.small(({ theme }) => ({
 **位置**：[utils.ts L1562-L1612](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/lib/src/theme/utils.ts#L1562-L1612)
 
 ```typescript
+// 继承合并顺序: mergeWith(主主题themeInput, sidebarThemeInput, 强制覆盖项)
 // 默认: 侧边栏背景 = main.secondaryBg
 // 但如果 [theme.sidebar] 或 [theme.light.sidebar] 有配置，则应用覆盖
 // 背景色、文字色、字体、圆角、所有语义色均可独立配置
+// → 输出一个完整的、独立的 EmotionTheme + baseuiTheme 对象
 ```
 
-渲染时在侧边栏容器外包一层轻量 `ThemeProvider`（[ThemeProvider.tsx](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/lib/src/components/core/ThemeProvider.tsx)），内部为 `baseui.ThemeProvider` + `EmotionThemeProvider`，不含 CacheProvider / Global / FontSources，实现内外主题隔离。
+渲染时在侧边栏容器外包一层轻量 `ThemeProvider`（[ThemeProvider.tsx](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/lib/src/components/core/ThemeProvider.tsx)）：
+- **完全替换**内层组件的 baseui 主题 context（用侧边栏的 baseuiTheme）和 Emotion 主题 context（用侧边栏的 emotion）
+- 不创建新的 emotion cache、不重复注入 Global / FontSources，复用外层基础设施
+- 弹层层级仍由根级 `BaseProvider` 的 `LayersManager` 统一管理
 
 ---
 
@@ -779,46 +815,92 @@ ThemedApp
   │  fontFaces/fontSources 来自 setFonts(themeInput)  ← 只执行一次
   │
   ├─ <RootStyleProvider theme={activeTheme}>
-  │     ├─ <BaseProvider theme={basewebTheme} zIndex={popup}>     ← baseui 顶层 Provider
-  │     └─ <CacheProvider value={cache}>                          ← Emotion 样式缓存
-  │          └─ <EmotionThemeProvider theme={emotion}>            ← 主 Emotion 主题
-  │               ├─ <Global styles={globalStyles} />             ← body { font-family, bg, color }
-  │               ├─ <FontFaceDeclaration fontFaces={fontFaces} /> ← @font-face CSS
-  │               ├─ <FontSources fontSources={fontSources} />    ← <link rel=stylesheet>
+  │     │
+  │     ├─ <BaseProvider theme={basewebTheme} zIndex={popup}>
+  │     │     │   ← baseui 顶层 Provider
+  │     │     │   ← 内含 baseui.ThemeProvider（提供 baseui 主题 context）
+  │     │     │   ← 内含 LayersManager（统一管理 Modal/Tooltip/Dropdown 的弹层 z-index）
+  │     │     │
+  │     └─ <CacheProvider value={cache}>              ← Emotion 样式缓存，唯一实例
+  │          └─ <EmotionThemeProvider theme={emotion}>← 主 Emotion 主题 context
+  │               ├─ <Global styles={globalStyles} /> ← body { font-family, bg, color }
+  │               ├─ <FontFaceDeclaration />          ← @font-face CSS
+  │               ├─ <FontSources />                  ← <link rel=stylesheet>
   │               │
-  │               └─ <AppWithScreencast theme={themeManager}>
+  │               └─ <AppWithScreencast>
   │                    └─ <App>
   │                         └─ <AppView>
+  │                              │
   │                              ├─ <ThemedSidebar>
-  │                              │     │  useContext(ThemeContext) → activeTheme
-  │                              │     │  createSidebarTheme(activeTheme)
   │                              │     │
-  │                              │     └─ <ThemeProvider>                            ← 轻量版
-  │                              │          ├─ <baseui.ThemeProvider>               ← 覆盖 BaseWeb 主题
-  │                              │          └─ <EmotionThemeProvider>               ← 覆盖 Emotion 主题
-  │                              │               └─ <SidebarWithProvider>            ← Sidebar.tsx 默认导出
+  │                              │     ├─ useContext(ThemeContext) → activeTheme
+  │                              │     ├─ createSidebarTheme(activeTheme)
+  │                              │     │    ← mergeWith(主主题配置, sidebar配置)
+  │                              │     │    ← createTheme() → 生成完整 emotion + baseuiTheme
+  │                              │     │
+  │                              │     └─ <ThemeProvider theme={sidebarEmotion} baseuiTheme={sidebarBaseUI}>
+  │                              │          │
+  │                              │          ├─ <baseui.ThemeProvider>
+  │                              │          │    ← ⚠️ 完整替换 baseui 主题 context
+  │                              │          │    ← 但 LayersManager 仍继承外层 BaseProvider
+  │                              │          │    ← 所有 baseui 组件使用侧边栏主题配色
+  │                              │          │    ← 但弹层 z-index 由根级统一调度
+  │                              │          │
+  │                              │          └─ <EmotionThemeProvider>
+  │                              │               ← ⚠️ 完整替换 Emotion 主题 context
+  │                              │               ← styled-components 消费侧边栏主题
+  │                              │               └─ <SidebarWithProvider>
   │                              │                    └─ <IsSidebarContext.Provider value={true}>
   │                              │                         └─ <Sidebar> ... </Sidebar>
   │                              │
   │                              └─ <StyledMainContent> ... </StyledMainContent>
   │
-  │  注意：ThemeProvider 内没有 CacheProvider / Global / FontSources / FontFaceDeclaration
-  │  侧边栏的字体文件依赖外层 ThemedApp 加载
+  │  总结：ThemeProvider 的职责 = 完整替换两个主题 context
+  │                          + 共享基础设施（cache/LayersManager/字体/全局CSS）
 ```
 
-#### 两层 Provider 的职责划分
+#### 两层 Provider 的职责划分（统一口径）
 
-| 能力 | RootStyleProvider（主应用） | ThemeProvider（侧边栏） |
-|------|---------------------------|----------------------|
-| baseui 上下文 | `BaseProvider`（from "baseui"） | `ThemeProvider`（from "baseui"） |
-| Emotion 缓存 | ✅ `CacheProvider`（创建 `st-emotion-cache`） | ❌ 复用外层缓存 |
-| Emotion 主题 | ✅ `EmotionThemeProvider` | ✅ `EmotionThemeProvider`（覆盖内层） |
-| 全局 CSS | ✅ `Global(globalStyles)` → body/html/滚动条 | ❌ 不重复注入 |
-| 字体源 `<link>` | ✅ `FontSources` → `<head>` 中 | ❌ 无 |
-| 字体声明 | ✅ `FontFaceDeclaration` → `@font-face` | ❌ 无 |
-| 侧边栏标志 | ❌ | ✅ `IsSidebarContext.Provider`（由 SidebarWithProvider 设置） |
+| 能力 | RootStyleProvider（应用根，一次） | ThemeProvider（侧边栏子树，局部） |
+|------|:---:|:---:|
+| **baseui 弹层层级栈** | ✅ `BaseProvider` 含 `LayersManager` | ❌ 共享根级（弹层 z-index 统一管理） |
+| **baseui 主题 context** | ✅ 由 `BaseProvider` 中的 Theme 部分提供 | ✅ `baseui.ThemeProvider` **完整替换** |
+| **Emotion 样式缓存** | ✅ `CacheProvider` 创建 `st-emotion-cache` | ❌ 复用根级（所有样式写入同一 cache） |
+| **Emotion 主题 context** | ✅ 提供主主题 | ✅ `EmotionThemeProvider` **完整替换** |
+| **Global 全局 CSS** | ✅ 注入 html/body/滚动条/段落 | ❌ 不重复注入（同 DOM，一次足够） |
+| **字体源 `<link>`** | ✅ `FontSources` → `<head>` | ❌ 依赖根级（字体是全局 CSS 资源） |
+| **字体声明 `@font-face`** | ✅ `FontFaceDeclaration` → CSS | ❌ 依赖根级（同上） |
+| **IsSidebarContext** | ❌ | ✅ `SidebarWithProvider` 设置 |
 
-**关键洞察**：侧边栏的 `ThemeProvider` 只覆盖了 Emotion 主题值（颜色、字体名、间距等），但不注入任何字体资源。侧边栏使用的字体依赖外层 `ThemedApp` 的 `FontSources` / `FontFaceDeclaration` 加载。
+#### 关于"主题继承/覆盖"的澄清
+
+文档中出现的"继承"、"覆盖"、"替换"三个词容易混淆，此处给出准确定义：
+
+| 术语 | 发生层面 | 含义 | 例子 |
+|------|---------|------|------|
+| **配置合并** | 数据构造阶段（JS） | `mergeWith(A, B)` 把多段配置合并为最终一份 `createSidebarTheme()` 输入 | 主主题 font=Inter + 侧边栏 font=Mono → 侧边栏最终 font=Mono |
+| **Context 替换** | React 渲染阶段 | 内层 `ThemeProvider` 接收一个完整的 theme 对象，替换 context 的值，**不做合并** | `useTheme()` 钩子返回的是内层 theme，完全看不到外层 |
+| **样式层叠** | CSS 阶段 | CSS 选择器优先级/先后顺序决定最终应用哪个样式（和 Provider 无关） | globalStyles 的 `body { color }` 对主区和侧边栏都生效，除非被组件内联覆盖 |
+
+#### ThemeProvider 组件源码对照
+
+**位置**：[ThemeProvider.tsx](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/lib/src/components/core/ThemeProvider.tsx)
+
+```tsx
+function ThemeProvider({ theme, baseuiTheme, children }) {
+  return (
+    <BaseUIThemeProvider theme={baseuiTheme || baseuiLightTheme}>
+      {/* ← baseui.ThemeProvider：完整替换 baseui 主题 context */}
+      <EmotionThemeProvider theme={theme}>
+        {/* ← EmotionThemeProvider：完整替换 Emotion 主题 context */}
+        {children}
+      </EmotionThemeProvider>
+    </BaseUIThemeProvider>
+  )
+}
+```
+
+**关键洞察**：`ThemeProvider` 没有任何 merge 逻辑——它接收的 `theme` 和 `baseuiTheme` 必须是已经由 `createSidebarTheme()` 完整构造好的对象。"继承"完全发生在 `createSidebarTheme()` 内部的 `mergeWith`，而不是 React context 层。
 
 ---
 
