@@ -85,34 +85,34 @@ def is_dataframe_like(obj):
         NUMPY_LIST, NUMPY_MATRIX,
         PANDAS_ARRAY, PANDAS_DATAFRAME, PANDAS_INDEX, PANDAS_SERIES, PANDAS_STYLER,
         POLARS_DATAFRAME, POLARS_LAZYFRAME, POLARS_SERIES,
-        PYARRAY_ARRAY, PYARROW_TABLE,
+        PYARROW_ARRAY, PYARROW_TABLE,   # ⚠️ 注意是 PYARROW（双R）不是 PYARRAY
         PYSPARK_OBJECT, SNOWPANDAS_OBJECT, SNOWPARK_OBJECT,
         XARRAY_DATASET, XARRAY_DATA_ARRAY,
     }
 ```
 
-#### 关键结论：dict / list 在这一级到底能不能通过？
+#### 关键结论：各种集合类型在这一级到底能不能通过？
 
-| 输入类型 | 快速排除层是否拦截？ | `determine_data_format()` 返回值 | 在白名单中？ | 最终走 datafram路径？ |
-|----------|---------------------|----------------------------------|--------------|----------------------|
-| `[1,2,3]` list | ❌ 不拦截 | `LIST_OF_VALUES` | ❌ 不在 | ❌ NO |
-| `[[1,2],[3,4]]` list | ❌ 不拦截 | `LIST_OF_ROWS` | ❌ 不在 | ❌ NO |
-| `[{"a":1},{"a":2}]` list | ❌ 不拦截 | `LIST_OF_RECORDS` | ❌ 不在 | ❌ NO |
-| `(1,2,3)` tuple | ✅ 拦截 → False | 不再进入 | ❌ | ❌ NO |
-| `{1,2,3}` set | ✅ 拦截 → False | 不再进入 | ❌ | ❌ NO |
-| `{1,2,3}` frozenset | ❌ 不拦截 | `SET_OF_VALUES` | ❌ 不在 | ❌ NO |
-| `{"a": 1, "b": 2}` dict | ❌ 不拦截 | `KEY_VALUE_DICT` | ❌ 不在 | ❌ NO |
-| `{"col1": {"row1": 1}}` dict | ❌ 不拦截 | `COLUMN_INDEX_MAPPING` | ❌ 不在 | ❌ NO |
-| `{"col1": [1,2,3]}` dict | ❌ 不拦截 | `COLUMN_VALUE_MAPPING` | ❌ 不在 | ❌ NO |
-| **`{"col1": pd.Series([1,2])}` dict** | ❌ 不拦截 | **`COLUMN_SERIES_MAPPING`** | ✅ 在 | **✅ YES，走st.dataframe()** |
+| 输入类型 | 快速排除层是否拦截？ | `determine_data_format()` 返回值 | 在白名单中？ | 第5级是否通过？ |
+|----------|---------------------|----------------------------------|--------------|-----------------|
+| `[1,2,3]` list | ❌ 不拦截 | `LIST_OF_VALUES` | ❌ 不在 | ❌ NO → 继续往下 |
+| `[[1,2],[3,4]]` list | ❌ 不拦截 | `LIST_OF_ROWS` | ❌ 不在 | ❌ NO → 继续往下 |
+| `[{"a":1},{"a":2}]` list | ❌ 不拦截 | `LIST_OF_RECORDS` | ❌ 不在 | ❌ NO → 继续往下 |
+| `(1,2,3)` tuple | ✅ 拦截 → False | 不再进入 | ❌ | ❌ NO → 继续往下 |
+| `{1,2,3}` set | ✅ 拦截 → False | 不再进入 | ❌ | ❌ NO → 继续往下 |
+| `frozenset([1,2,3])` | ❌ 不拦截 | `SET_OF_VALUES` | ❌ 不在 | ❌ NO → 继续往下 |
+| `{"a": 1, "b": 2}` dict | ❌ 不拦截 | `KEY_VALUE_DICT` | ❌ 不在 | ❌ NO → 继续往下 |
+| `{"col1": {"row1": 1}}` dict | ❌ 不拦截 | `COLUMN_INDEX_MAPPING` | ❌ 不在 | ❌ NO → 继续往下 |
+| `{"col1": [1,2,3]}` dict | ❌ 不拦截 | `COLUMN_VALUE_MAPPING` | ❌ 不在 | ❌ NO → 继续往下 |
+| **`{"col1": pd.Series([1,2])}` dict** | ❌ 不拦截 | **`COLUMN_SERIES_MAPPING`** | ✅ 在 | **✅ YES → 走st.dataframe()** |
 | `pd.DataFrame(...)` | ❌ 不拦截 | `PANDAS_DATAFRAME` | ✅ 在 | ✅ YES |
 | `np.array([1,2])` | ❌ 不拦截 | `NUMPY_LIST` | ✅ 在 | ✅ YES |
 | `pl.DataFrame(...)` | ❌ 不拦截 | `POLARS_DATAFRAME` | ✅ 在 | ✅ YES |
 
 **一句话总结**：
-- **所有普通 list/tuple/set/frozenset**：第5级全部被挡下，继续往下走
+- **list/tuple/set/frozenset**：第5级全部被挡下，继续往下走
 - **普通 dict**：第5级也被挡下，继续往下
-- **特殊 dict**：只有 `dict[str, pd.Series]` 这种 "列→Series" 映射才能通过第5级，直接走 `st.dataframe()`
+- **特殊 dict**：只有 `dict[str, pd.Series]` 这种 "列→Series" 映射才能通过第5级
 
 命中第5级后执行：
 ```python
@@ -139,9 +139,9 @@ self.dg.dataframe(arg)
 
 ---
 
-### 5.4 第14级：JSON/字典/列表路径 → 大多数集合类型的终点
+### 5.4 第14级：JSON/字典/列表路径 → 部分集合类型的终点
 
-**这是普通 list、dict 最终命中的级别！**
+**⚠️ 重要：只有 list 和 dict 会在这里命中！tuple / set / frozenset 都不会走这里！**
 
 代码位置：`lib/streamlit/elements/write.py` 第496-519行
 
@@ -153,15 +153,18 @@ elif (
         map,
         enumerate,
         types.MappingProxyType,
-        UserDict,           # ✅ UserDict命中（也是dict-like）
+        UserDict,           # ✅ UserDict命中
         ChainMap,           # ✅ ChainMap命中
-        UserList,           # ✅ UserList命中（也是list-like）
+        UserList,           # ✅ UserList命中
         ItemsView,          # ✅ dict.items()命中
         KeysView,           # ✅ dict.keys()命中
         ValuesView,         # ✅ dict.values()命中
+        # ❌ 注意：这里没有 tuple, set, frozenset！
+        # tuple / set 在第5级已经被 is_dataframe_like 的快速排除层拦截，
+        # 但它们也不会在第14级被 JSON 分支捕获，而是继续向下落入兜底分支。
     ))
     or type_util.is_custom_dict(arg)       # st.session_state等
-    or type_util.is_namedtuple(arg)        # namedtuple实例
+    or type_util.is_namedtuple(arg)        # namedtuple实例（注意：namedtuple不是tuple！）
     or type_util.is_pydantic_model(arg)    # Pydantic模型实例
     or type_util.is_sequence_of_pydantic_models(arg)  # [Pydantic, Pydantic]
 ):
@@ -182,7 +185,12 @@ elif (
 | **Pydantic模型** | 单个模型实例 | 通过 `.model_dump()`/`.dict()` 转JSON |
 | **Pydantic序列** | `[Model(), Model(), ...]` | 批量dump为JSON数组 |
 
-**这就是为什么 `st.write([1,2,3])` 和 `st.write({"a":1})` 都显示为 JSON 折叠树的原因！**
+> **关键区分**：
+> - ✅ `st.write([1,2,3])` → 第14级命中 → JSON折叠树
+> - ✅ `st.write({"a":1})` → 第14级命中 → JSON折叠树
+> - ❌ `st.write((1,2,3))` → 第14级 **不命中**（tuple不在isinstance列表）→ 继续往下 → 落入兜底
+> - ❌ `st.write({1,2,3})` → 第14级 **不命中**（set不在isinstance列表）→ 继续往下 → 落入兜底
+> - ❌ `st.write(frozenset([1,2,3]))` → 第14级 **不命中** → 继续往下 → 落入兜底
 
 ---
 
@@ -437,7 +445,91 @@ st.write({"col1": pd.Series([1,2,3])})
 
 ---
 
-### 7.4 以自定义类实例为例（终极兜底链）
+### 7.4 以 `st.write((1, 2, 3))` 为例（tuple — 落入兜底）
+
+```
+st.write((1, 2, 3))
+    │
+    ├─ 单字符串快速路径？ ❌ (是tuple不是str)
+    │
+    ├─ 级别1 isinstance(str)？ ❌
+    ├─ 级别2 StreamingOutput？ ❌
+    ├─ 级别3 Exception？ ❌
+    ├─ 级别4 DeltaGenerator？ ❌
+    │
+    ├─ 级别5 is_dataframe_like()？
+    │   └─ 快速排除层 isinstance((tuple, set, ...))？tuple ✅ 命中 → 直接返回False → ❌
+    │
+    ├─ 级别6-13 各种图表/图像？ ❌
+    │
+    ├─ 级别14 JSON分支 isinstance((dict, list, ...))？
+    │   └─ tuple 不在列表中！→ ❌ 不命中
+    │
+    ├─ 级别15 StringIO？ ❌
+    ├─ 级别16 生成器？ ❌
+    ├─ 级别17 PyDeck？ ❌
+    ├─ 级别18 HELP_TYPES/dataclass？ ❌
+    ├─ 级别19 inspect.isclass？ ❌ (是实例不是类)
+    ├─ 级别20 _repr_html_？ ❌
+    ├─ 级别21 to_pandas/__dataframe__？ ❌
+    │
+    └─ 级别22 兜底：
+        ├─ str(arg) → "(1, 2, 3)"  (单行，不含换行)
+        ├─ is_mem_address_str("(1, 2, 3)") → False
+        ├─ "\n" in "(1, 2, 3)"？ → False
+        │
+        └─ → 行内代码分支：string_buffer.append("`(1, 2, 3)`")
+           → flush_buffer() 后 st.markdown("`(1, 2, 3)`")  [END]
+```
+
+**最终展示**：Markdown 行内代码，显示为 `` `(1, 2, 3)` ``
+
+---
+
+### 7.5 以 `st.write({1, 2, 3})` 为例（set — 落入兜底）
+
+```
+st.write({1, 2, 3})
+    │
+    ├─ 级别5 is_dataframe_like()？
+    │   └─ 快速排除层 isinstance((tuple, set, ...))？set ✅ 命中 → 直接返回False → ❌
+    │
+    ├─ 级别6-13？ ❌
+    ├─ 级别14 JSON分支？
+    │   └─ set 不在 isinstance((dict, list, map, enumerate, ...)) 列表中！→ ❌
+    │
+    ├─ 级别15-21？ 全部 ❌
+    │
+    └─ 级别22 兜底：
+        ├─ str(arg) → "{1, 2, 3}"  (单行)
+        └─ → 行内代码分支：string_buffer.append("`{1, 2, 3}`")  [END]
+```
+
+**最终展示**：Markdown 行内代码，显示为 `` `{1, 2, 3}` ``
+
+---
+
+### 7.6 以 `st.write(frozenset([1, 2, 3]))` 为例（frozenset — 落入兜底）
+
+```
+st.write(frozenset([1, 2, 3]))
+    │
+    ├─ 级别5 is_dataframe_like()？
+    │   ├─ 快速排除层 isinstance((tuple, set, ...))？frozenset ❌ 不在
+    │   └─ determine_data_format() → SET_OF_VALUES → 不在白名单 → ❌
+    │
+    ├─ 级别14 JSON分支？
+    │   └─ frozenset 不在 isinstance 列表中！→ ❌
+    │
+    └─ 级别22 兜底：
+        └─ str(arg) → "frozenset({1, 2, 3})" → 行内代码  [END]
+```
+
+**最终展示**：Markdown 行内代码，显示为 `` `frozenset({1, 2, 3})` ``
+
+---
+
+### 7.7 以自定义类实例为例（终极兜底链）
 
 ```python
 class MyClass:
@@ -475,7 +567,52 @@ st.write(MyClass())
 
 ---
 
-### 7.5 完整降级链一览（从高精确到低精确）
+### 7.8 tuple / set / frozenset 为什么走不到 JSON？—— 两级过滤
+
+```
+        tuple / set / frozenset 输入
+            │
+            ▼
+    ┌─ 第5级 is_dataframe_like() ─────────────────────┐
+    │  快速排除层 isinstance((tuple, set, str, ...))    │
+    │    - tuple → ✅ 被拦截 → 返回False                │
+    │    - set   → ✅ 被拦截 → 返回False                │
+    │    - frozenset → ❌ 不拦截，但 determine_data_format │
+    │                  返回 SET_OF_VALUES，不在白名单    │
+    └─────────────────────── 全部跌落 ─────────────────┘
+            │
+            ▼
+    ┌─ 第14级 JSON 分支 ──────────────────────────────┐
+    │  isinstance(arg, (                              │
+    │      dict, list, map, enumerate,                 │
+    │      MappingProxyType, UserDict, ChainMap,       │
+    │      UserList, ItemsView, KeysView, ValuesView   │
+    │  ))                                              │
+    │    - tuple     → ❌ 不在列表中                    │
+    │    - set       → ❌ 不在列表中                    │
+    │    - frozenset → ❌ 不在列表中                    │
+    └─────────────────────── 全部跌落 ─────────────────┘
+            │
+            ▼
+    ┌─ 第15-21级 ─────────────────────────────────────┐
+    │  StringIO / 生成器 / PyDeck / HELP_TYPES /      │
+    │  isclass / _repr_html_ / to_pandas              │
+    │  全部不命中                                      │
+    └─────────────────────── 全部跌落 ─────────────────┘
+            │
+            ▼
+    ┌─ 第22级 兜底（三级子分支）───────────────────────┐
+    │  str((1,2,3))        → "(1, 2, 3)"      → 行内代码 │
+    │  str({1,2,3})        → "{1, 2, 3}"      → 行内代码 │
+    │  str(frozenset(...)) → "frozenset(...)" → 行内代码 │
+    └──────────────────────────────────────────────────┘
+```
+
+**根本原因**：tuple / set 被第5级快速排除后，第14级 JSON 分支的 isinstance 列表也没有把它们包含进去，形成了 "两不管" 地带，最终只能落入兜底。这看起来像是一个设计遗漏——list 有 JSON 展示，但同属序列/集合的 tuple/set 却没有。
+
+---
+
+### 7.9 完整降级链一览（从高精确到低精确）
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -603,8 +740,9 @@ def is_type(obj, fqn_type_pattern):
 | `[{"a":1}, {"a":2}]` | 级别14 | JSON折叠数组（记录列表） | `st.json()` |
 | `{"a": 1}` | 级别14 | JSON折叠对象 | `st.json()` |
 | `{"col": pd.Series([1,2])}` | 级别5 | 交互式数据表格 | `st.dataframe()` |
-| `(1, 2, 3)` | 级别14 | JSON折叠数组 | `st.json()` |
-| `{1, 2, 3}` | 级别14 | JSON折叠数组 | `st.json()` |
+| `(1, 2, 3)` | 级别22C | 行内代码 | `` st.markdown("`(1, 2, 3)`") `` |
+| `{1, 2, 3}` | 级别22C | 行内代码 | `` st.markdown("`{1, 2, 3}`") `` |
+| `frozenset([1,2,3])` | 级别22C | 行内代码 | `` st.markdown("`frozenset({1, 2, 3})`") `` |
 | `pd.DataFrame(...)` | 级别5 | 交互式数据表格 | `st.dataframe()` |
 | `np.array([1,2,3])` | 级别5 | 交互式数据表格 | `st.dataframe()` |
 | `pl.DataFrame(...)` | 级别5 | 交互式数据表格 | `st.dataframe()` |
