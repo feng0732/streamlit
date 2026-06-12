@@ -115,13 +115,13 @@ if dg and not ignore_command_kwargs:
 
 ---
 
-## 二-B、页面归属过滤的关键前提：script_hash 的来源与传递
+## 三-B、页面归属过滤的关键前提：script_hash 的来源与传递
 
-### 2B.1 为什么需要 script_hash
+### 3B.1 为什么需要 script_hash
 
 页面归属过滤（populate_from_query_string）能够按页面保留/过滤 URL 参数的核心前提是：**每个绑定 widget 在注册时都携带了它所属页面的 script_hash**。这个 hash 是后续判断"这个参数属于哪个页面"的唯一依据。
 
-### 2B.2 script_hash 的完整传递链路
+### 3B.2 script_hash 的完整传递链路
 
 ```
 ThreadState.active_script_hash
@@ -155,7 +155,7 @@ ThreadState.active_script_hash
 
 3. **Fragment 执行时固定**：Fragment 在第一次定义时捕获当前的 `active_script_hash`，后续每次重跑都通过 `run_with_active_hash` 恢复该值，保证 widget ID 稳定（不受 fragment rerun 时页面变化影响）。
 
-### 2B.3 widget 注册时的 script_hash 捕获
+### 3B.3 widget 注册时的 script_hash 捕获
 
 **代码位置**：[_handle_query_param_binding](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/session_state.py#L1126-L1133)
 
@@ -179,7 +179,7 @@ def _handle_query_param_binding(self, metadata, user_key, widget_id):
 | `st.Page("page1.py")` 内的 widget | page1 的 _script_hash（calc_hash(url_path)） |
 | Fragment 内的 widget | Fragment 定义时捕获的 hash |
 
-### 2B.4 ID 命名空间中的 active_script_hash
+### 3B.4 ID 命名空间中的 active_script_hash
 
 **代码位置**：[compute_and_register_element_id](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/elements/lib/utils.py#L249-L257)
 
@@ -194,7 +194,7 @@ if dg and not ignore_command_kwargs:
 - 不同页面的相同 widget → ID 不同 → 不会产生 ID 冲突
 - 同一页面的相同 widget → ID 稳定 → 跨 rerun 能找到历史值
 
-### 2B.5 script_hash 对页面归属过滤的影响
+### 3B.5 script_hash 对页面归属过滤的影响
 
 回到页面切换时的过滤逻辑：
 ```python
@@ -213,6 +213,35 @@ if binding.script_hash not in valid_script_hashes:
 ---
 
 ## 四-B、key="None" 字符串与 key=None 的差异及其影响
+
+### 4B.0 核心前提：user_key 的来源
+
+在理解这个 bug 之前，必须先明确一个关键事实：**SessionState 层的 user_key 完全从 widget_id 反向解析，而不是从调用方参数传入的。**
+
+**代码位置**：[register_widget_from_metadata](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/widgets.py#L180-L200)
+
+```python
+def register_widget_from_metadata(metadata, ctx):
+    widget_id = metadata.id
+    user_key = user_key_from_element_id(widget_id)  # ← 完全反向解析
+    return ctx.session_state.register_widget(metadata, user_key)
+```
+
+这意味着：如果 `user_key_from_element_id` 解析错了，那么整个 session_state 层拿到的 user_key 都是错的，所有依赖 user_key 的功能都会受影响。
+
+另外，在 widgets.py 的 `register_widget` 函数中，`bind="query-params"` 的前置校验也使用了同样的解析方式：
+
+```python
+if bind == "query-params":
+    user_key = user_key_from_element_id(element_id)
+    if user_key is None:
+        raise StreamlitAPIException(
+            "When using bind='query-params', the widget must have a unique 'key' "
+            "parameter specified..."
+        )
+```
+
+所以 **bug 的根源在 user_key_from_element_id**，影响向上传导到整个系统。
 
 ### 4B.1 两种写法的差异产生点
 
@@ -263,7 +292,7 @@ def _compute_element_id(element_type, user_key=None, **kwargs):
 | `"None"`（字符串） | True | ✅ 包含（字节串） | `-None` |
 | `"mykey"` | True | ✅ 包含 | `-mykey` |
 
-**重要发现**：`key=None` 和 `key="None"` 产生的 ID **格式完全相同**（都是 `$$ID-<hash>-None`），但 hash 内容不同！因为 `"None"` 字符串参与了哈希计算而 `None` 没有。所以它们的 ID 实际上是**不同的**。
+**重要发现**：`key=None` 和 `key="None"` 产生的 ID **格式完全相同**（都是 `$$ID-<hash>-None`），但 hash 内容不同！因为 `"None"` 字符串参与了哈希计算而 `None` 没有。所以它们的 widget_id 实际上是**不同的**。
 
 ### 4B.3 ID 解析中的混淆 bug
 
@@ -279,76 +308,172 @@ def user_key_from_element_id(element_id: str) -> str | None:
 - `key=None` 产生的 ID：`$$ID-hash1-None` → 解析为 `None` ✅ 正确
 - `key="None"` 产生的 ID：`$$ID-hash2-None` → 解析为 `None` ❌ 错误！应该返回 `"None"`
 
-#### bug 连锁影响 1：去重检测失效
+因为后缀都是字符串 `"None"`，所以解析结果都是 Python `None`。
 
-**代码位置**：[_register_element_id](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/elements/lib/utils.py#L113-L146)
+### 4B.4 bug 连锁影响全景
+
+由于 user_key 完全从 widget_id 反向解析，这个 bug 会**连锁影响所有依赖 user_key 的功能**。
+
+#### 影响 1：bind="query-params" 校验失败
+
+**代码位置**：[register_widget](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/widgets.py#L143-L151)
 
 ```python
-def _register_element_id(ctx, element_type, element_id) -> None:
+if bind == "query-params":
     user_key = user_key_from_element_id(element_id)
-    if user_key and not ctx.widget_user_keys_this_run.check_and_add(user_key):
-        raise StreamlitDuplicateElementKey(user_key)
-    if not ctx.widget_ids_this_run.check_and_add(element_id):
-        raise StreamlitDuplicateElementId(element_type)
+    if user_key is None:
+        raise StreamlitAPIException(
+            "When using bind='query-params', the widget must have a unique 'key'..."
+        )
 ```
 
-对于 `key="None"` 的 widget：
-- `user_key_from_element_id` 返回的是 `None`（而不是字符串 `"None"`）
-- 所以 `if user_key:` 条件为假，**跳过了 user_key 去重检测**
-- 但 widget_id 仍然不同（hash 不同），所以 element_id 检测不会抛异常
-- 实际后果：`key="None"` 的 widget 表现得**完全像没有 user_key**，只是 ID hash 略有不同
+对于 `key="None"` 且 `bind="query-params"` 的 widget：
+- `user_key_from_element_id` 返回 Python None
+- `if user_key is None` → True → **直接抛异常**
+- **后果**：`key="None"` 的 widget **根本不能使用 `bind="query-params"`**
 
-#### bug 连锁影响 2：query params 绑定异常
+#### 影响 2：key↔id 映射不建立
 
-**代码位置**：[register_widget](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/session_state.py#L1012-L1033)
+**代码位置**：[SessionState.register_widget](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/session_state.py#L1012-L1014)
 
 ```python
 if user_key is not None:
     self._set_key_widget_mapping(widget_id, user_key)
-
-if metadata.bind == "query-params" and user_key is not None:
-    url_value_seeded = self._handle_query_param_binding(...)
-elif metadata.bind is None and user_key is not None:
-    self._query_param_bound_widget_ids.discard(widget_id)
-    self.query_params.unbind_and_clear_param(widget_id)
 ```
 
-对于 `key="None"` 的 widget：
-- `register_widget` 收到的 `user_key` 是**来自调用方传的参数**（即通过 `to_key` 转换后的值），不是通过 `user_key_from_element_id` 解析的
-- `to_key("None")` 返回的是字符串 `"None"`，**而不是 Python None**
-- 所以 `user_key is not None` → True → **会正常建立 key↔id 映射和 query params 绑定**
-- 绑定到 URL 的参数名是 `None`（字符串，即 `?None=xxx`）
+- `register_widget_from_metadata` 传入的 `user_key` 是解析后的 Python None
+- `user_key is not None` → False
+- **后果**：`KeyIdMapper` 中不会建立 key↔widget_id 映射
+- **进一步影响**：所有通过 `_key_id_mapper` 查找的功能都失效
 
-但在 `_remove_stale_widgets` 的 bound_preserved 阶段：
+#### 影响 3：session_state 不能通过 "None" 键访问 widget 值
+
+**代码位置**：[SessionState.__getitem__](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/session_state.py#L531-L546)
+
 ```python
-bound_preserved[user_key] = self._getitem(key, user_key)
-# ...
-self._old_state.update(bound_preserved)
+def __getitem__(self, key: str) -> Any:
+    widget_id = self._get_widget_id(key)  # 通过 KeyIdMapper 查找
+    ...
 ```
-这里 user_key 是通过 `wid_key_map[key]` 取出来的，是注册时传入的正确值。
 
-而在解析 element_id 时（例如在其他需要反向推导 user_key 的场景），`user_key_from_element_id("$$ID-xxx-None")` 返回 None，可能导致某些代码路径判断"该 widget 没有 user_key"而跳过绑定值处理。
+对于 `st.session_state["None"]`：
+- `_key_id_mapper` 中没有映射（因为影响 2）
+- `_get_widget_id("None")` 返回 `"None"`（原样返回，找不到映射）
+- 然后按 user_key="None" 在 session_state 中查找
+- 但 widget 的值是以 `widget_id`（`$$ID-xxx-None`）为键存储的，不是以 "None" 为键
+- **后果**：`st.session_state["None"]` 找不到这个 widget 的值
 
-### 4B.4 去重与参数绑定影响汇总表
+#### 影响 4：filtered_state 中不出现
 
-| 场景 | `key=None` (Python None) | `key="None"` (字符串) |
-|------|-------------------------|----------------------|
-| **ID 生成** | hash 不含 user_key，后缀 `-None` | hash 含 `"None"` 字符串，后缀 `-None` |
-| **widget_id 是否相同** | 不同 | 不同（因为 hash 输入不同） |
-| **user_key 去重检测** | 跳过（`user_key=None`，if 条件假） | ❌ 被跳过！（因为 `user_key_from_element_id` 误解析为 `None`） |
-| **key↔id 映射建立** | ❌ 不建立（register_widget 收到 `user_key=None`） | ✅ 建立（register_widget 收到 `user_key="None"`） |
-| **bind="query-params"** | ❌ 不允许（`user_key is None`） | ✅ 允许，参数名 `"None"` |
-| **bound_preserved 保留** | ❌ 不保留 | ✅ 保留（通过 `wid_key_map` 取到正确 user_key） |
-| **session_state 访问** | 只能通过 widget_id | 可通过 `st.session_state["None"]` 访问 |
-| **user_key_from_element_id 解析** | 返回 `None` ✅ 正确 | 返回 `None` ❌ 错误 |
+**代码位置**：[filtered_state](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/session_state.py#L472-L496)
 
-### 4B.5 核心结论
+```python
+for k in self._keys():
+    if not is_element_id(k) and not _is_internal_key(k):
+        state[k] = self[k]
+    elif is_keyed_element_id(k) and not _is_internal_key(k):
+        try:
+            key = wid_key_map[k]
+            state[key] = self[k]
+        except KeyError:
+            pass
+```
 
-1. **页面归属过滤的正确性依赖于 widget 注册时的 ThreadState.active_script_hash**。这个值通过三层机制（reset 初始化 → Page.run() 切换 → Fragment 固定）保证在 widget 执行 `register_widget` 时恰好是其所属页面的 hash，从而使 binding 中的 script_hash 正确。
+- `is_keyed_element_id(k)` 的判断是：`is_element_id(k) and not k.endswith("-None")`
+- 对于 ID 为 `$$ID-hash-None` 的 widget，`endswith("-None")` → True → `is_keyed_element_id` 返回 False
+- 同时也不是纯 user_key 键
+- **后果**：widget 不会出现在 `filtered_state` 中（即 `st.session_state` 迭代和 `to_dict()` 中看不到）
 
-2. **`key="None"` 是一个边缘缺陷场景**：虽然 `to_key` 层能正确保留字符串，但 `user_key_from_element_id` 的解析逻辑会把它混淆为 `key=None`，导致 user_key 去重检测被跳过。不过由于 register_widget 接收的 user_key 来自调用参数而非 element_id 反向解析，所以 key↔id 映射、query params 绑定等功能仍然正常工作——只有 `_register_element_id` 内的 user_key 去重检测会漏掉。
+#### 影响 5：user_key 去重检测被跳过
 
-3. **`key=""` 与 `key=None` 有本质区别**：`key=""` 会触发 `require_valid_user_key` 直接抛异常，而 `key=None` 是合法的"无自定义 key"状态。
+**代码位置**：[_register_element_id](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/elements/lib/utils.py#L113-L146)
+
+```python
+user_key = user_key_from_element_id(element_id)
+if user_key and not ctx.widget_user_keys_this_run.check_and_add(user_key):
+    raise StreamlitDuplicateElementKey(user_key)
+```
+
+- `user_key_from_element_id` 返回 Python None
+- `if user_key:` → False → **跳过 user_key 去重检测**
+- **后果**：可以创建多个 `key="None"` 的 widget 而不抛 `StreamlitDuplicateElementKey` 异常
+- 但 widget_id 不同（hash 不同），所以 element_id 检测仍然会工作——除非所有参数都相同
+
+等等——如果所有参数都相同且 key 都是 "None"，那 widget_id 会相同吗？
+- 相同的 element_type + 相同的 user_key（"None" 字符串） + 相同的 kwargs
+- → hash 相同 → widget_id 相同
+- → element_id 检测会抛 `StreamlitDuplicateElementId` 异常
+- 所以实际上 key="None" 的重复 widget 仍然会报错，只是报错类型从 StreamlitDuplicateElementKey 变成了 StreamlitDuplicateElementId
+
+#### 影响 6：bound_preserved 值保留不工作
+
+**代码位置**：[_remove_stale_widgets](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/runtime/state/session_state.py#L917-L934)
+
+```python
+wid_key_map = self._key_id_mapper.id_key_mapping
+...
+if (
+    is_element_id(key)
+    and key in self._query_param_bound_widget_ids
+    and key in wid_key_map   # ← 需要在映射中
+    and _is_stale_widget(...)
+):
+```
+
+- `wid_key_map` 是从 KeyIdMapper 来的 id→key 映射
+- 由于 key↔id 映射没建立（影响 2），`key in wid_key_map` → False
+- **后果**：bound_preserved 逻辑会跳过，已绑定的值不会被保留
+
+（但注意：key="None" 的 widget 根本不能用 bind="query-params"，所以这条影响在实际中不会触发，因为影响 1 已经先抛异常了。）
+
+#### 影响 7：测试侧 element_tree 读取不到 key
+
+**代码位置**：[element_tree.py](file:///d:/fz/0601/solo-dogfeeding/code/217-streamlit/lib/streamlit/testing/v1/element_tree.py#L509)
+
+```python
+self.key = user_key_from_element_id(proto.id) if proto.id else None
+```
+
+- 测试侧也是用 `user_key_from_element_id` 解析 key
+- 同样会把 `key="None"` 的 widget 解析为 `None`
+- **后果**：测试代码中 `element.key is None`，无法通过 key 找到 widget
+
+### 4B.5 全链路影响汇总表
+
+| 功能模块 | `key=None` (Python None) | `key="None"` (字符串) | 备注 |
+|---------|-------------------------|----------------------|------|
+| **ID hash 输入** | 不含 user_key | 含 "None" 字符串 | hash 值不同 |
+| **ID 后缀** | `-None` | `-None` | 格式相同 |
+| **widget_id 是否相同** | 不同 | 不同 | （与 key=None 的 widget 相比） |
+| **require_valid_user_key 校验** | 不执行 | 执行并通过 | 策略层 |
+| **user_key 去重检测** | 跳过 | ❌ 被跳过 | 解析 bug 导致 |
+| **bind="query-params"** | ❌ 不允许（编译期校验） | ❌ 不允许（运行期抛异常） | 两者都不行，但报错时机不同 |
+| **key↔id 映射建立** | ❌ 不建立 | ❌ 不建立 | 都因 user_key=None 而跳过 |
+| **SessionState 注册路径** | user_key=None | user_key=None | 两者表现完全相同 |
+| **st.session_state["key"] 访问** | 不能访问（无映射） | ❌ 不能访问 widget 值 | 无法通过 "None" 键找到 |
+| **filtered_state 可见性** | 不可见 | ❌ 不可见 | 两者都不可见 |
+| **bound_preserved 值保留** | 不保留 | ❌ 不保留 | 但实际上也用不了 bind |
+| **测试侧 element.key** | None | ❌ None | 解析 bug 导致 |
+
+### 4B.6 核心结论
+
+1. **`key="None"` 是一个贯穿全链路的系统性缺陷**：由于 `user_key_from_element_id` 的字符串匹配缺陷，`key="None"` 的 widget 在整个 session_state 层面**完全被当作无 user_key 的 widget** 处理。
+
+2. **之前文档中的错误结论修正**：
+   - ❌ ~~register_widget 收到的 user_key 来自调用方参数~~ → ✅ 完全来自 widget_id 反向解析
+   - ❌ ~~key↔id 映射正常建立~~ → ✅ 不建立
+   - ❌ ~~bind="query-params" 正常工作~~ → ✅ 在 widgets.py 校验阶段就会抛异常，根本不能用
+   - ❌ ~~st.session_state["None"] 可以访问~~ → ✅ 不能通过 "None" 键访问 widget 值
+   - ❌ ~~bound_preserved 正常保留~~ → ✅ 不保留（但实际也用不了绑定）
+
+3. **bug 的双重路径**：
+   - **检测路径**（`_register_element_id`）：用 `user_key_from_element_id` → 解析错 → 去重失效
+   - **注册路径**（`register_widget_from_metadata`）：也用 `user_key_from_element_id` → 解析错 → 映射/绑定全失效
+
+4. **`key=""` 与 `key=None` 的区别**：
+   - `key=""` → `require_valid_user_key` 直接抛异常（非法 key）
+   - `key=None` → 合法状态（表示"无用户自定义 key"）
+   - `key="None"` → 能通过校验但实际行为全错（隐蔽的 bug）
 
 ---
 
@@ -979,7 +1104,7 @@ with st.form("my_form"):
 
 ---
 
-## 十、关键代码索引表
+## 八、关键代码索引表
 
 | 功能模块 | 文件 | 行号 |
 |---------|------|------|
@@ -1017,7 +1142,7 @@ with st.form("my_form"):
 
 ---
 
-## 十一、设计权衡总结
+## 九、设计权衡总结
 
 | 设计决策 | 优点 | 缺点 |
 |---------|------|------|
@@ -1031,7 +1156,8 @@ with st.form("my_form"):
 | discard_param_no_forward_msg | 避免冗余 ForwardMsg | 需要区分前端已删 vs 后端缓存过期 |
 | _is_stale_widget 双条件判定 | fragment 局部重跑时只清理相关 widget | 逻辑取反嵌套，可读性稍差 |
 | MPA 参数按 script_hash 过滤 | 页面参数天然隔离，防止跨页污染 | 过滤时机早于正常清理，时序需精确控制 |
-| user_key=None 特殊后缀 | 无需额外字段即可表示"无用户 key" | 与字面字符串 "None" 冲突，存在已知缺陷 |
+| user_key=None 特殊后缀 | 无需额外字段即可表示"无用户 key" | 与字面字符串 "None" 冲突，存在全链路 bug |
 | ThreadState ContextVar 传 active_hash | 三层机制保证 widget 注册时 hash 正确 | 调用链较长，理解时需追溯多个上下文切换点 |
 | widget 注册时同步捕获 script_hash | 时序天然正确，无需额外传参 | 依赖 ThreadState 隐式上下文，出错难以排查 |
-| 双路径 user_key（调用参数 vs ID 反向解析） | 注册路径不依赖解析，绑定功能受 bug 影响小 | 两者不一致时产生边缘缺陷（key="None" 去重失效） |
+| user_key 完全从 widget_id 反向解析 | 单一真相源，避免参数与 ID 不一致 | 解析 bug 会导致全连锁失效（key="None" 场景） |
+| is_keyed_element_id 用 endswith 判断 | 实现简单高效 | 与 user_key_from_element_id 存在同样的 "None" 字符串误判问题 |
