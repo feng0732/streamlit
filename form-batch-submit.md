@@ -273,6 +273,349 @@ private scheduleFlush(fragmentId: string | undefined): void {
 
 ---
 
+## 3.5 后端状态恢复与脚本重跑完整链路
+
+**核心文件:**
+- [app_session.py](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/lib/streamlit/runtime/app_session.py)
+- [script_runner.py](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/lib/streamlit/runtime/scriptrunner/script_runner.py)
+- [session_state.py](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/lib/streamlit/runtime/state/session_state.py)
+
+当后端收到前端发来的 rerun 消息(带 widget_states)后,完整执行链路如下:
+
+#### Step 1: AppSession 接收消息并分发
+
+```python
+# app_session.py - request_rerun() 第420行
+def request_rerun(self, client_state: ClientState | None = None) -> None:
+    # 从 client_state 中提取 widget_states、fragment_id 等
+    fragment_id = client_state.fragment_id
+    
+    # fragment 存在性预检:防止被全量 rerun 清理后产生孤儿 ScriptRunner
+    if fragment_id and not self._fragment_storage.contains(fragment_id):
+        return  # 静默丢弃
+
+    rerun_data = RerunData(
+        widget_states=client_state.widget_states,
+        fragment_id=fragment_id or None,
+        # ... query_string, page_script_hash 等
+    )
+    
+    # 决定是复用现有 ScriptRunner 还是新建
+    if self._scriptrunner is not None:
+        if fastReruns and not rerun_data.fragment_id:
+            self._scriptrunner.request_stop()  # 打断当前,新建 ScriptRunner
+            self._scriptrunner = None
+        else:
+            success = self._scriptrunner.request_rerun(rerun_data)
+            if success: return
+    
+    self._create_scriptrunner(rerun_data)
+```
+
+#### Step 2: ScriptRunner._run_script() 主循环
+
+```python
+# script_runner.py - _run_script() 第528行
+def _run_script(self, rerun_data: RerunData) -> None:
+    while True:
+        # 页面切换时的 widget 清理(略)
+        # ...
+        
+        # 重置 ScriptRunContext,注入 fragment_ids_this_run
+        if rerun_data.fragment_id_queue:
+            fragment_ids_this_run = self._fragment_storage.order_fragment_ids(
+                rerun_data.fragment_id_queue
+            )
+        ctx.reset(fragment_ids_this_run=fragment_ids_this_run, ...)
+        
+        # 编译脚本,准备执行环境
+        code = self._script_cache.get_bytecode(script_path)
+        module = self._new_module("__main__")
+        sys.modules["__main__"] = module
+        
+        # ============ 核心:code_to_exec 闭包 ============
+        def code_to_exec(...) -> None:
+            with modified_sys_path(self._main_script_path), self._set_execing_flag():
+                # ★★★ 关键1: widget 状态同步 + 回调触发(在脚本执行之前)
+                if rerun_data.widget_states is not None:
+                    self._session_state.on_script_will_rerun(
+                        rerun_data.widget_states
+                    )
+                
+                ctx.on_script_start()
+                
+                # ★★★ 关键2: 选择执行范围 —— 全量脚本 or fragment(s)
+                if fragment_ids_this_run:
+                    # --- Fragment 局部重跑分支 ---
+                    for fragment_id in fragment_ids_this_run:
+                        wrapped_fragment = self._fragment_storage.lookup(fragment_id)
+                        try:
+                            wrapped_fragment()  # 只执行 fragment 函数体
+                        finally:
+                            # 清理该 fragment 下的过时嵌套 fragment
+                            registered_ids = self._fragment_storage.ids_registered_after(...)
+                            self._fragment_storage.clear_stale_descendants(
+                                fragment_id, registered_ids
+                            )
+                else:
+                    # --- 全量脚本重跑分支 ---
+                    if PagesManager.uses_pages_directory:
+                        _mpa_v1(self._main_script_path)
+                    else:
+                        exec(code, module.__dict__)  # 执行整个用户脚本
+                    coordinator.join()  # 等待并行 fragment 完成
+                    self._fragment_storage.clear(
+                        new_fragment_ids=ctx.new_fragment_ids.snapshot()
+                    )
+                
+                self._session_state.maybe_check_serializable()
+                self._maybe_handle_execution_control_request()
+        
+        # 执行并捕获异常
+        (_, run_without_errors, rerun_exception_data, ...) = exec_func_with_error_handling(
+            code_to_exec, ctx
+        )
+        
+        # 处理 RerunException(循环继续) 或正常结束(break)
+        if rerun_exception_data is not None:
+            rerun_data = rerun_exception_data
+        else:
+            break
+    
+    # 脚本结束后的清理
+    self._on_script_finished(ctx, finished_event, premature_stop)
+```
+
+#### Step 3: on_script_will_rerun —— 状态同步与回调触发
+
+这是后端处理表单提交的**核心入口**,发生在用户脚本代码执行之前:
+
+```python
+# session_state.py - on_script_will_rerun() 第641行
+def on_script_will_rerun(self, latest_widget_states: WidgetStatesProto) -> None:
+    # 子步骤 A: 清理上次残留的 trigger 值(防止误触发)
+    self._reset_triggers()
+    
+    # 子步骤 B: 状态压缩 —— 把 _new_widget_state 合并到 _old_state
+    #         这一步让 _widget_changed() 能正确判断"值是否改变"
+    self._compact_state()
+    
+    # 子步骤 C: 用前端发来的批量状态更新 _new_widget_state
+    self.set_widgets_from_proto(latest_widget_states)
+    
+    # 子步骤 D: ★★★ 触发所有变更 widget 的回调(包括 submit button)
+    self._call_callbacks()
+```
+
+#### Step 4: _call_callbacks —— 回调调度的两条路径
+
+```python
+# session_state.py - _call_callbacks() 第653行
+def _call_callbacks(self) -> None:
+    # ===== 路径 1: 单回调 (on_change / on_click 传统模式) =====
+    changed_widget_ids_for_single_callback = [
+        wid for wid in self._new_widget_state
+        if self._widget_changed(wid)
+        and metadata.callback is not None
+    ]
+    for wid in changed_widget_ids_for_single_callback:
+        self._new_widget_state.call_callback(wid)  # 直接执行 metadata.callback
+    
+    # ===== 路径 2: 多回调(trigger 聚合模式,Component v2 等)=====
+    for wid in list(self._new_widget_state.states.keys()):
+        metadata = self._new_widget_state.widget_metadata.get(wid)
+        if not metadata or metadata.callbacks is None:
+            continue
+        
+        # 子路径 2a: trigger 调度 (bool + JSON trigger 聚合器)
+        self._dispatch_trigger_callbacks(wid, metadata, args, kwargs)
+        
+        # 子路径 2b: JSON 值变化调度(浅 diff,按 key 分别回调)
+        if metadata.value_type == "json_value":
+            self._dispatch_json_change_callbacks(wid, metadata, args, kwargs)
+```
+
+> **表单提交回调在哪里触发?**
+> FormSubmitButton 使用 `trigger_value` 类型,前端在 `submitForm()` 中把它设为 `true`。
+> 在 `_dispatch_trigger_callbacks` 中,`widget_proto_state.trigger_value == true` 会匹配并执行 `metadata.callbacks["click"]`(即用户的 `on_click`)。
+
+#### Step 5: on_script_finished —— 运行后清理
+
+```python
+# session_state.py - on_script_finished() 第866行
+def on_script_finished(self, widget_ids_this_run: frozenset[str]) -> None:
+    # A: 重置所有 trigger 值为 false / null
+    #    确保 trigger 是一次性的,下次脚本运行不会重复触发
+    self._reset_triggers()
+    
+    # B: 删除未访问的 widget 状态(页面切换 / 条件渲染)
+    self._remove_stale_widgets(widget_ids_this_run)
+```
+
+---
+
+## 3.6 回车提交禁用判断的完整链路
+
+回车提交的判断完全在**前端**完成,后端不参与。涉及两个关键调用点:
+
+#### 判断一:useSubmitFormViaEnterKey Hook(提交前拦截)
+
+```typescript
+// useSubmitFormViaEnterKey.ts - 默认导出 第39行
+export default function useSubmitFormViaEnterKey(
+  formId: string,
+  widgetProps: { disabled?: boolean },
+  commit: () => void,
+  fragmentId?: string
+): void {
+  const widgetMgr = useContext(WidgetManagerContext)
+  
+  const onEnterPressed = useCallback((): void => {
+    if (widgetProps.disabled) return       // 1. widget 自身禁用
+    if (!widgetMgr.allowFormEnterToSubmit(formId)) return  // 2. 表单级校验
+    commit()                               // 3. 先提交当前 widget 的值
+    widgetMgr.submitForm(formId, fragmentId)  // 4. 再触发表单提交
+  }, [widgetProps.disabled, widgetMgr, formId, commit, fragmentId])
+  
+  // 绑定 keydown 事件...
+}
+```
+
+#### 判断二:allowFormEnterToSubmit(表单级规则)
+
+```typescript
+// WidgetStateManager.ts - allowFormEnterToSubmit() 第932行
+public allowFormEnterToSubmit(formId: string): boolean {
+  // 层级 1: 必须属于有效表单
+  if (!isValidFormId(formId)) return false
+  
+  // 层级 2: 用户显式关闭 enterToSubmit (st.form(..., enter_to_submit=False))
+  const form = this.forms.get(formId)
+  if (form && !form.enterToSubmit) return false
+  
+  // 层级 3: 默认规则 —— 第一个 submit button 不能是 disabled
+  const firstSubmitButton = this.formsData.submitButtons.get(formId)?.[0]
+  if (!firstSubmitButton) return false  // 没有 submit button → 不允许
+  return !firstSubmitButton.disabled
+}
+```
+
+> **判断优先级(从高到低):**
+> 1. 当前输入 widget 自身 `disabled=true` → 拦截
+> 2. 表单显式 `enter_to_submit=False` → 拦截  
+> 3. 表单无任何 submit button → 拦截
+> 4. 第一个 submit button `disabled=true` → 拦截
+> 5. 全部通过 → 允许回车提交
+
+---
+
+## 3.7 提交回调、clear_on_submit、fragment 局部重跑的执行顺序
+
+这是整个表单机制最关键的时序,横跨前后端和同步/异步边界。
+
+### 完整时序(以"fragment 内的 clear_on_submit 表单"为例)
+
+```
+ 时间轴   前端(JS 主线程)                    后端(Python 脚本线程)
+  │
+  │  T0  用户点击 submit button
+  │─────┐
+  │     ▼
+  │  T1  FormSubmitButton.handleSubmit()
+  │      └─ widgetMgr.submitForm(formId, fragmentId, element)
+  │
+  │  T2  submitForm() 内部步骤(全部同步)
+  │      ├─ ① 确定 selectedSubmitButton = element
+  │      ├─ ② createWidgetState(submitBtn, {fromUi:true}).triggerValue = true
+  │      ├─ ③ widgetStates.copyFrom(form.widgetStates)  ← 表单值合并到全局
+  │      ├─ ④ form.widgetStates.clear()
+  │      ├─ ⑤ sendUpdateWidgetsMessage(fragmentId)  ──────────► 发送到后端
+  │      ├─ ⑥ syncFormsWithPendingChanges()
+  │      ├─ ⑦ deleteWidgetState(submitBtn.id)       ← 清理前端 trigger
+  │      └─ ⑧ form.clearOnSubmit ? form.formCleared.emit() : 跳过
+  │
+  │  T3  formCleared 信号广播(同步,但通过 useEffect 调度)
+  │      └─ 各订阅 widget 的 handleFormCleared 被调用
+  │          └─ setNextValueWithSource({value: default, fromUi: true})
+  │              └─ useEffect → updateWidgetMgrState
+  │                  └─ createWidgetState(widget, {fromUi: true})
+  │                      ↳ 因为 widget.formId 有效,写入 form.widgetStates
+  │                        (★ 关键:不会触发 rerun,只是暂存下次提交的默认值)
+  │
+  │         . . . . 网络传输: WidgetStates proto 消息 . . . . .
+  │                                                     │
+  │                                                     ▼
+  │  T4                                    AppSession.request_rerun()
+  │                                        ├─ 预检 fragment 是否存在
+  │                                        └─ ScriptRunner.request_rerun()
+  │
+  │  T5                                    ScriptRunner._run_script()
+  │                                        │
+  │                                        ▼
+  │  T6                                    code_to_exec 闭包执行
+  │                                        ├─ A. on_script_will_rerun(widget_states)
+  │                                        │   ├─ _reset_triggers()
+  │                                        │   ├─ _compact_state()
+  │                                        │   ├─ set_widgets_from_proto()
+  │                                        │   └─ _call_callbacks()  ← ★ on_click 在此执行
+  │                                        │
+  │                                        ├─ B. ctx.on_script_start()
+  │                                        │
+  │                                        ├─ C. 选择执行范围
+  │                                        │   └─ fragment_ids_this_run 非空
+  │                                        │       └─ 只执行 wrapped_fragment()
+  │                                        │           └─ Fragment 函数体
+  │                                        │               (widget register_widget
+  │                                        │                读取最新 widget 状态)
+  │                                        │
+  │                                        └─ D. maybe_check_serializable()
+  │
+  │  T7                                    on_script_finished()
+  │                                        ├─ _reset_triggers()  ← 重置后端 trigger
+  │                                        └─ _remove_stale_widgets()
+  │
+  │         . . . . 网络传输: ForwardMsg (新页面 Delta) . . . . .
+  │                                                     │
+  │                                                     ▼
+  │  T8  前端收到新 Delta,React 重渲染
+  │      ├─ widget 组件从 proto 获取新 setValue(如有)
+  │      └─ 各 widget 的 defaultValue(来自 form.widgetStates)生效
+  │         因为后端 fragment 重跑会重新下发所有 widget 的默认值
+```
+
+### 关键执行顺序总结
+
+| 阶段 | 序号 | 动作 | 发生位置 | 说明 |
+|------|------|------|---------|------|
+| **前端提交** | ① | 设置 submit btn trigger=true | 前端同步 | `trigger_value` 是一次性信号 |
+| | ② | 合并 form.widgetStates → 全局 widgetStates | 前端同步 | 这一步才让表单值参与后端计算 |
+| | ③ | sendUpdateWidgetsMessage(fragmentId) | 前端同步 → 后端异步 | fragmentId 决定后端执行范围 |
+| | ④ | deleteWidgetState(submitBtn) | 前端同步 | 立即清理前端 trigger |
+| | ⑤ | form.formCleared.emit() | 前端同步 | clear_on_submit 才触发 |
+| **Widget 重置** | ⑥ | 各 widget reset 为默认值 | 前端 useEffect(微任务) | `fromUi:true` → 写入 form.widgetStates,不触发 rerun |
+| **后端状态同步** | ⑦ | _reset_triggers() | 后端脚本线程 | 清除旧 trigger,防止误触发 |
+| | ⑧ | _compact_state() | 后端脚本线程 | new→old,为变更检测做准备 |
+| | ⑨ | set_widgets_from_proto() | 后端脚本线程 | 写入前端提交的批量值 |
+| **回调触发** | ⑩ | _call_callbacks() | 后端脚本线程 | ★ on_click / on_change 在此执行,**早于用户脚本代码** |
+| **脚本执行** | ⑪ | fragment 函数 / 全脚本 | 后端脚本线程 | register_widget() 读取新状态 |
+| **运行后清理** | ⑫ | _reset_triggers() | 后端脚本线程 | 确保 trigger 是一次性的 |
+| | ⑬ | _remove_stale_widgets() | 后端脚本线程 | 清理条件渲染消失的 widget |
+| **前端更新** | ⑭ | React 重渲染 | 前端 | 接收新 Delta,应用默认值 |
+
+### 关键约束与设计意图
+
+1. **回调先于脚本代码执行**: `_call_callbacks()` 在 `exec(code)` 或 `wrapped_fragment()` 之前调用。这意味着回调中对 `st.session_state` 的修改,用户脚本代码能看到。
+
+2. **trigger 的双重清理**: 前端 `submitForm()` 立即删 + 后端 `_reset_triggers()` 前后各一次,三重保险确保 trigger 值的"一次性"语义。
+
+3. **clear_on_submit 的写入位置**: 重置值写入 `form.widgetStates` 而非全局状态,因此不会触发额外 rerun。这些值在下一次用户输入时作为新的初始值参与收集。
+
+4. **fragment 的执行范围**: `fragment_ids_this_run` 非空时只执行对应的 `wrapped_fragment()`,全脚本中的其余代码被完全跳过。但 `on_script_will_rerun`、`on_script_finished` 等生命周期钩子仍完整执行。
+
+5. **fragment 存在性预检**: `AppSession.request_rerun()` 中提前检查 `fragment_storage.contains(fragment_id)`,避免全量 rerun 已清理 fragment 后产生孤儿 ScriptRunner 导致事件不完整。
+
+---
+
 ## 四、校验反馈:表单状态的可视化反馈
 
 ### 4.1 缺失提交按钮警告
@@ -550,9 +893,18 @@ private syncFormsWithPendingChanges(): void {
 | Widget 状态管理器 | [WidgetStateManager.ts](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/frontend/lib/src/WidgetStateManager.ts) | `submitForm()` 第346行 |
 | 表单值写入分流 | [WidgetStateManager.ts](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/frontend/lib/src/WidgetStateManager.ts) | `createWidgetState()` 第873行 |
 | 批处理调度 | [WidgetStateManager.ts](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/frontend/lib/src/WidgetStateManager.ts) | `scheduleFlush()` 第1071行 |
+| Enter 键提交校验 | [WidgetStateManager.ts](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/frontend/lib/src/WidgetStateManager.ts) | `allowFormEnterToSubmit()` 第932行 |
+| 后端 rerun 分发 | [app_session.py](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/lib/streamlit/runtime/app_session.py) | `request_rerun()` 第420行 |
+| 后端脚本主循环 | [script_runner.py](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/lib/streamlit/runtime/scriptrunner/script_runner.py) | `_run_script()` 第528行 |
+| 状态同步+回调触发 | [session_state.py](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/lib/streamlit/runtime/state/session_state.py) | `on_script_will_rerun()` 第641行 |
+| 回调调度(两条路径) | [session_state.py](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/lib/streamlit/runtime/state/session_state.py) | `_call_callbacks()` 第653行 |
+| Widget 注册读取值 | [session_state.py](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/lib/streamlit/runtime/state/session_state.py) | `register_widget()` 第998行 |
+| Trigger 重置 | [session_state.py](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/lib/streamlit/runtime/state/session_state.py) | `_reset_triggers()` 第880行 |
+| 脚本结束清理 | [session_state.py](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/lib/streamlit/runtime/state/session_state.py) | `on_script_finished()` 第866行 |
+| Fragment 定义/存储 | [fragment.py](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/lib/streamlit/runtime/fragment.py) | `_fragment()` 第332行、`MemoryFragmentStorage` 第180行 |
 | Form 组件 | [Form.tsx](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/frontend/lib/src/components/widgets/Form/Form.tsx) | 主组件第57行 |
 | 提交按钮组件 | [FormSubmitButton.tsx](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/frontend/lib/src/components/widgets/Form/FormSubmitButton.tsx) | 主组件第41行 |
 | 表单清除助手 | [FormClearHelper.ts](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/frontend/lib/src/components/widgets/Form/FormClearHelper.ts) | `useFormClearHelper()` 第92行 |
 | Widget 基础 Hook | [useBasicWidgetState.ts](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/frontend/lib/src/hooks/useBasicWidgetState.ts) | `useBasicWidgetState()` 第255行 |
-| Enter 键提交 | [useSubmitFormViaEnterKey.ts](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/frontend/lib/src/hooks/useSubmitFormViaEnterKey.ts) | 默认导出第39行 |
+| Enter 键提交 Hook | [useSubmitFormViaEnterKey.ts](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/frontend/lib/src/hooks/useSubmitFormViaEnterKey.ts) | 默认导出第39行 |
 | Forms 上下文 | [FormsContext.tsx](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/frontend/lib/src/components/core/FormsContext.tsx) | 第41行 |
