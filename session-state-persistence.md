@@ -942,37 +942,60 @@ this.sendBackMsg(
 
 ```
 WebSocket 断开
-    ↓ sessionInfo.disconnect() → _last = { sessionId: "abc", isConnected: false }
+    ↓ sessionInfo.disconnect() →
+    │   setCurrent({...旧_current, isConnected: false})
+    │     _current = { sessionId: "abc-123", isConnected: false, ... }
+    │     _last    = { sessionId: "abc-123", isConnected: true, ... }  ← 原_current的完整拷贝
     ↓
     ⏳ 网络恢复
     ↓
-WebsocketConnection 重新建立连接
-    ↓ Sec-WebSocket-Protocol: "streamlit, token, abc"  ← 传递旧 sessionId
-    ↓ 服务端恢复 AppSession → 返回 NewSession 消息
+T0: WebsocketConnection 重新建立连接
+    ↓ 先调用 getLastSessionId() → _last.sessionId = "abc-123"
+    ↓ Sec-WebSocket-Protocol: "streamlit, token, abc-123"  ← 传递旧 sessionId
+    ↓ 服务端 connect_session(existing_session_id="abc-123")
+    ↓   SessionStorage.get("abc-123") → 找到 SessionInfo(AppSession)
+    ↓   恢复 AppSession（含完整 SessionState）
+    ↓   但 connect_session 本身不触发脚本运行！只返回 session.id
+
+T1: WebSocket onopen → 进入 CONNECTED 状态 ★（先于 NewSession！）
+    ↓ stepFsm("CONNECTION_SUCCEEDED") → setFsmState(CONNECTED)
+    ↓ args.onConnectionStateChange(CONNECTED)
+        ↓
+    handleConnectionStateChanged(CONNECTED)
+        ↓ 此时 sessionInfo 的状态：
+        │   _current.isConnected = false  （还未收到 NewSession）
+        │   _last.isConnected = true      （仍保留原状态）
+        ↓
+    判断条件 → 需补发 rerun（运行被中断 / 有 last session 等）
+        ↓
+    widgetMgr.sendUpdateWidgetsMessage(undefined)
+        ↓ 发送 BackMsg.rerunScript（widgetStates=前端全部当前值）
+
+T2: 服务端收到 BackMsg.rerun_script
+    ↓ AppSession.handle_backmsg() → request_rerun(client_state)
+    ↓ client_state 包含：前端 widgetStates、queryString、contextInfo 等
+    ↓ 创建/复用 ScriptRunner → 开始执行脚本
+    ↓ ScriptRunner._run_script() → SCRIPT_STARTED 事件
+    ↓ AppSession._on_scriptrunner_event 处理 SCRIPT_STARTED
+    ↓   _create_new_session_message()
+    ↓   _enqueue_forward_msg(new_session_msg)
+
+T3: 前端收到 ForwardMsg.new_session ★（后于 CONNECTED！）
+    ↓ dispatchProto → handleNewSession(newSessionMsg)
+    ↓   if (!sessionInfo.isSet || !sessionInfo.current.isConnected):
+    │       → true（_current.isConnected 还是 false）
+    │       → handleInitialization()
+    │       → sessionInfo.setCurrent(新会话 props)
+    │       →   _last = 旧_current(abc, isConnected=false) 拷贝
+    │       →   _current = 新会话(abc 或新id, isConnected=true)
     ↓
-前端收到 NewSession → handleNewSession()
-    ↓ sessionInfo.setCurrent() → _current = 新会话, _last = 旧会话
-    ↓
-ConnectionManager 状态变为 CONNECTED
-    ↓ handleConnectionStateChanged(CONNECTED)
-    ↓ 判断条件 → 需要补发 rerun
-    ↓ widgetMgr.sendUpdateWidgetsMessage(undefined)
-    ↓ sendRerunBackMsg(widgetStates=createWidgetStatesMsg())
-    ↓
-BackMsg { rerunScript: { widgetStates: {...}, queryString: "...", ... } }
-    ↓
-服务端 AppSession.handle_backmsg()
-    ↓ _handle_rerun_script_request()
-    ↓ request_rerun(client_state)  ← client_state 包含前端所有 widget 状态
-    ↓
-ScriptRunner._run_script_loop()
-    ↓ on_script_will_rerun(latest_widget_states)  ← 恢复点！
+后续脚本运行 → 一切恢复正常
 ```
 
-**关键理解**：
-- 前端重连后自动补发 rerun 的决策逻辑在 `handleConnectionStateChanged` 中
-- 补发的 rerun 消息携带**前端当前所有 widget 状态**，确保服务端状态与前端一致
-- 如果不需要 rerun（如只是短暂断开且脚本已完成），前端只关闭错误弹窗
+**关键修正**：
+1. **断开时两份记录的标记**：`_current.isConnected=false`（新设置的断开标志），`_last.isConnected=true`（原 `_current` 的完整拷贝）
+2. **时序顺序**：CONNECTED（T1）→ 补发 rerun（T1）→ 服务端执行脚本 → NewSession 消息（T2→T3）
+3. **补发 rerun 时 sessionInfo 尚未切换**：`_current.isConnected` 仍是 false，`setCurrent()` 在收到 NewSession 后才执行
 
 ---
 
@@ -1056,63 +1079,240 @@ if client_state:
 
 ##### Widget 状态的正确服务端来源
 
-用户交互状态的权威来源**不是** `_client_state.widget_states`，而是 **`SessionState` 本身**：
+用户交互状态的权威来源**不是** `_client_state.widget_states`，而是 **`SessionState` 三层状态结构**。下面详细拆解 `_compact_state` 如何将两份"新状态"（`_new_session_state` 和 `_new_widget_state`）合并为一份"旧状态"（`_old_state`）。
+
+###### SessionState 三层状态结构总览
 
 ```
-用户交互（拖动滑块等）
-    ↓ 前端 BackMsg.rerun_script { widget_states: {...} }
-    ↓ ScriptRunner._run_script_loop()
-    ↓ on_script_will_rerun(latest_widget_states)
-    ↓   set_widgets_from_proto(latest_widget_states)
-    ↓       _new_widget_state[widget_id] = Serialized(protobuf)
-    ↓
-脚本执行中，用户代码访问 st.session_state
-    ↓ SessionState.__getitem__
-    ↓   _new_widget_state → WStates.__getitem__
-    ↓     懒加载反序列化 Protobuf → Python 对象
-    ↓
-本次脚本运行完成 → 下次 on_script_will_rerun()
-    ↓ _compact_state()
-    ↓   遍历 self.keys() → self[key] → self._old_state[key] = value
-    ↓     _old_state: {widget_id: python_value, ...}  ← 持久化！
+SessionState = {
+  _old_state: dict[str, Any]               ← 历史持久化层（所有前序运行的合并结果）
+      键: user_key 或 widget_id (str)
+      值: Python 对象 (已反序列化)
+
+  _new_session_state: dict[str, Any]        ← 用户代码写入层（本次运行 st.session_state.xxx = yyy）
+      键: user_key (str)
+      值: Python 对象 (用户赋值)
+
+  _new_widget_state: WStates                ← 前端上报层（本次运行前 set_widgets_from_proto 设置）
+      键: widget_id (str)
+      值: Value(Python对象) 或 Serialized(Protobuf) 两种之一
+}
 ```
 
-**热更新时 Widget 状态的恢复路径**：
+**三种状态来源的写入时机**：
 
-```
-_on_source_file_changed() → request_rerun(self._client_state)
-    ↓
-request_rerun() 构造 RerunData:
-    query_string      = client_state.query_string       ← SHUTDOWN 时保存的 URL 参数
-    widget_states     = client_state.widget_states      ← 空！（SHUTDOWN 时没填）
-    page_script_hash  = client_state.page_script_hash   ← SHUTDOWN 时保存的页面
-    context_info      = client_state.context_info       ← SHUTDOWN 时保存的上下文
-    ↓
-ScriptRunner._run_script_loop()
-    ↓
-on_script_will_rerun(rerun_data.widget_states)  ← 参数是空 WidgetStates！
-    ├─ _compact_state()
-    │   └─ 遍历 _old_state（包含上一次压缩的所有 widget 值）
-    │       → _old_state[slider_1] = 8  ✅ 正确值
-    │       → _old_state[counter] = 4   ✅ 正确值
-    │   清空 _new_session_state 和 _new_widget_state
-    │
-    ├─ set_widgets_from_proto(latest_widget_states)  ← 空！所以啥都不做
-    │   （latest_widget_states 是热更新传入的，为空集合）
-    │
-    └─ _call_callbacks()  ← 没有 widget 值变化，无回调
-    ↓
-用户脚本执行 → register_widget(slider_1, ...)
-    ↓ widget_id in _old_state? → YES，值为 8
-    ↓ 脚本使用值 8 继续执行 ✅ 状态正确保留
+| 状态层 | 写入者 | 写入时机 | 典型场景 |
+|-------|-------|---------|---------|
+| `_new_widget_state` | `set_widgets_from_proto()` | 每次 `on_script_will_rerun()` 时 | 前端 widget 交互后发来的新值 |
+| `_new_session_state` | `SessionState.__setitem__()` | 用户代码执行中 | `st.session_state.counter = 5` 或 `st.slider(..., value=x)` 同步 |
+| `_old_state` | `_compact_state()` | 每次 `on_script_will_rerun()` 开始时 | 合并上一轮的两个新层 |
+
+###### _compact_state 合并算法详解
+
+[session_state.py#L448-L461](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/runtime/state/session_state.py#L448-L461)
+
+```python
+def _compact_state(self) -> None:
+    for key_or_wid in self:      # ★ 遍历所有三层的所有 key
+        try:
+            self._old_state[key_or_wid] = self[key_or_wid]  # ★ 查找链取最新值
+        except KeyError:
+            pass
+    self._new_session_state.clear()   # 清空，为新运行做准备
+    self._new_widget_state.clear()    # 清空，为新运行做准备
 ```
 
-**结论**：热更新不会错误地"复用浏览器先前上报的所有控件值"，因为：
+**关键：`for key_or_wid in self` 迭代哪些 key？**
 
-1. **Widget 状态不从 `_client_state.widget_states` 取**（该字段在 SHUTDOWN 时被刻意留空）
-2. **Widget 状态从 `SessionState._old_state` 取**（服务端内存中的持久化层）
-3. **热更新触发的 rerun 传入空的 `widget_states`**，不会覆盖或污染服务端状态
-4. **`_client_state` 只复用 URL 参数、页面哈希和上下文信息**——这些是纯"导航/环境"类数据，不是用户交互状态
+[session_state.py#L498-L509](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/runtime/state/session_state.py#L498-L509)
+
+```python
+def _keys(self) -> set[str]:
+    # _old_state 的 key → 全部转为 widget_id（如有映射）
+    old_keys = {self._get_widget_id(k) for k in self._old_state}
+
+    # _new_widget_state 的 key（本身就是 widget_id）
+    new_widget_keys = set(self._new_widget_state.keys())
+
+    # _new_session_state 的 key（user_key）→ 转为 widget_id（如有映射）
+    new_session_state_keys = {
+        self._get_widget_id(k) for k in self._new_session_state
+    }
+
+    return old_keys | new_widget_keys | new_session_state_keys  # ★ 三层合并去重
+```
+
+**关键：`self[key_or_wid]` 的查找优先级**
+
+[session_state.py#L548-L592](file:///d:/fz/0601/solo-dogfeeding/code/214-streamlit/lib/streamlit/runtime/state/session_state.py#L548-L592)
+
+```python
+def _getitem(self, widget_id, user_key):
+    # 优先级1: 本次用户代码写入（_new_session_state）
+    if user_key is not None:
+        try: return self._new_session_state[user_key]  # 最新！
+        except KeyError: pass
+
+    # 优先级2: 本次前端上报（_new_widget_state，懒加载反序列化）
+    if widget_id is not None:
+        try: return self._new_widget_state[widget_id]  # 次新！
+        except KeyError: pass
+
+    # 优先级3: 历史持久化层的 widget_id 条目
+    if widget_id is not None:
+        try: return self._old_state[widget_id]
+        except KeyError: pass
+
+    # 优先级4: 历史持久化层的 user_key 条目
+    if user_key is not None:
+        try: return self._old_state[user_key]
+        except KeyError: pass
+
+    raise KeyError
+```
+
+**查找优先级总结**：`_new_session_state` > `_new_widget_state` > `_old_state`（保证用户显式写入 > 前端交互 > 历史值）
+
+###### 合并场景示例
+
+假设场景：
+- 第 N-1 次运行结束后：`_old_state = {"counter": 3, "$slider-12345": 50}`
+- 用户拖动滑块到 80 → 第 N 次 `on_script_will_rerun()` 时：
+  - `set_widgets_from_proto` 设置：`_new_widget_state = {"$slider-12345": Serialized(protobuf=80)}`
+  - 用户代码执行：`st.session_state.counter = 4` → `_new_session_state = {"counter": 4}`
+
+**第 N 次 `_compact_state()` 合并过程**：
+
+1. **收集所有 key**：`_old_state.keys()` ∪ `_new_widget_state.keys()` ∪ `_new_session_state.keys()`
+   → `{"$slider-12345", "counter"}` （user_key `"counter"` 通过 `_get_widget_id` 查找如无映射则保留原名）
+
+2. **逐 key 取最新值**：
+
+| key | 查找过程 | 结果 | 写入 _old_state |
+|-----|---------|------|----------------|
+| `"counter"` | ① `_new_session_state["counter"]` → **找到 4** ✅ | `4` | `_old_state["counter"] = 4`（覆盖旧的 3） |
+| `"$slider-12345"` | ① `_new_session_state` → 无<br>② `_new_widget_state["$slider-12345"]` → 懒加载反序列化 **得到 80** ✅ | `80` | `_old_state["$slider-12345"] = 80`（覆盖旧的 50） |
+
+3. **清空两个新层**：
+   ```python
+   _new_session_state.clear()  # {}
+   _new_widget_state.clear()   # {}
+   ```
+
+4. **结果**：`_old_state = {"counter": 4, "$slider-12345": 80}` ✅ 最新状态
+
+**热更新场景（无 new_widget_state，无 new_session_state）**：
+
+热更新时 `on_script_will_rerun(空 widget_states)` → `set_widgets_from_proto(空)` 不设置 `_new_widget_state` → 用户代码还没执行 `_new_session_state` 也空。
+
+1. **收集所有 key**：只有 `_old_state` 的 key 被收集
+   → `{"$slider-12345", "counter"}`
+
+2. **逐 key 取最新值**：
+
+| key | 查找过程 | 结果 | 写入 _old_state |
+|-----|---------|------|----------------|
+| `"counter"` | ① `_new_session_state` → 空<br>② `_new_widget_state` → 无 widget_id<br>③ `_old_state["counter"]` → **找到 4** ✅ | `4` | `_old_state["counter"] = 4`（写回相同值，等于 no-op） |
+| `"$slider-12345"` | ① `_new_session_state` → 无<br>② `_new_widget_state` → 空<br>③ `_old_state["$slider-12345"]` → **找到 80** ✅ | `80` | `_old_state["$slider-12345"] = 80`（写回相同值） |
+
+3. **结果**：`_old_state` 内容不变 → 交互状态正确保留 ✅
+
+**Widget 懒加载反序列化**：
+- `_new_widget_state["$slider-12345"]` 在存储时是 `Serialized(protobuf)` 格式
+- 通过 `WStates.__getitem__` 首次访问时才反序列化为 `Value(python_obj=80)`，然后回写到 `self.states[k] = Value(deserialized)`
+- 被反序列化后的值再写入 `_old_state`，确保 `_old_state` 始终存 Python 对象（非 protobuf 字节）
+
+###### Widget 状态生命周期流转全景图
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                     第 N-1 次运行结束（状态）                          │
+│   _old_state     = { counter: 3, $slider-12345: 50 }  Python 对象    │
+│   _new_session_state = {}  (已被 compact 清空)                       │
+│   _new_widget_state  = {}  (已被 compact 清空)                       │
+└──────────────────────────────────────────────────────────────────────┘
+                            ↓ 前端 BackMsg.rerun_script(widget_states={slider:80})
+
+┌──────────────────────────────────────────────────────────────────────┐
+│  on_script_will_rerun(latest_widget_states)  第 N 次运行前           │
+│                                                               │
+│  ① _compact_state() ──┐                                      │
+│     (将 N-1 轮可能遗留│                                      │
+│      的新值入 old_state)                                    │
+│                        │                                      │
+│  ② set_widgets_from_proto(latest_widget_states) ←─────────┘    │
+│     → _new_widget_state = { $slider-12345: Serialized(80) }  │
+│                                                               │
+│  ③ _call_callbacks()  回调处理                                │
+└──────────────────────────────────────────────────────────────────────┘
+                            ↓ 用户代码执行
+
+┌──────────────────────────────────────────────────────────────────────┐
+│                     用户脚本执行（第 N 次）                            │
+│                                                               │
+│  st.slider(..., key="slider_1")                               │
+│    → register_widget → 建立 "slider_1" ↔ $slider-12345 映射  │
+│    → self["$slider-12345"]                                    │
+│      → _new_widget_state 命中 → 懒加载反序列化 → 80          │
+│    → 返回值 80                                                │
+│                                                               │
+│  st.session_state.counter = 4                                 │
+│    → __setitem__ → _new_session_state["counter"] = 4         │
+│                                                               │
+│  运行结束时状态：                                              │
+│    _old_state     = { counter: 3, $slider-12345: 50 }  (未变)│
+│    _new_session_state = { counter: 4 }                       │
+│    _new_widget_state  = { $slider-12345: Value(80) } (已反序列化)│
+└──────────────────────────────────────────────────────────────────────┘
+                            ↓ 下次 on_script_will_rerun（或热更新触发）
+
+┌──────────────────────────────────────────────────────────────────────┐
+│                  _compact_state() 合并三个层                         │
+│                                                               │
+│  keys = _old_state.keys()                                      │
+│       ∪ _new_widget_state.keys()                               │
+│       ∪ _new_session_state.keys() 映射后                       │
+│       = { counter, $slider-12345 }                             │
+│                                                               │
+│  for key in keys:                                              │
+│    _old_state[key] = self[key]  (按优先级取)                   │
+│                                                               │
+│  写回后：                                                      │
+│    _old_state = { counter: 4, $slider-12345: 80 } ← 最新！    │
+│    _new_session_state.clear() → {}                             │
+│    _new_widget_state.clear() → {}                              │
+└──────────────────────────────────────────────────────────────────────┘
+                            ↓ 热更新（源码变化触发）
+
+┌──────────────────────────────────────────────────────────────────────┐
+│                     热更新（_on_source_file_changed）                  │
+│                                                               │
+│  request_rerun(self._client_state)                             │
+│    → widget_states = 空！(SHUTDOWN 时不传)                     │
+│                                                               │
+│  → on_script_will_rerun(空 widget_states)                     │
+│                                                               │
+│  ① _compact_state():                                          │
+│     keys = _old_state.keys()  (只有 old_state 的 key)         │
+│     → _old_state[key] = _old_state[key] → 写回相同值          │
+│     状态完全不变！                                             │
+│                                                               │
+│  ② set_widgets_from_proto(空) → 不改变任何状态                │
+│                                                               │
+│  ③ 用户脚本执行 → register_widget → 从 _old_state 取值       │
+│     → counter 还是 4, slider_1 还是 80 ✅ 正确保留            │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+###### 交互状态的权威来源总结
+
+| 数据维度 | 存储位置 | 合并机制 | 热更新时行为 |
+|---------|---------|---------|------------|
+| **用户代码写入值**（`st.session_state.xxx = v`） | `_new_session_state` → 经 `_compact_state()` → `_old_state` | 查找优先级最高，始终覆盖其他来源 | 从 `_old_state` 直接恢复 |
+| **前端交互值**（用户拖动 widget） | `_new_widget_state` → 经 `_compact_state()` → `_old_state` | 懒加载反序列化后写入，优先级次高 | 从 `_old_state` 直接恢复 |
+| **历史持久值**（所有前序运行结果） | `_old_state` | 优先级最低，被新值覆盖 | 自身就是来源 |
+
+**核心结论**：交互状态不是单一存储在 `_old_state`，而是由三层共同构成。每次运行通过**查找优先级链**（用户写入 > 前端交互 > 历史值）取最新值，`_compact_state()` 将三层拍平为一层。热更新时两层"新状态"为空，但 `_old_state` 仍完整保留，所以交互状态不会丢失。
 
 ##### query_string（页面缓存）与交互状态的边界
 
