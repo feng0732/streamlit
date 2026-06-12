@@ -1,385 +1,469 @@
 # Streamlit 多页应用核心标识与路由机制
 
-本文聚焦解答三个核心疑问：
+本文围绕三个核心问题展开：
 
-1. **默认页为什么对外显示为空 URL 路径？这个空路径从哪来？**
-2. **页面内部标识 `page_script_hash` 和应用级 `main_script_hash` 分别基于什么计算？二者为什么不能混淆？**
-3. **直接访问不存在的路径为什么必然返回默认页？回退判定在代码里的具体位置？**
-
----
-
-## 一、三层标识全景：先搞清楚每一层的输入源
-
-| 层级 | 标识名 | 面向谁 | 计算输入 | 代码位置 | 示例值 |
-|------|--------|--------|----------|---------|--------|
-| ① 对外层 | **`url_path`（url_pathname）** | 浏览器用户 / 地址栏 | 页面标题 / 文件名 / 用户传参（默认页强制 `""`） | `StreamlitPage.url_path` property | `""`、`"dashboard"`、`"user_settings"` |
-| ② 页面内部层 | **`page_script_hash`** | 前后端通信 / 页面注册表 key | **`calc_hash(url_path)`** | `StreamlitPage._script_hash` property，实际调用 `calc_hash()` | 32 位十六进制（BLAKE2b，16 字节） |
-| ③ 应用层 | **`main_script_hash`** | 主脚本 / 公共元素标记 | **`calc_hash(入口文件绝对路径)`** | `PagesManager.__init__`，一次性计算 | 32 位十六进制（BLAKE2b，16 字节） |
-
-> **核心原则**：
-> - 对外层 ① 和 内部层 ② 是**强绑定关系**，一对一由哈希函数映射；
-> - 应用层 ③ 与前两者**完全无关**，它是对「入口文件路径」哈希，不是对 URL 路径哈希。
-> - 三者都使用同一个 `calc_hash()` 函数，但输入源完全不同。
-
-### 1.1 统一哈希函数 `calc_hash()`
-
-```python
-def calc_hash(s: bytes | str) -> str:
-    """BLAKE2b 快速哈希，输出 32 位十六进制（16 字节）。"""
-    b = s.encode("utf-8") if isinstance(s, str) else s
-    h = hashlib.blake2b(digest_size=16, usedforsecurity=False)
-    h.update(b)
-    return h.hexdigest()
-```
-
-**关键特性**：
-- 输入相同 → 输出必然相同；输入不同 → 输出概率上不同
-- 字符串走 UTF-8 编码再哈希
-- 非安全用途，所以 `usedforsecurity=False`，性能优先
+1. **默认页的内部 hash 到底按什么值算？按对外空路径，还是按页面自己保存的路径？**
+2. **`page_script_hash` 和 `main_script_hash` 分别基于什么计算、承担什么职责？**
+3. **直接访问不存在的路径、或者匹配到的是外部 URL 页，会走哪条链路最终回到默认页？PageNotFound 提示触发的精确条件是什么？**
 
 ---
 
-## 二、对外层：为什么默认页的 `url_path` 必须是空字符串
+## 一、默认页的"两条路径"：一个容易忽略的关键裂隙
 
-### 2.1 代码证据：`StreamlitPage.url_path` property
+### 1.1 两个不同的属性
+
+`StreamlitPage` 内部有两个看起来像、但实际取值不同的属性：
+
+| 属性 | 类型 | 对默认页的取值 | 对非默认页的取值 |
+|------|------|---------------|-----------------|
+| `_url_path` | 普通字段（`str`） | 保存**原始推导值**，如 `"home"` | 保存原始推导值或用户指定值 |
+| `url_path` | `@property` | `""`（被 `_default=True` 强制覆盖） | 等于 `_url_path` |
+
+**代码证据**：
 
 ```python
-# StreamlitPage 类内部
+# 字段赋值——不区分默认页
+self._url_path = inferred_name        # 从文件名/函数名推导
+if url_path is not None:
+    self._url_path = stripped_url_path  # 或用户指定的 url_path 参数
+
+# property——默认页强制返回空串
 @property
 def url_path(self) -> str:
-    """对外暴露的 URL 路径名。默认页恒返回 ""。"""
     return "" if self._default else self._url_path
 ```
 
-这里是三层判断：
+> **关键**：`_url_path` 字段在 `__init__` 里赋完值就不再改了。`st.navigation()` 把某个页面的 `_default` 改为 `True` 时，**不会**同步修改 `_url_path`。因此默认页始终同时持有一个非空内部路径和一个空的对外路径。
 
-| 判断条件 | 结果 | 说明 |
-|----------|------|------|
-| `self._default == True` | 返回 `""` | **强制覆盖**，不管内部 `_url_path` 原本存的是什么 |
-| `self._default == False` | 返回 `self._url_path` | 使用初始化时推导或用户指定的路径 |
-
-### 2.2 `_default` 标记是怎么来的
-
-`_default` 的来源有两条路径：
-
-**路径 A：用户显式声明**
-```python
-home_page = st.Page("views/home.py", title="Home", default=True)
-# ↑ home_page._default = True
-```
-
-**路径 B：`st.navigation()` 内部自动回退（最常见）**
+### 1.2 _script_hash 用的是哪条路径？
 
 ```python
-# 第 1 轮：遍历找用户已显式声明 default=True 的页面
-for page in all_pages:
-    if page._default:
-        if default_page is not None:
-            raise StreamlitAPIException("Multiple Pages specified with default=True")
-        default_page = page
-
-# 第 2 轮：没有用户声明 → 取第一个非外部页面，强制 _default=True
-if default_page is None:
-    non_external_pages = [p for p in page_list if not p.is_external]
-    default_page = non_external_pages[0]
-    default_page._default = True   # ← 就地修改对象属性
-```
-
-> **为什么大多数开发者「没写 default=True 也有默认页」？**
-> 因为路径 B 是兜底逻辑，90% 的应用不显式声明 `default=True`，在 `st.navigation()` 里直接被「第一个非外部页面」拿走了默认位，它的 `url_path` property 随即开始返回 `""`。
-
-### 2.3 `default=True` 时 `url_path=` 参数被忽略的证据
-
-文档字符串（`Page()` 函数 docstring）明确写着：
-
-> `url_path` can't include forward slashes; paths can't include subdirectories.
-> The default page will have a pathname of `""`, indicating the root URL of the app.
-> **If you set `default=True`, `url_path` is ignored.**
-> If `default` is `True`, then the page will have an empty pathname and **`url_path` will be ignored**.
-
-初始化逻辑也有对应校验：
-```python
-if stripped_url_path.strip() == "" and not default:
-    raise StreamlitAPIException(
-        "The URL path cannot be an empty string unless the page is the default page."
-    )
-```
-
-即：**空串 `""` 只有默认页能持有**，非默认页如果想设空路径会报错。这从 API 层面就保证了 `url_path=""` 唯一标识默认页。
-
----
-
-## 三、内部层：`page_script_hash` 如何由对外路径映射而来
-
-### 3.1 计算链：`url_path → calc_hash() → page_script_hash`
-
-```python
-# StreamlitPage 类内部（注意这是 property，不是普通属性）
 @property
 def _script_hash(self) -> str:
-    return calc_hash(self.url_path)    # ← 注意调用的是 url_path property！
+    return calc_hash(self._url_path)    # ← 用的是内部字段 _url_path
 ```
 
-**关键点**：这里调用的是 **`self.url_path`（property）**，不是 `self._url_path`（内部字段）。
+**结论：默认页的内部 hash 是按 `_url_path`（原始推导值）计算的，不是按对外空路径 `""` 计算的。**
 
-这意味着什么？
+这和 `url_path` property 返回的空串形成了**裂隙**：
 
-| 页面 | 内部字段 `_url_path` | `_default` | `self.url_path`（property） | `_script_hash` |
-|------|---------------------|------------|------------------------------|----------------|
-| 默认页 | `"home"`（从文件名推导） | `True` | `""`  ← 被覆盖 | `calc_hash("")` |
-| Dashboard 页 | `"sales_dashboard"` | `False` | `"sales_dashboard"` | `calc_hash("sales_dashboard")` |
-| Settings 页 | `"settings"` | `False` | `"settings"` | `calc_hash("settings")` |
+| 页面 | `_url_path`（内部字段） | `url_path`（property） | `_script_hash` |
+|------|------------------------|----------------------|----------------|
+| 默认页 `home.py` | `"home"` | `""` | `calc_hash("home")` |
+| Dashboard 页 `dashboard.py` | `"dashboard"` | `"dashboard"` | `calc_hash("dashboard")` |
+| Settings 页（用户指定） | `"settings"` | `"settings"` | `calc_hash("settings")` |
 
-> ⚠️ **最容易混淆的点**：默认页在内部字段 `_url_path` 里可能存着 `"home"`（从 `home.py` 推导来的），但真正参与哈希计算的是 `self.url_path` property 返回的 `""`。**对外展示给用户看的是什么字符串，内部就对什么字符串哈希**。
+> ⚠️ 只有非默认页的 `url_path` 和 `_url_path` 是一致的，所以只有非默认页满足 `_script_hash = calc_hash(url_path)`。默认页**不满足**这个等式。
 
-### 3.2 注册表构建：`pagehash_to_pageinfo`
+### 1.3 为什么这个裂隙不导致 bug？
 
-在 `st.navigation()` 内部，用 `_script_hash` 作为 key 构建字典：
+虽然默认页的 `_script_hash = calc_hash("home")` 不等于 `calc_hash("")`，但系统各处的使用方式是**自洽**的：
 
-```python
-pagehash_to_pageinfo: dict[PageHash, PageInfo] = {}
+| 使用位置 | 用了哪个值 | 为什么不出错 |
+|----------|-----------|-------------|
+| `pagehash_to_pageinfo` 字典的 key | `page._script_hash` = `calc_hash(_url_path)` | 注册和查找都用同一个 key |
+| `pagehash_to_pageinfo["url_pathname"]` | `page.url_path` = `""` | 用于字符串匹配，和前端提取的 pageName 对齐 |
+| Navigation proto `app_pages[i].pageScriptHash` | `page._script_hash` = `calc_hash(_url_path)` | 前端拿到后用于精确查找 |
+| Navigation proto `app_pages[i].urlPathname` | `page.url_path` = `""` | 前端用于地址栏展示 |
+| `fallback_page_hash` | `default_page._script_hash` = `calc_hash(_url_path)` | 在 `_pages` 字典中能找到默认页 |
+| `_resolve_page_script` 字符串匹配 | `p["url_pathname"] == intended_page_name` | 用 `url_pathname=""` 匹配根路径 |
 
-for page in nav_sections.flat_values():
-    script_hash = page._script_hash     # = calc_hash(page.url_path)
-    if script_hash in pagehash_to_pageinfo:
-        raise StreamlitAPIException(
-            f"Multiple Pages specified with URL pathname {page.url_path}. "
-            "URL pathnames must be unique."
-        )
-    pagehash_to_pageinfo[script_hash] = {
-        "page_script_hash": script_hash,
-        "page_name": page.title,
-        "icon": page.icon,
-        "script_path": str(page._page) if isinstance(page._page, Path) else "",
-        "url_pathname": page.url_path,   # ← 存的就是对外路径 "" 或 "xxx"
-    }
-```
-
-**冲突检测原理**：如果两个页面算出来 `script_hash` 相同，意味着它们的 `url_path` 相同 → 报「URL pathnames must be unique」错误。哈希在这里其实是「路径唯一」的替身检查。
+**自洽原则**：注册表 key 和查找 key 都来自 `_script_hash`（基于 `_url_path`），展示和字符串匹配都来自 `url_path` property（基于对外空串）。两条线各走各的，不会交叉。
 
 ---
 
-## 四、应用层：`main_script_hash` 为什么和页面没关系
+## 二、三层标识：对外路径、页面标识、应用标识
 
-### 4.1 计算来源
+### 2.1 总览
 
-```python
-# PagesManager.__init__
-def __init__(self, main_script_path: ScriptPath, ...):
-    self._main_script_path = main_script_path
-    self._main_script_hash: PageHash = calc_hash(main_script_path)  # ← 入口文件路径！
-    ...
-```
+| 层级 | 标识名 | 面向谁 | 计算输入 | 代码位置 |
+|------|--------|--------|----------|---------|
+| ① 对外层 | **`url_path` / `url_pathname`** | 浏览器地址栏 / 前端 URL 展示 | 页面名称推导或用户指定（默认页 property 返回 `""`） | `StreamlitPage.url_path` property |
+| ② 页面层 | **`page_script_hash`** | 前后端通信的页面唯一 key | **`calc_hash(_url_path)`** — 内部字段，不是 property | `StreamlitPage._script_hash` property |
+| ③ 应用层 | **`main_script_hash`** | 入口脚本的元素归属标记 | **`calc_hash(入口脚本路径)`** — 与页面完全无关 | `PagesManager.__init__` |
 
-**输入是「入口 Python 文件的路径」**，比如 `D:\myapp\streamlit_app.py`。和任何页面的 `url_path` 都没关系，和 `page_script_hash` 更不会冲突（输入集合完全不同，概率上不碰撞）。
-
-### 4.2 它的用途：标记公共元素归属
+### 2.2 统一哈希函数
 
 ```python
-# ScriptRunContext.enqueue() — 每一条发往前端的 ForwardMsg 都打标签
-def enqueue(self, msg: ForwardMsg) -> None:
-    msg.metadata.active_script_hash = ThreadState.get().active_script_hash
-    ...
+def calc_hash(s: bytes | str) -> str:
+    b = s.encode("utf-8") if isinstance(s, str) else s
+    h = hashlib.blake2b(digest_size=16, usedforsecurity=False)
+    h.update(b)
+    return h.hexdigest()    # 32 位十六进制
 ```
 
-- **入口文件执行期间**：`active_script_hash = main_script_hash`
-  → 入口文件里创建的 `st.title()`、`st.sidebar.selectbox(...)` 等元素，都被标记为 `main_script_hash`
-- **`pg.run()` 页面执行期间**：`active_script_hash = page._script_hash`
-  → 页面文件里创建的元素，被标记为对应的 `page_script_hash`
+三层标识共用同一个哈希函数，但**输入源完全不同**：
 
-**切页时前端清理逻辑**：
-```typescript
-clearPageElements(elements, mainScriptHash) {
-  return elements.filterMainScriptElements(mainScriptHash)
-  // → 保留所有 active_script_hash === mainScriptHash 的元素
-  // → 清除其他（即属于具体页面的）元素
+| 标识 | 输入到 calc_hash 的字符串 | 输入来源 |
+|------|--------------------------|---------|
+| `url_path`（默认页） | 不经过 calc_hash | property 直接返回 `""` |
+| `page_script_hash` | 页面内部 `_url_path` 字段值 | 如 `"home"`、`"dashboard"` |
+| `main_script_hash` | 入口脚本文件路径字符串 | 如 `"/myapp/streamlit_app.py"` |
+
+### 2.3 层级 ① 对外路径 `url_path`
+
+**职责**：决定浏览器地址栏显示什么，决定前端 `extractPageNameFromPathName` 提取的字符串能匹配到谁。
+
+**对默认页的特殊行为**：
+- `url_path` property 检测 `_default=True` → 返回 `""`
+- API 层禁止非默认页持有空串（初始化时会抛异常）
+- 因此外部观察者永远看到默认页的 URL 路径是 `""`
+
+**对非默认页**：
+- `url_path` 等于 `_url_path`，从文件名/函数名/用户参数推导
+- 经过 `_sanitize_url_path` 清理（小写、去特殊字符、合并下划线）
+
+### 2.4 层级 ② 页面标识 `page_script_hash`
+
+**职责**：作为 `pagehash_to_pageinfo` 注册表的 key，作为前后端通信中唯一标识一个页面的凭证。
+
+**计算来源**：
+```python
+@property
+def _script_hash(self) -> str:
+    return calc_hash(self._url_path)    # 内部字段，非 property
+```
+
+**在注册表中的角色**：
+```python
+# st.navigation() 构建注册表
+pagehash_to_pageinfo[page._script_hash] = {
+    "page_script_hash": page._script_hash,     # = calc_hash(_url_path)
+    "url_pathname":      page.url_path,         # = "" if default else _url_path
+    ...
 }
 ```
 
-> 所以 `main_script_hash` 本质是「公共元素保护伞」：入口文件里写的 UI 跨页保留，页面文件里写的 UI 切页就扔。这就是 Streamlit 推荐把公共导航栏、公共筛选器放在入口文件的底层原因。
+**在前端 Navigation proto 中的角色**：
+```python
+p.page_script_hash = page._script_hash   # 前端拿到后用于精确 rerun
+p.url_pathname    = page.url_path        # 前端拿到后用于地址栏和 URL 匹配
+```
 
----
+**唯一性保证**：如果两个页面的 `_script_hash` 相同（即 `_url_path` 相同），`st.navigation()` 会抛异常。对于默认页，虽然 `url_path=""`，但 `_url_path` 通常不重复，所以冲突检测仍然有效。
 
-## 五、三层标识的对应关系总结表
+### 2.5 层级 ③ 应用标识 `main_script_hash`
 
-以一个典型三页应用为例，入口文件 `streamlit_app.py`，页面分别是 `home.py`、`dashboard.py`、用户指定了 `url_path="settings"` 的第三页。
+**职责**：标记入口文件产生的 UI 元素归属，使这些元素在切页时被保留。
 
-| 项目 | 默认页（home.py） | 第二页（dashboard.py） | 第三页（url_path="settings"） | 入口文件公共元素 |
-|------|-------------------|------------------------|-------------------------------|------------------|
-| **① 对外层**<br>`url_path` / `url_pathname` | `""`（被 property 强制覆盖） | `"dashboard"`（从文件名 dashboard.py 推导） | `"settings"`（用户指定） | —— 无 URL，不参与路由 |
-| **② 内部层**<br>`page_script_hash` | `calc_hash("")` | `calc_hash("dashboard")` | `calc_hash("settings")` | —— 不参与路由 |
-| **③ 应用层**<br>`main_script_hash` | —— 不使用 | —— 不使用 | —— 不使用 | `calc_hash("streamlit_app.py"的完整路径)` |
-| 浏览器地址栏显示 | `http://app/` 或 `http://app` | `http://app/dashboard` | `http://app/settings` | —— |
-| `pg.run()` 期间 active_hash | `calc_hash("")` | `calc_hash("dashboard")` | `calc_hash("settings")` | 入口执行期间 = main_script_hash |
-| 切页时元素是否清理 | ❌ 清理（是具体页面元素） | ❌ 清理 | ❌ 清理 | ✅ 保留（是 main_script_hash） |
+**计算来源**：
+```python
+# PagesManager.__init__
+self._main_script_hash = calc_hash(main_script_path)  # 入口脚本路径
+```
 
----
+**使用位置 1 — 元素归属标记**：
 
-## 六、不存在路径为什么必然返回默认页：完整判定链
-
-### 6.1 代码核心位置：`PagesManager._resolve_page_script()`
-
-这是所有路由解析的唯一出口：
+脚本运行期间，`active_script_hash` 决定每条 ForwardMsg 属于谁：
 
 ```python
-def _resolve_page_script(self, fallback_page_hash: PageHash = "") -> PageInfo | None:
-    # 条件 1：意图哈希不为空 → 精确哈希匹配，匹配不到就拿 fallback 兜底
+# ScriptRunContext.reset() 中初始化
+ThreadState.initialize(active_script_hash=self.pages_manager.main_script_hash)
+
+# 入口文件执行期间
+#   → active_script_hash = main_script_hash
+#   → 入口文件产生的所有元素都带 main_script_hash 标签
+
+# pg.run() 执行页面代码期间
+#   → with ctx.run_with_active_hash(page._script_hash):
+#   → 页面内产生的元素带 page_script_hash 标签
+```
+
+**使用位置 2 — 前端切页清理**：
+
+```typescript
+clearPageElements(elements, mainScriptHash) {
+  return elements.filterMainScriptElements(mainScriptHash)
+  // → 保留 active_script_hash === mainScriptHash 的元素（入口文件的）
+  // → 清除其他的（具体页面的）
+}
+```
+
+**使用位置 3 — query_params 过滤**：
+
+```python
+# script_runner.py 中，跨页切换时
+valid_script_hashes = {main_script_hash, page_script_hash}
+# 只保留属于入口脚本或当前页面的 query params
+```
+
+> **`main_script_hash` 和 `page_script_hash` 的本质区别**：
+> - `main_script_hash` 是「谁的元素不该被清除」的判据
+> - `page_script_hash` 是「当前在哪个页面」的凭证
+> - 两者输入源不同、用途不同、永远不可能相等（概率意义上）
+
+---
+
+## 三、三层标识的完整对应关系表
+
+以三页应用为例：入口 `streamlit_app.py`，页面 `home.py`（默认）、`dashboard.py`、第三页指定了 `url_path="settings"`。
+
+| 项目 | 默认页（home.py） | 第二页（dashboard.py） | 第三页（url_path="settings"） | 入口文件公共 UI |
+|------|-------------------|------------------------|-------------------------------|-----------------|
+| **`_url_path`（内部字段）** | `"home"` | `"dashboard"` | `"settings"` | — |
+| **`url_path`（property）** | **`""`** ← 被覆盖 | `"dashboard"` | `"settings"` | — |
+| **`_script_hash`** | `calc_hash("home")` | `calc_hash("dashboard")` | `calc_hash("settings")` | — |
+| **浏览器地址栏** | `http://app/` | `http://app/dashboard` | `http://app/settings` | — |
+| **注册表 key** | `calc_hash("home")` | `calc_hash("dashboard")` | `calc_hash("settings")` | — |
+| **注册表 url_pathname** | `""` | `"dashboard"` | `"settings"` | — |
+| **Navigation proto pageScriptHash** | `calc_hash("home")` | `calc_hash("dashboard")` | `calc_hash("settings")` | — |
+| **Navigation proto urlPathname** | `""` | `"dashboard"` | `"settings"` | — |
+| **run_with_active_hash 用值** | `calc_hash("home")` | `calc_hash("dashboard")` | `calc_hash("settings")` | `calc_hash(入口脚本路径)` |
+| **切页时元素清理** | ❌ 清理 | ❌ 清理 | ❌ 清理 | ✅ 保留 |
+
+> **默认页的核心特征**：对用户来说是根路径 `""`，对系统内部来说 hash 来自 `"home"`。两条线在注册表的同一条 `PageInfo` 记录里汇合——key 是内部 hash，`url_pathname` 是对外空串。
+
+---
+
+## 四、路由解析：两个匹配入口如何到达同一个默认页
+
+### 4.1 `_resolve_page_script()` 的三个分支
+
+```python
+def _resolve_page_script(self, fallback_page_hash=""):
+    if self._pages is None:
+        return None
+
+    # 分支 1：有 page_script_hash → 精确匹配注册表 key
     if self.intended_page_script_hash:
         return self._pages.get(
             self.intended_page_script_hash,
-            self._pages.get(fallback_page_hash, None),  # ← 哈希匹配失败，回退
+            self._pages.get(fallback_page_hash, None),  # 匹配失败 → 用 fallback
         )
 
-    # 条件 2：意图名称不为空 → url_pathname 字符串精确匹配，匹配不到返回 None
+    # 分支 2：有 page_name → 用 url_pathname 字符串匹配
     if self.intended_page_name:
         return next(
             filter(
-                lambda p: p and (p["url_pathname"] == self.intended_page_name),
+                lambda p: p["url_pathname"] == self.intended_page_name,
                 self._pages.values(),
             ),
-            None,  # ← 注意：字符串匹配失败时返回 None，没有 inline fallback
+            None,  # 匹配失败 → 返回 None（不直接 fallback）
         )
 
-    # 条件 3：意图和名称都为空（直接访问根路径）→ 直接取 fallback
+    # 分支 3：两个都没有 → 直接取 fallback
     return self._pages.get(fallback_page_hash, None)
 ```
 
-注意**条件 2 和条件 1 的不对称性**：
-- 哈希匹配失败 → 代码内**立即** `dict.get(..., fallback)` 回退到默认页
-- 字符串匹配失败 → 返回 `None`，要在上层判断后再走 fallback
-
-### 6.2 上层调用：`set_pages_and_resolve()` 与最终回退位置
+**fallback_page_hash 是什么？**
 
 ```python
-# 在 _navigation() 里调用
-found_page = ctx.pages_manager.set_pages_and_resolve(
-    pagehash_to_pageinfo,
-    fallback_page_hash=default_page._script_hash,  # ← = calc_hash("")
-)
+# st.navigation() 传入
+fallback_page_hash = default_page._script_hash   # = calc_hash(default_page._url_path)
+```
 
-# --- 接下来是真正的回退逻辑 ---
-page_to_return = None
-if found_page:                            # 情况 A：_resolve_page_script 找到了东西
+### 4.2 访问根路径时的两种到达路径
+
+用户访问 `http://app/` → 前端提取 `pageName = ""` → 后端 `set_script_intent(hash="", name="")`
+
+- 分支 1：`intended_page_script_hash = ""` → 空字符串为 falsy → **跳过**
+- 分支 2：`intended_page_name = ""` → 空字符串为 falsy → **跳过**
+- 分支 3：`self._pages.get(fallback_page_hash)` → 用 `calc_hash("home")` 查表 → **命中默认页**
+
+> 所以根路径访问走的是**分支 3**，通过 fallback hash 直接查注册表。
+
+### 4.3 前端已知 hash 时的到达路径
+
+用户点击导航菜单 → 前端发送 `pageScriptHash = calc_hash("home")`
+
+- 分支 1：`intended_page_script_hash = calc_hash("home")` → 在注册表中查找 → **命中默认页**
+
+> 此时走的是**分支 1**，用内部 hash 精确匹配。
+
+### 4.4 访问不存在的路径
+
+用户访问 `http://app/nonexistent` → 前端提取 `pageName = "nonexistent"`
+
+- 分支 1：`intended_page_script_hash = ""` → 跳过
+- 分支 2：`intended_page_name = "nonexistent"` → 遍历所有 `url_pathname`，找不到 → 返回 `None`
+- 分支 2 返回 None → 上层 `if not page_to_return` → 触发 `send_page_not_found()` + 赋值 `default_page`
+
+### 4.5 访问存在的子路径
+
+用户访问 `http://app/dashboard` → 前端提取 `pageName = "dashboard"`
+
+- 分支 1：`intended_page_script_hash = ""` → 跳过
+- 分支 2：`intended_page_name = "dashboard"` → 遍历 `url_pathname`，找到 `"dashboard"` → **命中**
+
+---
+
+## 五、回退判定的完整链路
+
+### 5.1 回退触发的统一条件：`if not page_to_return`
+
+所有回退路径最终都汇聚到同一个判定：
+
+```python
+if not page_to_return:
+    send_page_not_found(ctx)
+    page_to_return = default_page
+```
+
+> 也就是说：**回退的唯一触发条件是 `page_to_return` 为 falsy（通常是 `None`），与 `found_page` 本身是否为 None 没有直接绑定关系。** `found_page` 只是上游的一个中间结果，而不是最终判据。
+
+### 5.2 三条让 `page_to_return` 变为 None 的路径
+
+#### 路径 A：`_resolve_page_script` 直接返回 None
+
+上游 `_resolve_page_script()` 三个分支中任何一个返回 None：
+- 分支 1 走到 inline fallback，但 fallback_hash 在注册表中也查不到（极端异常情况）
+- 分支 2：字符串匹配 `url_pathname == intended_page_name`，filter 没有找到匹配项，`next(..., None)` 返回 None
+- 分支 3：`dict.get(fallback_page_hash, None)` 返回 None（fallback_hash 在注册表也查不到，极端异常）
+
+```python
+found_page = ctx.pages_manager.set_pages_and_resolve(...)
+# found_page = None
+page_to_return = None   # 初始值就是 None，if found_page: 块不执行
+```
+
+**典型场景**：用户访问不存在的 URL 路径（如 `/nonexistent`），分支 2 filter 无匹配 → None。
+
+#### 路径 B：`found_page` 非 None，但在 `page_list` 中找不到对应的 StreamlitPage
+
+`found_page` 来自 `_pages` 注册表（`PageInfo` 字典），里面有 `page_script_hash`。接下来需要用这个 hash 在 `page_list`（Python 中的 StreamlitPage 对象列表）里做二次匹配：
+
+```python
+if found_page:
     found_page_script_hash = found_page["page_script_hash"]
-    matching_pages = [p for p in page_list if p._script_hash == found_page_script_hash]
-    if len(matching_pages) > 0:
+    matching_pages = [
+        p for p in page_list if p._script_hash == found_page_script_hash
+    ]
+    if len(matching_pages) > 0:   # ← 如果没有匹配上
         page_to_return = matching_pages[0]
+    # 否则 page_to_return 保持为初始值 None
+```
 
-# 情况 B：命中了外部 URL 页 → 外部页不能直接 URL 访问，置空
+**典型场景**：理论层面的"防护性分支"。注册表和 `page_list` 都是在 `st.navigation()` 里由同一份数据构建的，正常情况下 hash 应该一一对应。代码留了这个兜底分支以防不一致。
+
+#### 路径 C：匹配到了页面，但它是外部 URL 页，被显式置空
+
+```python
+# 路径 A 或 B 之后，page_to_return 可能已经是某个 StreamlitPage
+# 现在做外部页过滤：
 if page_to_return and page_to_return.is_external:
-    page_to_return = None
-
-# 情况 C：found_page 为 None，或匹配页面不存在，或外部页置空
-if not page_to_return:                        # ← 回退最终触发点
-    send_page_not_found(ctx)                  # ← 发送 PageNotFound 给前端
-    page_to_return = default_page             # ← 兜底：使用默认页
+    page_to_return = None    # ← 显式置空
 ```
 
-三个条件形成「回退漏斗」：
+**典型场景**：外部 URL 页（如 `st.Page("https://docs.streamlit.io", title="Docs")`）也有自己的 `_url_path`（`"docs"`）和 `_script_hash`（`calc_hash("docs")`），也会被加入注册表。如果用户猜到它的 URL 路径并直接访问：
+1. `_resolve_page_script` 分支 2 匹配到 `url_pathname="docs"` → `found_page` 非 None
+2. 在 `page_list` 里找到对应的外部页 StreamlitPage → `page_to_return = 外部页`
+3. 外部页过滤：`is_external == True` → `page_to_return = None`
+4. 进入 `if not page_to_return` → 触发 `send_page_not_found` + 赋值默认页
+
+> **外部页不能直接通过 URL 访问**的底层原因：外部页 `_page = None`（没有 Python 文件也没有 Callable），`pg.run()` 会什么都不执行，所以必须强制回退。
+
+### 5.3 三条路径的汇总判定图
 
 ```
-_resolve_page_script() 返回值
+set_pages_and_resolve(registry, fallback_hash) → found_page
     │
-    ├─ None → 直接穿过，进入 not page_to_return 分支
+    │ found_page is None？
+    ├─ 是 → page_to_return = None （路径 A）
     │
-    └─ 非 None → 拿到 page_script_hash
+    └─ 否 → 取 found_page_script_hash
          │
-         ├─ 在 page_list（StreamlitPage 列表）里匹配不到 → page_to_return 仍为 None
+         │ page_list 中有匹配 hash 的 StreamlitPage？
+         ├─ 否 → page_to_return = None （路径 B）
          │
-         ├─ 匹配到了但它是 external 页面 → page_to_return = None
-         │
-         └─ 匹配到且是内部页 → page_to_return = 该页（不回退）
+         └─ 是 → page_to_return = matching_pages[0]
+              │
+              │ page_to_return.is_external？
+              ├─ 是 → page_to_return = None （路径 C）
+              │
+              └─ 否 → page_to_return = 正常页面，不回退
+
+最终统一判定：
+    if not page_to_return:
+        send_page_not_found(ctx)          # ← 三路径 A/B/C 都会触发
+        page_to_return = default_page     # ← 三路径 A/B/C 都兜底
 ```
 
-因此**最终回退率 100%**：只要走了 `not page_to_return` 分支，就必然赋值 `default_page`。不可能有别的结果。
+### 5.4 场景速查表：每条路径各自对应什么用户行为
 
-### 6.3 `send_page_not_found()` 什么时候触发，什么时候不触发
+| 场景 | 让 `page_to_return` 为空的路径 | `found_page` 值 | send_page_not_found？ | 用户体验 |
+|------|-------------------------------|-----------------|----------------------|---------|
+| 访问根路径 `/` | —（正常命中，无需回退） | 非 None（分支 3 fallback 成功） | **否** | 正常首页 |
+| 点击导航菜单到默认页 | —（正常命中） | 非 None（分支 1 哈希精确命中） | **否** | 正常首页 |
+| 访问存在的子路径 `/dashboard` | —（正常命中） | 非 None（分支 2 字符串匹配命中） | **否** | 正常页面 |
+| 访问不存在的路径 `/nope` | **路径 A**（分支 2 filter 无匹配 → None） | None | **是** | 提示 + 首页 |
+| 哈希匹配失败（构造不存在的 hash） | —（分支 1 inline fallback 命中默认页） | 非 None（默认页 PageInfo） | **否** | **静默**跳首页 |
+| 猜到并直访外部 URL 页的路径 `/docs` | **路径 C**（先匹配成功，再被 `is_external` 置 None） | 非 None，但被置空 | **是** | 提示 + 首页 |
+| 注册表与 page_list hash 不一致（极端） | **路径 B**（found_page 非 None，但 page_list 无匹配） | 非 None | **是** | 提示 + 首页 |
 
-| 场景 | `page_to_return` 是否为 None | 触发 send_page_not_found？ | 用户体验 |
-|------|------------------------------|----------------------------|---------|
-| 访问根路径 `/` | ❌ 非 None（命中默认页 fallback） | **否** | 正常显示首页，无任何提示 |
-| 访问存在的页面 `/dashboard` | ❌ 非 None | **否** | 正常显示对应页 |
-| 访问不存在的页面 `/foo/bar` | ✅ None | **是** | 顶部提示「Page not found」，下方显示首页内容 |
-| 直接访问外部页的 URL（如果有人猜到） | ✅ None（被 is_external 过滤） | **是** | 同上 |
-| 意图哈希（page_script_hash）在注册表不存在 | ❌ 非 None（dict.get 的 fallback 返回默认页） | **否** | 静默跳首页 |
-| `page_script_hash=""` 且 `page_name=""`（首次进入或刷新根页） | ❌ 非 None | **否** | 正常首页 |
+> ⚠️ **关于「哈希匹配失败静默不提示」的理解**：它不是因为走了 `if not page_to_return` 分支而被跳过——相反，它根本就**没进入**这个分支。因为分支 1 的 `dict.get(key, dict.get(fallback))` 在 key 查不到时 inline 取了 fallback（默认页），`found_page` 是正常的默认页 PageInfo，路径 B 和路径 C 也都不会把它置空，所以 `page_to_return` 是非 None 的，`if not page_to_return` 条件为假，自然就跳过了提示。
 
-> ⚠️ **最微妙的场景**：用户输入一个不存在的 `page_script_hash`（只有精通内部机制的人才能构造），条件 1 的 `dict.get()` 直接拿到 fallback 页 → 不触发 PageNotFound 提示，**静默跳到首页**。
+### 5.5 为什么根路径不触发 PageNotFound
 
-### 6.4 完整链路图：用户访问 `/nonexistent`
+根路径访问时：
+- `set_script_intent(hash="", name="")` → 两个意图值都是空串
+- 空串都是 falsy → 跳过分支 1 和分支 2
+- 分支 3：`dict.get(fallback_page_hash)` → fallback_hash 是 `default_page._script_hash`，必然在注册表 → 返回默认页 PageInfo → 非 None
+- 路径 B：在 page_list 找到默认页 → `page_to_return` = 默认页
+- 路径 C：默认页不是外部页 → 不过滤
+- 最终 `page_to_return` 非 None → `if not page_to_return` 为假 → 不触发 PageNotFound
 
+### 5.6 PageNotFound 消息的前端处理细节
+
+后端 `send_page_not_found()` 硬编码了 `page_name = ""`：
+
+```python
+def send_page_not_found(ctx):
+    msg = ForwardMsg()
+    msg.page_not_found.page_name = ""
+    ctx.enqueue(msg)
 ```
-Step 1: 浏览器发送 HTTP 请求，加载 index.html
-Step 2: 前端 JS 启动 WebSocket 连接，读取 document.location.pathname
-        → pathname = "/nonexistent"
-        → 此时 currentPageScriptHash 为空（还没收到 Navigation 消息）
 
-Step 3: 前端 sendRerunBackMsg() 走分支 C（currentPageScriptHash 为空）
-        extractPageNameFromPathName("/nonexistent", basePath) → "nonexistent"
-        BackMsg.rerunScript: { pageScriptHash: "", pageName: "nonexistent" }
-
-Step 4: 后端 ScriptRunner 处理
-        set_script_intent(page_script_hash="", page_name="nonexistent")
-        → _intended_page_script_hash = ""
-        → _intended_page_name = "nonexistent"
-
-Step 5: 执行入口文件 → st.navigation()
-        构建 pagehash_to_pageinfo 注册表，fallback = default_page._script_hash = calc_hash("")
-        调用 set_pages_and_resolve(registry, fallback)
-
-Step 6: _resolve_page_script() 内部判定
-        if intended_page_script_hash: "" → 条件 1 跳过
-        if intended_page_name:     "nonexistent" → 进入条件 2
-            filter(lambda p: p["url_pathname"] == "nonexistent", registry.values())
-            所有条目的 url_pathname 分别是 ""、"dashboard"、"settings"
-            → 没有匹配项，filter 返回空迭代器
-            → next(..., None) → 返回 None
-
-Step 7: 上层拿到 found_page = None
-        page_to_return 初始化 = None
-        跳过 found_page 的匹配分支
-
-        进入：if not page_to_return:
-            → send_page_not_found(ctx)  # 发送 PageNotFound ForwardMsg
-            → page_to_return = default_page  # 兜底赋值
-
-Step 8: msg.navigation.page_script_hash = default_page._script_hash
-        ctx.enqueue(msg)  # 发送导航 + NewSession 消息
-
-Step 9: 前端收到
-        → appPages 更新为注册表
-        → currentPageScriptHash = 默认页哈希
-        → maybeUpdatePageUrl(newPageName="")  # URL 改回 "/"
-        → 渲染默认页内容
-        → PageNotFound 元素显示在顶部（可选消失）
+前端拿到后：
+```typescript
+onPageNotFound = (pageName?: string): void => {
+    const errMsg = pageName
+        ? `You have requested page /${pageName}, but no corresponding file was found...`
+        : "The page that you have requested does not seem to exist"
+    this.showError("Page not found", {
+        message: `${errMsg}. Running the app's main page.`,
+    })
+}
 ```
+
+由于后端永远传 `""`（空字符串，falsy），所以前端**永远只显示通用提示**「The page that you have requested does not seem to exist」，不会在错误文案里携带用户实际访问的不存在路径。
+
+同时前端 `handlePageNotFound` 会：
+- `currentPageScriptHash` 临时设为 `mainScriptHash`
+- 向主机发送一条 `SET_CURRENT_PAGE_NAME`，`currentPageName=""`，`currentPageScriptHash=mainScriptHash`
+- 最终 URL 改回根路径 `""`
 
 ---
 
-## 七、七层触发方式对应的三层标识取值（汇总速查表）
+## 六、前后端各自用什么值定位页面（7 种场景速查）
 
-| 触发方式 | 前端 currentPageScriptHash 状态 | 前端取值手段 | BackMsg.rerunScript | _resolve_page_script 命中分支 |
-|----------|---------------------------------|-------------|---------------------|--------------------------------|
-| 首次访问 `/`（根路径） | 空 | `extractPageNameFromPathName` 得到 `""` | `{hash: "", name: ""}` | 条件 3：直接 `dict.get(fallback)` → 默认页 |
-| 首次访问 `/dashboard`（存在）| 空 | `extractPageNameFromPathName` 得到 `"dashboard"` | `{hash: "", name: "dashboard"}` | 条件 2：filter 匹配到 `url_pathname="dashboard"` 的条目 |
-| 首次访问 `/nope`（不存在）| 空 | `extractPageNameFromPathName` 得到 `"nope"` | `{hash: "", name: "nope"}` | 条件 2：filter 无匹配 → 返回 None → 上层兜底到默认页 + PageNotFound |
-| 点击导航菜单 / page_link | 非空 | Navigation 消息里直接有 `pageScriptHash` | `{hash: "a1b2...", name: ""}` | 条件 1：`dict.get("a1b2...", fallback)` → 精确命中 |
-| 浏览器前进/后退（popstate）| 非空 | `findPageByUrlPath(pathname)` 查表拿 `pageScriptHash` | `{hash: "a1b2...", name: ""}` | 条件 1：精确命中 |
-| 重新运行按钮 | 非空 | 直接读 `state.currentPageScriptHash` | `{hash: 当前哈希, name: ""}` | 条件 1：精确命中当前页 |
-| `st.switch_page(...)` | 已存在（后端产生） | 后端直接构造 RerunData，不经过前端 | `{page_script_hash: 目标哈希}` | 条件 1：`dict.get(目标哈希, fallback)` → 命中或回退 |
+| 触发方式 | 前端取值 | 发给后端的 RerunData | 后端命中分支 |
+|----------|---------|---------------------|-------------|
+| 首次访问根路径 `/` | `extractPageNameFromPathName` → `""` | `hash=""`, `name=""` | 分支 3：fallback |
+| 首次访问存在的子路径 `/dashboard` | `extractPageNameFromPathName` → `"dashboard"` | `hash=""`, `name="dashboard"` | 分支 2：url_pathname 匹配 |
+| 首次访问不存在的路径 `/nope` | `extractPageNameFromPathName` → `"nope"` | `hash=""`, `name="nope"` | 分支 2：无匹配 → None → 回退 |
+| 点击导航菜单 | 从 Navigation proto 拿到 `pageScriptHash` | `hash="calc_hash(...)"`, `name=""` | 分支 1：哈希精确匹配 |
+| 浏览器前进/后退 | `findPageByUrlPath` 查表拿 `pageScriptHash` | `hash="calc_hash(...)"`, `name=""` | 分支 1：哈希精确匹配 |
+| 重新运行按钮 | 读当前 `currentPageScriptHash` | `hash=当前哈希`, `name=""` | 分支 1：精确命中 |
+| `st.switch_page(...)` | 后端直接构造 RerunData | `page_script_hash=目标哈希` | 分支 1：精确匹配或 inline fallback |
 
 ---
 
-## 八、关键代码位置索引（相对项目根路径）
+## 七、关键代码位置索引
 
-| 文件 | 关注点 | 说明 |
-|------|--------|------|
-| `lib/streamlit/navigation/page.py` | `StreamlitPage.url_path` property、`StreamlitPage._script_hash` property、`StreamlitPage.__init__` 中 `default` 存储 | 默认页强制 `url_path=""`、内部哈希基于对外 property 计算 |
-| `lib/streamlit/commands/navigation.py` | `_navigation()` 中默认页确定、`pagehash_to_pageinfo` 构建、`send_page_not_found` 触发条件、回退赋值 `page_to_return = default_page` | 回退判定的最上层位置 |
-| `lib/streamlit/runtime/pages_manager.py` | `PagesManager.__init__`（main_script_hash 计算）、`_resolve_page_script()`（三层分支判定）、`set_pages_and_resolve()` | 路由解析核心、main_script_hash 来源 |
-| `lib/streamlit/util.py` | `calc_hash()` 定义 | 统一哈希函数 |
-| `lib/streamlit/runtime/scriptrunner_utils/script_run_context.py` | `ScriptRunContext.enqueue()` 给每条 ForwardMsg 打 `active_script_hash` 标签 | main_script_hash 与页面元素归属的连接点 |
-| `frontend/app/src/App.tsx` | `sendRerunBackMsg()` 三大分支判定、`onHistoryChange` popstate 监听、`extractPageNameFromPathName` 调用 | 首次直访时的前端解析入口 |
-| `frontend/app/src/util/AppNavigation.ts` | `findPageByUrlPath()`、`clearPageElements()`、`handleNavigation()` | 前端反向 URL 查表、元素清理策略 |
-| `frontend/lib/src/util/utils.ts` | `extractPageNameFromPathName()` 实现 | 浏览器 pathname 到对外 url_path 的转换算法 |
-| `lib/streamlit/runtime/app_session.py` | `_create_new_session_message()` 中 `msg.new_session.page_script_hash`、`main_script_hash` 字段填充 | 后端到前端 NewSession 消息的 hash 装配点 |
+| 文件（相对项目根） | 关注点 |
+|------|--------|
+| `lib/streamlit/navigation/page.py` — `_script_hash` property | **`calc_hash(self._url_path)`** — 用内部字段，非 property |
+| `lib/streamlit/navigation/page.py` — `url_path` property | **`"" if self._default else self._url_path`** — 默认页强制空串 |
+| `lib/streamlit/navigation/page.py` — `__init__` 中 `_url_path` 赋值 | 初始化后不再改变，`st.navigation` 改 `_default` 不改 `_url_path` |
+| `lib/streamlit/commands/navigation.py` — 默认页确定 | 遍历找 `_default=True`，没有则取第一个非外部页并就地设 `_default=True` |
+| `lib/streamlit/commands/navigation.py` — 注册表构建 | key = `page._script_hash`，`url_pathname` = `page.url_path`（property） |
+| `lib/streamlit/commands/navigation.py` — 回退判定 | `if not page_to_return` → `send_page_not_found` + 赋值 `default_page` |
+| `lib/streamlit/runtime/pages_manager.py` — `__init__` | **`main_script_hash = calc_hash(main_script_path)`** — 入口脚本路径 |
+| `lib/streamlit/runtime/pages_manager.py` — `_resolve_page_script` | 三分支判定：哈希精确 → 字符串匹配 → fallback |
+| `lib/streamlit/util.py` — `calc_hash()` | BLAKE2b 统一哈希函数 |
+| `lib/streamlit/runtime/scriptrunner_utils/script_run_context.py` — `reset()` | 初始化 `active_script_hash = main_script_hash` |
+| `lib/streamlit/runtime/scriptrunner_utils/script_run_context.py` — `run_with_active_hash()` | 切换到 `page._script_hash` 执行页面代码 |
+| `frontend/app/src/App.tsx` — `sendRerunBackMsg` | 三分支判定：有 hash → 有当前 hash → 空（用 extractPageNameFromPathName） |
+| `frontend/lib/src/util/utils.ts` — `extractPageNameFromPathName()` | pathname 去 basePath 去首尾斜杠 + decodeURIComponent |
+| `frontend/app/src/util/AppNavigation.ts` — `findPageByUrlPath()` | `url_pathname.endsWith("/" + p.urlPathname)` 反向查表 |
+| `frontend/app/src/util/AppNavigation.ts` — `clearPageElements()` | 保留 `main_script_hash` 标记的元素，清除其他 |
