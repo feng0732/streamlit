@@ -102,7 +102,7 @@
   [media.py](lib/streamlit/elements/media.py#L742-L762)
 - **视频 YouTube URL** → `_reshape_youtube_url()` 正则提取 video_id，重写为 embed 链接
   [media.py](lib/streamlit/elements/media.py#L415-L446)
-- **字幕文件** → `process_subtitle_data()` 同样注册到 MediaFileManager
+- **字幕文件** → 格式归一化后经 MediaFileManager 注册，详见 2.6 节
 
 ### 2.4 写入路径：`MediaFileManager.add()` 协调流程
 
@@ -155,6 +155,67 @@ extension = get_extension_for_mimetype(media_file.mimetype)
 return f"{self._media_endpoint}/{file_id}{extension}"
 # 例如: /media/abc123def456.jpg
 ```
+
+### 2.6 字幕文件注册流程
+
+字幕文件是视频元素的附属资源，其注册流程遵循与图片/音视频相同的分层架构，但多了一步**格式归一化**（SRT → VTT 自动转换）和**多轨道支持**。
+
+**入口**：用户调用 `st.video(data, subtitles=...)`，由 `marshall_video()` [media.py](lib/streamlit/elements/media.py#L504-L640) 处理字幕参数。
+
+**完整调用链（与全文分层描述一致）：**
+
+```
+用户字幕数据 (str/bytes/Path/BytesIO/dict)
+        │
+        ▼
+marshall_video() 字幕处理分支 [media.py L611-L640]
+  1. 归一化为 list[(label, data)]
+     - 单字幕 → [("default", data)]
+     - dict 多字幕 → [(label1, data1), (label2, data2), ...]
+  2. 为每个字幕生成独立 coordinates: "{video_coord}[subtitle{label}]"
+  3. 对每个字幕调用 process_subtitle_data()
+        │
+        ▼
+process_subtitle_data() [subtitle_utils.py L148-L175]
+  ┌─ [格式归一化层] 决定 kind，统一为 VTT bytes
+  │   • str/Path → _handle_string_or_path_data()
+  │   • BytesIO → _handle_stream_data()
+  │   • bytes → _handle_bytes_data()
+  │   • SRT 检测 (_is_srt) → _srt_to_vtt() 自动转换
+  │   • 最终统一为 WebVTT 格式的 bytes
+  │
+  └─ [Manager 协调层] 注册到媒体管理器
+      • kind = MEDIA（由 Manager 决定，字幕按普通媒体处理）
+      • media_file_mgr.add(subtitle_bytes, "text/vtt", subtitle_coord, filename)
+        ├─ [Storage] load_and_get_id() → 存内容 + 算 file_id
+        ├─ [Manager] 记录 _file_metadata 和 session 引用
+        └─ [Storage] get_url(file_id) → 返回 /media/{file_id}.vtt
+        │
+        ▼
+返回字幕 URL → 赋值给 proto.subtitles[i].url → WebSocket 发送到前端
+```
+
+**每一步的分层职责归属：**
+
+| 步骤 | 归属层 | 具体代码位置 | 职责 |
+|---|---|---|---|
+| 字幕参数解析 | 元素层 | [media.py L611-L627](lib/streamlit/elements/media.py#L611-L627) | 将 dict/str 等统一为 `(label, data)` 列表 |
+| SRT → VTT 转换 | 格式归一化层 | [subtitle_utils.py L36-L108](lib/streamlit/elements/lib/subtitle_utils.py#L36-L108) | 检测 SRT 格式，转换为浏览器原生支持的 WebVTT |
+| 决定 kind (MEDIA) | Manager 协调层 | [media_file_manager.py L272-L276](lib/streamlit/runtime/media_file_manager.py#L272-L276) | 字幕按普通媒体文件处理，生命周期与视频一致 |
+| 计算 file_id | Storage 执行层 | [memory_media_file_storage.py L162](lib/streamlit/runtime/memory_media_file_storage.py#L162) | 基于 VTT bytes 内容哈希 |
+| 存储 bytes | Storage 执行层 | [memory_media_file_storage.py L165-L168](lib/streamlit/runtime/memory_media_file_storage.py#L165-L168) | `_files_by_id[file_id] = MemoryFile(bytes, "text/vtt", ...)` |
+| 生成字幕 URL | Storage 执行层 | [memory_media_file_storage.py L187-L193](lib/streamlit/runtime/memory_media_file_storage.py#L187-L193) | `/media/{file_id}.vtt` |
+| 记录 session 引用 | Manager 协调层 | [media_file_manager.py L283](lib/streamlit/runtime/media_file_manager.py#L283) | 视频被替换时，字幕也被判定为 orphan |
+
+**关键设计与一致性：**
+
+1. **coordinates 独立标识**：每个字幕轨道使用 `"{video_coord}[subtitle{label}]"` 作为独立的 coordinates，确保视频被替换时，对应的字幕也会被标记为 orphan 并清理。
+
+2. **kind 决策一致**：字幕的 `kind = MEDIA`，与图片/音视频相同，因此在 `remove_orphaned_files()` 中会被直接清理，无需特殊逻辑。
+
+3. **mimetype 固定**：无论输入是 SRT 还是 VTT，最终注册时 `mimetype = "text/vtt"`，保证浏览器端 `<track>` 标签能正确解析。
+
+4. **多层复用**：字幕注册的核心路径（`media_file_mgr.add()` → Storage）与图片、音频、视频完全一致，只是在调用 `add()` 之前多了一步格式归一化。
 
 ---
 
@@ -497,6 +558,8 @@ return <StyledAudio
 
 | 衔接环节 | 位置 | 关键数据 |
 |---|---|---|
+| **字幕 SRT → VTT** | `_srt_to_vtt()` [subtitle_utils.py](lib/streamlit/elements/lib/subtitle_utils.py#L71-L107) | SRT 时间戳格式替换 + 加 WEBVTT 头 |
+| **字幕 VTT bytes → file_id** | `Storage.load_and_get_id()` | VTT bytes + "text/vtt" → 内容哈希 → file_id |
 | **后端 bytes → file_id** | `Storage.load_and_get_id()` | bytes + mimetype → 内容哈希 → file_id |
 | **file_id → URL** | `Storage.get_url()` | file_id + mimetype → `/media/{file_id}.{ext}` |
 | **URL → Protobuf** | `marshall_images()` / `marshall_audio()` / `marshall_video()` | `proto.url = file_url` |
