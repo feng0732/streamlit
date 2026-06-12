@@ -36,9 +36,10 @@ Python 用户数据
               │
               ▼
 ┌───────────────────────────┐
-│  5. 传输边界               │  ForwardMsg.proto
-│  ForwardMsg → WebSocket    │  ConnectionManager.ts
-│  + 消息去重缓存            │  ForwardMsgCache
+│  5. 传输边界（WebSocket）  │  WebsocketConnection.tsx
+│  消息接收 → 去重匹配       │  ForwardMessageCache.ts
+│  → 引用还原 → 消息分发      │  App.tsx handleMessage()
+│  → Delta 应用              │  AppRoot.ts applyDelta()
 └─────────────┬─────────────┘
               │
               ▼
@@ -61,14 +62,14 @@ Python 用户数据
 
 ### 2.1 入口层：ArrowMixin.dataframe()
 
-核心入口位于 [arrow.py](file:///d:/fz/0601/solo-dogfeeding/code/220-streamlit/lib/streamlit/elements/arrow.py#L476-L1105) 的 `ArrowMixin.dataframe()` 方法。
+核心入口位于 [arrow.py](./lib/streamlit/elements/arrow.py#L476-L1105) 的 `ArrowMixin.dataframe()` 方法。
 
 **两条分支路径：**
 
 | 数据类型 | 处理方式 | 代码位置 |
 |---------|---------|---------|
-| `pa.Table` (PyArrow原生) | 直接序列化，跳过 Pandas | [arrow.py#L948-L954](file:///d:/fz/0601/solo-dogfeeding/code/220-streamlit/lib/streamlit/elements/arrow.py#L948-L954) |
-| 其他所有类型 | → Pandas DataFrame → Arrow | [arrow.py#L955-L981](file:///d:/fz/0601/solo-dogfeeding/code/220-streamlit/lib/streamlit/elements/arrow.py#L955-L981) |
+| `pa.Table` (PyArrow原生) | 直接序列化，跳过 Pandas | [arrow.py#L948-L954](./lib/streamlit/elements/arrow.py#L948-L954) |
+| 其他所有类型 | → Pandas DataFrame → Arrow | [arrow.py#L955-L981](./lib/streamlit/elements/arrow.py#L955-L981) |
 
 ```python
 # arrow.py L948-L981 核心逻辑
@@ -86,7 +87,7 @@ else:
 
 ### 2.2 数据格式识别：determine_data_format()
 
-[dataframe_util.py](file:///d:/fz/0601/solo-dogfeeding/code/220-streamlit/lib/streamlit/dataframe_util.py#L1364-L1453) 中定义了 **40+ 种** 数据格式的枚举 `DataFormat`，包括：
+[dataframe_util.py](./lib/streamlit/dataframe_util.py#L1364-L1453) 中定义了 **40+ 种** 数据格式的枚举 `DataFormat`，包括：
 
 - **Pandas 生态**: `PANDAS_DATAFRAME`, `PANDAS_SERIES`, `PANDAS_INDEX`, `PANDAS_STYLER`, `PANDAS_ARRAY`
 - **PyArrow 生态**: `PYARROW_TABLE`, `PYARROW_ARRAY`
@@ -98,7 +99,7 @@ else:
 
 ### 2.3 数据归一化：convert_anything_to_pandas_df()
 
-[dataframe_util.py#L559-L814](file:///d:/fz/0601/solo-dogfeeding/code/220-streamlit/lib/streamlit/dataframe_util.py#L559-L814) 是核心归一化函数，按优先级顺序尝试：
+[dataframe_util.py#L559-L814](./lib/streamlit/dataframe_util.py#L559-L814) 是核心归一化函数，按优先级顺序尝试：
 
 **第一梯队：直接兼容（零拷贝或轻量转换）**
 ```python
@@ -141,7 +142,7 @@ if has_callable_attr(data, "__dataframe__"):
 
 ### 2.4 Pandas → Arrow 转换：convert_pandas_df_to_arrow_bytes()
 
-[dataframe_util.py#L934-L975](file:///d:/fz/0601/solo-dogfeeding/code/220-streamlit/lib/streamlit/dataframe_util.py#L934-L975)：
+[dataframe_util.py#L934-L975](./lib/streamlit/dataframe_util.py#L934-L975)：
 
 ```python
 def convert_pandas_df_to_arrow_bytes(df, *, downcast_large_types=False):
@@ -162,7 +163,7 @@ def convert_pandas_df_to_arrow_bytes(df, *, downcast_large_types=False):
 
 #### 类型自动修复：fix_arrow_incompatible_column_types()
 
-[dataframe_util.py#L1302-L1361](file:///d:/fz/0601/solo-dogfeeding/code/220-streamlit/lib/streamlit/dataframe_util.py#L1302-L1361) 处理以下 Arrow 不兼容类型：
+[dataframe_util.py#L1302-L1361](./lib/streamlit/dataframe_util.py#L1302-L1361) 处理以下 Arrow 不兼容类型：
 
 | 不兼容类型 | 修复策略 | 示例 |
 |-----------|---------|------|
@@ -177,7 +178,7 @@ def convert_pandas_df_to_arrow_bytes(df, *, downcast_large_types=False):
 
 #### Large 类型降级：_downcast_large_arrow_types()
 
-[dataframe_util.py#L817-L892](file:///d:/fz/0601/solo-dogfeeding/code/220-streamlit/lib/streamlit/dataframe_util.py#L817-L892)：
+[dataframe_util.py#L817-L892](./lib/streamlit/dataframe_util.py#L817-L892)：
 
 **问题背景**：Pandas 3.x 默认将 StringDtype 存储为 Arrow 的 `large_string` (LargeUtf8)，而第三方自定义组件 v1 捆绑了较旧版本的 Arrow JS，无法解码 LargeUtf8/LargeBinary/LargeList 的 type code。
 
@@ -190,7 +191,7 @@ large_list<T> →  list<T>      (递归嵌套降级)
 
 ### 2.5 Polars 快速路径：_convert_polars_to_arrow_bytes()
 
-[dataframe_util.py#L1010-L1016](file:///d:/fz/0601/solo-dogfeeding/code/220-streamlit/lib/streamlit/dataframe_util.py#L1010-L1016)：
+[dataframe_util.py#L1010-L1016](./lib/streamlit/dataframe_util.py#L1010-L1016)：
 
 ```python
 def _convert_polars_to_arrow_bytes(data):
@@ -202,7 +203,7 @@ def _convert_polars_to_arrow_bytes(data):
 
 ### 2.6 Arrow Table → IPC Bytes：convert_arrow_table_to_arrow_bytes()
 
-[dataframe_util.py#L894-L931](file:///d:/fz/0601/solo-dogfeeding/code/220-streamlit/lib/streamlit/dataframe_util.py#L894-L931)：
+[dataframe_util.py#L894-L931](./lib/streamlit/dataframe_util.py#L894-L931)：
 
 ```python
 def convert_arrow_table_to_arrow_bytes(table):
@@ -225,7 +226,7 @@ def convert_arrow_table_to_arrow_bytes(table):
 
 ### 2.7 自动截断机制：_maybe_truncate_table()
 
-[dataframe_util.py#L1153-L1225](file:///d:/fz/0601/solo-dogfeeding/code/220-streamlit/lib/streamlit/dataframe_util.py#L1153-L1225)：
+[dataframe_util.py#L1153-L1225](./lib/streamlit/dataframe_util.py#L1153-L1225)：
 
 **触发条件**：`server.enableArrowTruncation = True`（实验性功能）
 
@@ -243,7 +244,7 @@ def convert_arrow_table_to_arrow_bytes(table):
 
 ### 2.8 Pandas Styler 处理：marshall_styler()
 
-[arrow.py#L962-L968](file:///d:/fz/0601/solo-dogfeeding/code/220-streamlit/lib/streamlit/elements/arrow.py#L962-L968) 调用 [pandas_styler_utils.py](file:///d:/fz/0601/solo-dogfeeding/code/220-streamlit/lib/streamlit/elements/lib/pandas_styler_utils.py#L33-L71)：
+[arrow.py#L962-L968](./lib/streamlit/elements/arrow.py#L962-L968) 调用 [pandas_styler_utils.py](./lib/streamlit/elements/lib/pandas_styler_utils.py#L33-L71)：
 
 ```
 Styler 对象处理流程：
@@ -263,7 +264,7 @@ Styler 对象处理流程：
 
 ### 3.1 基础数据容器：ArrowData.proto
 
-[ArrowData.proto](file:///d:/fz/0601/solo-dogfeeding/code/220-streamlit/proto/streamlit/proto/ArrowData.proto) 是所有 Arrow 数据的原子容器：
+[ArrowData.proto](./proto/streamlit/proto/ArrowData.proto) 是所有 Arrow 数据的原子容器：
 
 ```protobuf
 message ArrowData {
@@ -283,7 +284,7 @@ message ArrowData {
 
 ### 3.2 交互式表格：Dataframe.proto
 
-[Dataframe.proto](file:///d:/fz/0601/solo-dogfeeding/code/220-streamlit/proto/streamlit/proto/Dataframe.proto) 是 `st.dataframe` 和 `st.data_editor` 的容器：
+[Dataframe.proto](./proto/streamlit/proto/Dataframe.proto) 是 `st.dataframe` 和 `st.data_editor` 的容器：
 
 ```protobuf
 message Dataframe {
@@ -305,7 +306,7 @@ message Dataframe {
 
 ### 3.3 自定义组件 v1：Components.proto
 
-[Components.proto](file:///d:/fz/0601/solo-dogfeeding/code/220-streamlit/proto/streamlit/proto/Components.proto) 使用了 **独立的 Arrow 体系**（早于内部 Arrow 序列化实现）：
+[Components.proto](./proto/streamlit/proto/Components.proto) 使用了 **独立的 Arrow 体系**（早于内部 Arrow 序列化实现）：
 
 ```protobuf
 message ArrowTable {
@@ -319,7 +320,7 @@ message ArrowTable {
 **与内部实现的差异**：
 - 内部实现：index 和 columns 作为额外字段嵌入同一个 Arrow Table（通过 Pandas Schema metadata 识别）
 - 组件 v1：index、columns、data 是 **三组独立的 IPC 字节**，需分别反序列化后重组
-- 对应实现：[component_arrow.py](file:///d:/fz/0601/solo-dogfeeding/code/220-streamlit/lib/streamlit/components/v1/component_arrow.py)
+- 对应实现：[component_arrow.py](./lib/streamlit/components/v1/component_arrow.py)
 
 ```python
 # 反序列化时重组
@@ -344,7 +345,7 @@ message MixedData {
 }
 ```
 
-**后端序列化逻辑** [serialization.py#L34-L139](file:///d:/fz/0601/solo-dogfeeding/code/220-streamlit/lib/streamlit/components/v2/bidi_component/serialization.py#L34-L139)：
+**后端序列化逻辑** [serialization.py#L34-L139](./lib/streamlit/components/v2/bidi_component/serialization.py#L34-L139)：
 
 ```
 输入 dict → 遍历第一层 key-value：
@@ -373,7 +374,7 @@ message VegaLiteChart {
 }
 ```
 
-[ArrowNamedDataSet.proto](file:///d:/fz/0601/solo-dogfeeding/code/220-streamlit/proto/streamlit/proto/ArrowNamedDataSet.proto)：
+[ArrowNamedDataSet.proto](./proto/streamlit/proto/ArrowNamedDataSet.proto)：
 ```protobuf
 message ArrowNamedDataSet {
   string name = 1;
@@ -384,7 +385,7 @@ message ArrowNamedDataSet {
 
 ---
 
-## 四、传输边界：ForwardMsg 与 WebSocket
+## 四、传输边界：ForwardMsg → WebSocket → 前端接收完整链路
 
 ### 4.1 Delta → Element → ForwardMsg 封装链
 
@@ -400,7 +401,7 @@ ForwardMsg
             └─ BidiComponent { mixed_data: MixedData{json, arrow_blobs:{...}}, ... }
 ```
 
-[ForwardMsg.proto](file:///d:/fz/0601/solo-dogfeeding/code/220-streamlit/proto/streamlit/proto/ForwardMsg.proto#L36-L111) 核心结构：
+[ForwardMsg.proto](./proto/streamlit/proto/ForwardMsg.proto#L36-L111) 核心结构：
 
 ```protobuf
 message ForwardMsg {
@@ -420,47 +421,454 @@ message ForwardMsgMetadata {
 }
 ```
 
-### 4.2 消息去重机制：ForwardMsgCache
+### 4.2 WebSocket 连接建立与接收层
 
-**核心思想** [ForwardMsg.proto#L132-L136](file:///d:/fz/0601/solo-dogfeeding/code/220-streamlit/proto/streamlit/proto/ForwardMsg.proto#L132-L136)：
+#### 连接管理器：ConnectionManager
 
-> 当同一个大 DataFrame 在多次 rerun 中出现（甚至同一次 run 的不同位置），只需要发送一次 bytes，后续使用 ref_hash 引用。
+[ConnectionManager.ts](./frontend/connection/src/ConnectionManager.ts) 是连接层的入口，负责创建 `WebsocketConnection` 实例。它作为工厂和状态协调者，不直接处理消息。
 
-**工作流程**：
-```
-后端 ForwardMsgCache：
-  1. 计算 message hash（排除 metadata 字段）
-  2. 如果 hash 已缓存：
-     → 不发原消息，改为发 ForwardMsg{ref_hash: hash}
-  3. 如果未缓存但可缓存：
-     → 标记 metadata.cacheable = true
-     → 缓存后发送原消息
+#### WebSocket 连接：WebsocketConnection
 
-前端 ConnectionManager：
-  1. 收到 cacheable = true 的消息 → 存入 ForwardMessageCache
-  2. 收到 ref_hash 消息 → 从缓存取出原消息 → 正常处理
-```
+[WebsocketConnection.tsx](./frontend/connection/src/WebsocketConnection.tsx#L699-L723) 是实际的 WebSocket 接收层。这是一个状态机驱动的类，管理连接生命周期和消息接收。
 
-**对于 Arrow 数据的意义**：几 MB 甚至几十 MB 的 Arrow bytes 不会在 rerun 时重复传输。
+**WebSocket 消息接收的完整代码路径：**
 
-### 4.3 WebSocket 传输层
-
-前端 [ConnectionManager.ts](file:///d:/fz/0601/solo-dogfeeding/code/220-streamlit/frontend/connection/src/ConnectionManager.ts) 管理 WebSocket 连接：
-
-```
-ConnectionManager
-  └─ WebsocketConnection
-       ├─ sendMessage(BackMsg)     → 后端 (用户交互)
-       └─ onMessage(ForwardMsg)    → 前端 (UI 渲染)
+```typescript
+// WebsocketConnection.tsx L552-L560
+this.websocket.addEventListener("message", (event: MessageEvent) => {
+  if (checkWebsocket()) {
+    this.handleMessage(event.data).catch(reason => {
+      const err = `Failed to process a Websocket message. ${reason}`
+      LOG.error(err)
+      this.stepFsm("FATAL_ERROR", err)
+    })
+  }
+})
 ```
 
-Protobuf 的 `bytes` 字段在 WebSocket 二进制帧中直接传输，无需 base64 编码。Arrow IPC bytes 在整个链路中保持二进制形态，直到前端 Quiver 解析。
+**关键要点**：
+- `checkWebsocket()` 是防御性检查，确保当前处理的事件仍属于活跃的 WebSocket 实例（防止重连后的消息交叉）
+- `event.data` 是 `ArrayBuffer` 类型（WebSocket `binaryType = "arraybuffer"`，见 L545）
+- 整个处理是异步的，任何解析错误都会触发 FSM 进入 `DISCONNECTED_FOREVER` 状态
 
-### 4.4 消息大小硬限制
+### 4.3 消息解码与去重缓存：handleMessage()
 
-Protobuf 单个消息默认上限为 2GB（C++ 实现），但 Streamlit 通过 `server.maxMessageSize` 配置项（默认 ~200MB）进行更严格的限制。超过限制时：
-- 若开启 `server.enableArrowTruncation`：自动截断表格（见 2.7 节）
-- 否则：WebSocket 层报错，连接可能断开
+[WebsocketConnection.tsx](./frontend/connection/src/WebsocketConnection.tsx#L699-L723) 的 `handleMessage()` 是第一个处理函数，负责：
+
+```typescript
+private async handleMessage(data: ArrayBuffer): Promise<void> {
+  // 步骤1: 分配消息序列号（保证顺序）
+  const messageIndex = this.nextMessageIndex
+  this.nextMessageIndex += 1
+
+  // 步骤2: Protobuf 二进制解码 → ForwardMsg 对象
+  const encodedMsg = new Uint8Array(data)
+  const msg = ForwardMsg.decode(encodedMsg)
+
+  // 步骤3: 交给缓存处理（去重 + 引用还原）
+  this.messageQueue[messageIndex] = await this.cache.processMessagePayload(
+    msg,
+    encodedMsg
+  )
+
+  // 步骤4: 按顺序分发队列中的消息
+  while (this.lastDispatchedMessageIndex + 1 in this.messageQueue) {
+    const dispatchMessageIndex = this.lastDispatchedMessageIndex + 1
+    this.args.onMessage(this.messageQueue[dispatchMessageIndex])
+    delete this.messageQueue[dispatchMessageIndex]
+    this.lastDispatchedMessageIndex = dispatchMessageIndex
+  }
+}
+```
+
+**顺序保证机制**：
+- `nextMessageIndex` 单调递增分配给每个到来的消息
+- `messageQueue` 是一个普通对象作为字典存储（`{[index: number]: ForwardMsg}`）
+- `lastDispatchedMessageIndex` 跟踪最后一个已分发的索引
+- 消息解码可能是异步的（不同消息大小差异导致解码耗时不同），但分发时严格按索引顺序
+
+---
+
+### 4.4 去重匹配与引用还原：ForwardMessageCache
+
+[ForwardMessageCache.ts](./frontend/connection/src/ForwardMessageCache.ts) 是整个缓存机制的核心。它的 `processMessagePayload()` 方法处理两种消息类型：
+
+#### 4.4.1 缓存入口：processMessagePayload()
+
+```typescript
+// ForwardMessageCache.ts L119-L146
+public async processMessagePayload(
+  msg: ForwardMsg,
+  encodedMsg: Uint8Array
+): Promise<ForwardMsg> {
+  // 步骤1: 先尝试缓存（如果是 cacheable 且不是 refHash）
+  this.maybeCacheMessage(msg, encodedMsg)
+
+  // 步骤2: 如果不是引用消息，直接返回
+  if (msg.type !== "refHash") {
+    return msg
+  }
+
+  // 步骤3: 是 refHash 消息 → 从缓存中取出原始消息
+  const cachedMessage = this.getCachedMessage(msg.refHash as string, true)
+  if (isNullOrUndefined(cachedMessage)) {
+    throw new Error(`Cached ForwardMsg MISS [hash=${msg.refHash}]...`)
+  }
+  LOG.info(`Cached ForwardMsg HIT [hash=${msg.refHash}]`)
+
+  // 步骤4: 将引用消息的 metadata 合并到原始消息
+  if (!msg.metadata) {
+    throw new Error("Reference ForwardMsg has no metadata...")
+  }
+  cachedMessage.metadata = msg.metadata  // metadata 用最新的（可能包含不同的 delta_path）
+  return cachedMessage
+}
+```
+
+#### 4.4.2 缓存写入逻辑：maybeCacheMessage()
+
+```typescript
+// ForwardMessageCache.ts L151-L194
+private maybeCacheMessage(msg: ForwardMsg, encodedMsg: Uint8Array): void {
+  // 条件1: 永远不缓存 refHash 类型的消息
+  if (msg.type === "refHash") {
+    return
+  }
+
+  // 条件2: 只有服务器标记为 cacheable 的消息才缓存
+  if (!msg.metadata?.cacheable) {
+    return
+  }
+
+  // 条件3: 必须有 hash 字段
+  if (!msg.hash) {
+    LOG.error("ForwardMsg has no hash...")
+    return
+  }
+
+  // 条件4: 如果已缓存，只更新 scriptRunCount（不重复存储）
+  if (this.getCachedMessage(msg.hash, true) !== undefined) {
+    return
+  }
+
+  // 满足所有条件 → 存入缓存
+  LOG.info(`Caching ForwardMsg [hash=${msg.hash}]`)
+  this.messages.set(
+    msg.hash,
+    new CacheEntry(
+      encodedMsg,                          // 存原始二进制（不是解码后的对象）
+      this.scriptRunCount,
+      msg.delta?.fragmentId ?? undefined
+    )
+  )
+}
+```
+
+**关键设计决策**：
+- 缓存存储的是原始 `Uint8Array` 编码消息，而非解码后的 `ForwardMsg` 对象。这是为了节省内存（避免同时保留两份数据），同时保持精确性（反序列化可能不具有完全的往返一致性）。
+
+#### 4.4.3 缓存读取逻辑：getCachedMessage()
+
+```typescript
+// ForwardMessageCache.ts L203-L216
+private getCachedMessage(
+  hash: string,
+  updateScriptRunCount: boolean
+): ForwardMsg | undefined {
+  const cachedEntry = this.messages.get(hash)
+  if (isNullOrUndefined(cachedEntry)) {
+    return undefined
+  }
+
+  // 更新 LRU 时间戳（用 scriptRunCount 代替）
+  if (updateScriptRunCount) {
+    cachedEntry.scriptRunCount = this.scriptRunCount
+  }
+
+  // 动态解码：只有被引用时才解码
+  return ForwardMsg.decode(cachedEntry.encodedMsg)
+}
+```
+
+#### 4.4.4 缓存过期与清理
+
+```typescript
+// ForwardMessageCache.ts L70-L100
+public incrementRunCount(
+  maxMessageAge: number,
+  fragmentIdsThisRun: string[]
+): void {
+  this.scriptRunCount += 1
+
+  this.messages.forEach((entry, hash) => {
+    // 如果是 fragment run，只清理当前 fragment 相关的缓存
+    if (
+      fragmentIdsThisRun.length > 0 &&
+      (!entry.fragmentId || !fragmentIdsThisRun.includes(entry.fragmentId))
+    ) {
+      return
+    }
+
+    // 超过 maxMessageAge 次 rerun 未被访问 → 清理
+    if (entry.getAge(this.scriptRunCount) > maxMessageAge) {
+      LOG.info(`Removing expired ForwardMsg [hash=${hash}]`)
+      this.messages.delete(hash)
+    }
+  })
+}
+```
+
+**LRU 算法**：不是标准的 LRU，而是基于"脚本运行次数"的 Age 算法。每次脚本运行完成时，`scriptRunCount` 递增 1。缓存条目的 `age = currentRunCount - entry.scriptRunCount`。超过 `maxMessageAge`（默认值由服务器配置，通常为 1~2 次 rerun）就会被清理。
+
+**调用时机**：在 `handleScriptFinished()` 中调用，见 [App.tsx](./frontend/app/src/App.tsx#L1634-L1645)：
+
+```typescript
+// App.tsx L1634-L1645
+this.connectionManager?.incrementMessageCacheRunCount(
+  // maxMessageAge
+  status === ForwardMsg.ScriptFinishedStatus.FINISHED_EARLY_FOR_RERUN
+    ? 2
+    : 1,
+  // fragmentIdsThisRun
+  status === ForwardMsg.ScriptFinishedStatus.FINISHED_FRAGMENT_RUN_SUCCESSFUL
+    ? [this.state.currentFragmentId!]
+    : []
+)
+```
+
+**对于 Arrow 数据的意义**：几 MB 甚至几十 MB 的 Arrow bytes 不会在 rerun 时重复传输。当同一个 DataFrame 在多次 rerun 中出现时：
+- 第 1 次：发送完整消息 + `metadata.cacheable = true` → 前端缓存
+- 第 2 次及以后：只发送 `ForwardMsg{ref_hash: "abc123", metadata: {...}}`（约 50 字节），前端还原成原始消息
+
+---
+
+### 4.5 消息分发：App.tsx handleMessage()
+
+消息队列按顺序分发后，到达 [App.tsx](./frontend/app/src/App.tsx#L968-L1042) 的 `handleMessage()` 回调。这是消息类型路由的核心：
+
+```typescript
+handleMessage = (msgProto: ForwardMsg): void => {
+  const dispatchProto = (
+    obj: ForwardMsg,
+    name: string,
+    funcs: Record<string, (value: any) => void>
+  ): void => {
+    const whichOne = (obj as unknown as Record<string, unknown>)[
+      name
+    ] as string
+    if (whichOne in funcs) {
+      return funcs[whichOne](
+        (obj as unknown as Record<string, unknown>)[whichOne]
+      )
+    }
+    throw new Error(`Cannot handle ${name} "${whichOne}".`)
+  }
+
+  try {
+    dispatchProto(msgProto, "type", {
+      newSession: (newSessionMsg: NewSession) =>
+        this.handleNewSession(newSessionMsg),
+      sessionStatusChanged: (msg: SessionStatus) =>
+        this.handleSessionStatusChanged(msg),
+      sessionEvent: (evtMsg: SessionEvent) =>
+        this.handleSessionEvent(evtMsg),
+      delta: (deltaMsg: Delta) =>
+        this.handleDeltaMsg(
+          deltaMsg,
+          msgProto.metadata as ForwardMsgMetadata,
+          msgProto.hash  // elementHash 传递给下游做 memoization
+        ),
+      pageConfigChanged: (pageConfig: PageConfig) =>
+        this.handlePageConfigChanged(pageConfig),
+      scriptFinished: (status: ForwardMsg.ScriptFinishedStatus) =>
+        this.handleScriptFinished(status),
+      // ... 其他 10+ 种消息类型
+    })
+  } catch (e) {
+    const err = ensureError(e)
+    LOG.error(err)
+    this.showError("Bad message format", { message: err.message })
+  }
+}
+```
+
+**关键点**：
+- `msgProto.hash` 会传递给 `handleDeltaMsg`，最终成为 ElementNode 的 `elementHash`，用于前端组件的 memoization
+- 对于 Arrow 数据来说，这个 `hash` 是避免重复解析的关键锚点
+
+---
+
+### 4.6 Delta 应用：AppRoot.applyDelta()
+
+`handleDeltaMsg` 调用 `AppRoot.applyDelta()` 将 Delta 应用到渲染树：
+
+```typescript
+// App.tsx L1757-L1771
+handleDeltaMsg = (
+  deltaMsg: Delta,
+  metadataMsg: ForwardMsgMetadata,
+  elementHash?: string
+): void => {
+  this.setState(prevState => ({
+    elements: prevState.elements.applyDelta(
+      prevState.scriptRunId,
+      deltaMsg,
+      metadataMsg,
+      elementHash
+    ),
+  }))
+}
+```
+
+[AppRoot.ts](./frontend/lib/src/render-tree/AppRoot.ts#L238-L360) 的 `applyDelta()` 是核心渲染树更新方法：
+
+```typescript
+public applyDelta(
+  scriptRunId: string,
+  delta: Delta,
+  metadata: ForwardMsgMetadata,
+  elementHash?: string
+): AppRoot {
+  // 步骤1: 通过 delta_path 定位目标节点
+  const deltaPath = metadata.deltaPath.length > 0
+    ? metadata.deltaPath
+    : delta.deltaPath
+  const targetNode = new GetNodeByDeltaPathVisitor(deltaPath).visit(this.root)
+
+  // 步骤2: 执行 Delta 操作（addBlock / addRows / addColumns / setElement 等）
+  let newElement: Element | undefined
+  switch (delta.operation) {
+    case Delta.Operation.SET_INSERT_ELEMENT:
+      // 对于 Arrow DataFrame 数据，这是主要路径
+      newElement = (delta as Delta).newElement
+      break
+    // ... 其他操作类型
+  }
+
+  // 步骤3: 元素 payload 复用检测（核心性能优化！）
+  if (canReuseElementPayload(existingNode, elementHash, newElement)) {
+    // 相同 hash 的元素，直接复用现有 node 的 element payload
+    newNode = new ElementNode(
+      existingNode.element,  // 复用原有 element（包含 Arrow bytes！）
+      metadata,
+      scriptRunId,
+      mainScriptHash,
+      existingNode.elementHash
+    )
+  } else {
+    // 新元素，正常创建
+    newNode = new ElementNode(
+      newElement,
+      metadata,
+      scriptRunId,
+      mainScriptHash,
+      elementHash
+    )
+  }
+
+  // 步骤4: 将新节点写入渲染树
+  const newRoot = new SetNodeByDeltaPathVisitor(deltaPath, newNode).visit(this.root)
+  return new AppRoot(this.mainScriptHash, newRoot, this.appLogo)
+}
+```
+
+#### 元素 payload 复用：canReuseElementPayload()
+
+这是 Arrow 数据的第二道防线（第一道是 ForwardMsgCache）：
+
+```typescript
+// AppRoot.ts L53-L66
+function canReuseElementPayload(
+  existingNode: AppNode | undefined,
+  elementHash: string | undefined,
+  nextElement: Element
+): existingNode is ElementNode {
+  return (
+    Boolean(elementHash) &&
+    nextElement.type !== undefined &&
+    existingNode instanceof ElementNode &&
+    existingNode.elementHash === elementHash &&
+    existingNode.element.type === nextElement.type &&
+    !nextElement.hasOneShotEffect
+  )
+}
+```
+
+**复用生效场景**：
+- 两次 rerun 中同一个位置（相同 delta_path）的 DataFrame
+- elementHash 相同（表示 Arrow 数据内容未变）
+- 元素类型相同
+- 没有 `hasOneShotEffect` 标记
+
+**效果**：即使 ForwardMsgCache 未命中（例如 hash 算法或缓存策略差异），这道防线仍能避免 React 重新创建包含 Arrow bytes 的 Element 对象。结合下游组件的 `useMemo`，最终避免重新解析几 MB 的 Arrow IPC bytes。
+
+---
+
+### 4.7 前端接收链路完整时序
+
+```
+WebSocket 二进制帧 (ArrayBuffer)
+       │
+       ▼  WebsocketConnection.tsx L552-L560
+  websocket.onmessage 事件
+       │
+       ▼  L699-L723
+  handleMessage(data: ArrayBuffer)
+       ├─ 分配 messageIndex (保证顺序)
+       ├─ ForwardMsg.decode(encodedMsg) ────┐
+       ├─ cache.processMessagePayload()     │
+       │    ├─ maybeCacheMessage()          │
+       │    │    ├─ 检查 type != "refHash"  │
+       │    │    ├─ 检查 metadata.cacheable │
+       │    │    └─ 存入 Map<hash, CacheEntry>
+       │    └─ 如果 type == "refHash":
+       │         ├─ getCachedMessage(refHash)
+       │         │    └─ ForwardMsg.decode(缓存的 encodedMsg)  ←──┘
+       │         ├─ 合并 metadata（refMsg 的最新 metadata）
+       │         └─ 返回还原后的完整 ForwardMsg
+       ├─ 存入 messageQueue[messageIndex]
+       └─ while (lastDispatched+1 in queue):
+             └─ onMessage(ForwardMsg) ──┐
+                                         │
+       ┌─────────────────────────────────┘
+       ▼  App.tsx L968-L1042
+  handleMessage(msgProto: ForwardMsg)
+       └─ dispatchProto(msgProto, "type", {
+             delta: (deltaMsg) => handleDeltaMsg(deltaMsg, metadata, hash)
+          })
+       │
+       ▼  L1757-L1771
+  handleDeltaMsg()
+       └─ setState(prev => ({
+             elements: prev.elements.applyDelta(scriptRunId, deltaMsg, metadata, elementHash)
+          }))
+       │
+       ▼  AppRoot.ts L238-L360
+  applyDelta()
+       ├─ GetNodeByDeltaPathVisitor → 定位目标节点
+       ├─ canReuseElementPayload() → 检查是否可复用 Arrow payload
+       │    ├─ elementHash 匹配？
+       │    ├─ 元素类型匹配？
+       │    └─ 非 one-shot？
+       ├─ 复用 or 创建新 ElementNode
+       ├─ SetNodeByDeltaPathVisitor → 写入渲染树
+       └─ 返回新 AppRoot（不可变更新）
+       │
+       ▼
+  React setState → 重新渲染
+       │
+       ▼  DataFrame.tsx
+  useMemo(() => new Quiver(element.arrowData), [elementHash, element.arrowData])
+       └─ elementHash 不变 → 跳过重新解析！
+```
+
+### 4.8 WebSocket 传输层细节
+
+- **二进制传输**：WebSocket `binaryType = "arraybuffer"`，Protobuf 的 `bytes` 字段在 WebSocket 二进制帧中直接传输，无需 base64 编码。Arrow IPC bytes 在整个链路中保持二进制形态，直到前端 Quiver 解析。
+- **认证令牌传输**：通过 `Sec-WebSocket-Protocol` 头传递（浏览器 API 不允许设置自定义 HTTP 头），见 [WebsocketConnection.tsx L531-L544](./frontend/connection/src/WebsocketConnection.tsx#L531-L544)。
+- **消息大小硬限制**：Protobuf 单个消息默认上限为 2GB（C++ 实现），但 Streamlit 通过 `server.maxMessageSize` 配置项（默认 ~200MB）进行更严格的限制。超过限制时：
+  - 若开启 `server.enableArrowTruncation`：自动截断表格（见 2.7 节）
+  - 否则：WebSocket 层报错，连接可能断开
 
 ---
 
@@ -468,7 +876,7 @@ Protobuf 单个消息默认上限为 2GB（C++ 实现），但 Streamlit 通过 
 
 ### 5.1 核心解析器：parseArrowIpcBytes()
 
-[arrowParseUtils.ts](file:///d:/fz/0601/solo-dogfeeding/code/220-streamlit/frontend/lib/src/dataframes/arrowParseUtils.ts#L346-L408) 是前端所有 Arrow 数据解析的统一入口：
+[arrowParseUtils.ts](./frontend/lib/src/dataframes/arrowParseUtils.ts#L346-L408) 是前端所有 Arrow 数据解析的统一入口：
 
 ```typescript
 export function parseArrowIpcBytes(ipcBytes: Uint8Array): ParsedTable {
@@ -542,7 +950,7 @@ if (isPandasRangeIndex(indexCol)) {
 "('Level1', 'Level2')"   ← Pandas MultiIndex columns
 ```
 
-前端解析逻辑 [arrowParseUtils.ts#L134-L146](file:///d:/fz/0601/solo-dogfeeding/code/220-streamlit/frontend/lib/src/dataframes/arrowParseUtils.ts#L134-L146)：
+前端解析逻辑 [arrowParseUtils.ts#L134-L146](./frontend/lib/src/dataframes/arrowParseUtils.ts#L134-L146)：
 ```
 name = "('1','foo (bar)')"
   → trim()
@@ -554,7 +962,7 @@ name = "('1','foo (bar)')"
 
 ### 5.4 Quiver：前端数据容器
 
-[Quiver.ts](file:///d:/fz/0601/solo-dogfeeding/code/220-streamlit/frontend/lib/src/dataframes/Quiver.ts) 将 Arrow 的列式存储转换为前端易用的行列访问接口：
+[Quiver.ts](./frontend/lib/src/dataframes/Quiver.ts) 将 Arrow 的列式存储转换为前端易用的行列访问接口：
 
 ```typescript
 class Quiver {
@@ -594,7 +1002,7 @@ function parseStyler(pandasStyler: ArrowData.PandasStyler): PandasStylerData {
 
 #### 路径 A：交互式 DataFrame（glide-data-grid）
 
-[DataFrame.tsx](file:///d:/fz/0601/solo-dogfeeding/code/220-streamlit/frontend/lib/src/components/widgets/DataFrame/DataFrame.tsx#L80-L120)：
+[DataFrame.tsx](./frontend/lib/src/components/widgets/DataFrame/DataFrame.tsx#L80-L120)：
 ```
 Dataframe Proto
   └─ useMemo(() => new Quiver(element.arrowData), [elementHash, element.arrowData])
@@ -607,7 +1015,7 @@ Dataframe Proto
 
 #### 路径 B：静态 Table（HTML Table）
 
-[Table.tsx](file:///d:/fz/0601/solo-dogfeeding/code/220-streamlit/frontend/lib/src/components/elements/Table/Table.tsx#L80-L99)：
+[Table.tsx](./frontend/lib/src/components/elements/Table/Table.tsx#L80-L99)：
 ```
 Table Proto
   └─ useMemo(() => new Quiver(element.arrowData), [elementHash, element.arrowData])
@@ -619,7 +1027,7 @@ Table Proto
 
 #### 路径 C：双向组件 MixedData 还原
 
-[reconstructMixedData.ts](file:///d:/fz/0601/solo-dogfeeding/code/220-streamlit/frontend/lib/src/components/widgets/BidiComponent/utils/reconstructMixedData.ts#L42-L92)：
+[reconstructMixedData.ts](./frontend/lib/src/components/widgets/BidiComponent/utils/reconstructMixedData.ts#L42-L92)：
 
 ```typescript
 // 前端还原：遍历 JSON dict 第一层，将 {__arrow_ref__: refId} 占位符替换为实际 Arrow Table
@@ -660,3 +1068,9 @@ reconstructMixedData(jsonData, arrowBlobs):
 4. **Large 类型降级**：为兼容第三方旧版 Arrow JS 而在后端强制降级，本质是向后兼容的技术债。未来要求自定义组件升级 Arrow 版本后可移除。
 
 5. **ForwardMsgCache + Arrow 字节的协同**：这是大数据量 rerun 性能的关键优化。相同数据跨 run 不重复传输，是用户感知"快"的重要原因。
+
+6. **缓存存储原始二进制而非解码对象**：ForwardMessageCache 存储 `Uint8Array` 而非 `ForwardMsg` 对象，节省内存且保证精确性。
+
+7. **双重 memoization 防线**：ForwardMsgCache（传输层）+ canReuseElementPayload（渲染层）+ 组件 useMemo（渲染层）共同确保 Arrow 数据在 rerun 时不被重复传输、重复创建、重复解析。
+
+8. **基于 scriptRunCount 的 Age 缓存过期**：不同于标准 LRU，用脚本运行次数作为时间维度，更符合 Streamlit rerun 的使用模式。
