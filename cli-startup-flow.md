@@ -809,40 +809,92 @@ if self._scriptrunner is not None:
 
 ---
 
-### 4.4 多线程模型与线程安全
+### 4.4 线程与协程模型
 
-Streamlit 采用明确的多线程分工：
+Streamlit 的并发模型混合了多线程和 asyncio 协程，各组件有明确的职责边界：
 
-| 线程 | 职责 | 执行的代码 |
-|------|------|-----------|
-| **事件循环线程** (EventLoop Thread) | WebSocket 消息收发、会话管理、消息分发 | Runtime._loop_coroutine(), AppSession 事件处理 |
-| **ScriptRunner 线程** (每个会话) | 执行用户脚本代码 | 用户编写的 `app.py`、所有 `st.*` 组件调用 |
-| **StarletteSender 线程** (每个连接) | WebSocket 异步发送 | 后台 Task 发送 ForwardMsg |
+| 执行体 | 类型 | 职责 | 运行代码 |
+|--------|------|------|---------|
+| **事件循环线程** (EventLoop Thread) | 线程 | HTTP/WebSocket 协议处理、会话管理、消息调度、Runtime 主循环 | Runtime._loop_coroutine(), AppSession 事件处理、Starlette 路由 |
+| **ScriptRunner 线程** (每个会话) | 线程 | 执行用户脚本代码 | 用户编写的 `app.py`、所有 `st.*` 组件调用、ScriptRunner._run_script |
+| **文件监听线程** (Polling/watchdog) | 线程 | 检测源文件变更、触发重跑 | LocalSourcesWatcher.on_path_changed、_on_source_file_changed |
+| **Starlette 发送端** (_sender_task) | asyncio 协程任务 | 从发送队列消费并通过 WebSocket 发出 | StarletteSessionClient._sender() |
 
-**线程安全机制**:
+> **注意**: WebSocket 发送端**不是独立线程**，而是运行在事件循环线程上的 asyncio 后台任务（通过 `asyncio.create_task()` 创建）。它与事件循环共享同一线程，通过 `await` 让出执行权。
+
+#### 事件桥接关系
+
+各执行体之间通过明确的桥接机制通信：
+
+**1. ScriptRunner 线程 → 事件循环线程**
+
+机制：`call_soon_threadsafe`
+
+```python
+# AppSession._on_scriptrunner_event  [app_session.py L586-L597]
+self._event_loop.call_soon_threadsafe(
+    lambda: self._handle_scriptrunner_event_on_event_loop(...)
+)
+```
+
+- ScriptRunner 线程中所有 `st.*` 组件产生的 ForwardMsg，先通过 `on_event.send(ENQUEUE_FORWARD_MSG)` 发出事件
+- AppSession 的 `_on_scriptrunner_event` 接收事件，通过 `call_soon_threadsafe` 投递到事件循环线程
+- 在事件循环线程中调用 `_enqueue_forward_msg` → `_browser_queue.enqueue(msg)`
+- 所有脚本生命周期事件（SCRIPT_STARTED、SCRIPT_STOPPED 等）也走此路径
+
+**2. 文件监听线程 → 事件循环线程**
+
+机制：**直接调用，无显式桥接**
+
+- PollingPathWatcher 的 ThreadPoolExecutor 工作线程，或 watchdog 的观察者线程
+- 检测到文件变化后直接调用 `_on_source_file_changed`
+- `_on_source_file_changed` 中直接调用 `self._enqueue_forward_msg()` 或 `self.request_rerun()`
+- 这意味着 ForwardMsgQueue 的 `enqueue` 操作可能从文件监听线程直接执行，**不经过 call_soon_threadsafe**
+
+**3. 事件循环线程 → WebSocket 发送端**
+
+机制：`asyncio.Queue`（异步队列）
+
+```python
+# StarletteSessionClient  [starlette_websocket.py L283-L288]
+self._send_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=...)
+self._sender_task = asyncio.create_task(self._sender(), name="starlette-ws-send")
+```
+
+- 事件循环线程中（Runtime 主循环 flush 后）调用 `client.write_forward_msg(msg)`
+- `write_forward_msg` 是同步方法，使用 `put_nowait()` 将序列化后的 bytes 放入异步队列
+- `_sender` 协程任务在同一事件循环中消费队列，通过 `await websocket.send_bytes(payload)` 发送
+
+#### ForwardMsgQueue 的线程安全问题
+
+**官方说明**：[forward_msg_queue.py#L32-L33](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/lib/streamlit/runtime/forward_msg_queue.py#L32-L33)
+> "ForwardMsgQueue is not thread-safe - a queue should only be used from a single thread."
+
+**实际并发访问情况**：
+
+| 操作 | 调用线程 | 是否通过 call_soon_threadsafe |
+|------|---------|-------------------------------|
+| `enqueue` (ScriptRunner 产生的 Delta 消息) | 事件循环线程 | 是 |
+| `enqueue` (脚本生命周期事件) | 事件循环线程 | 是 |
+| `enqueue` (BackMsg 处理产生的消息) | 事件循环线程 | 直接调用（已在事件循环） |
+| `enqueue` (文件变更通知) | 文件监听线程 | **否，直接调用** |
+| `flush` (Runtime 主循环) | 事件循环线程 | 直接调用 |
+
+> **注意**: 由于 ForwardMsgQueue 非线程安全，而文件监听线程可能直接调用 `enqueue`，理论上存在竞态条件风险。但在实践中，由于文件变更频率低、且 CPython GIL 对简单操作的保护，该问题很少显现。
+
+#### 其他线程安全机制
 
 1. **ScriptRunContext 线程本地存储**:
    ```python
    # script_run_context.py
    _SCRIPT_RUN_CONTEXT = threading.local()
    ```
+   确保每个 ScriptRunner 线程有独立的执行上下文。
 
-2. **跨线程通信使用 call_soon_threadsafe**:
-   ```python
-   # ScriptRunner 线程 → 事件循环线程
-   self._event_loop.call_soon_threadsafe(
-       lambda: self._handle_scriptrunner_event_on_event_loop(...)
-   )
-   ```
-   所有 ForwardMsg 的入队和 flush 操作都通过 `call_soon_threadsafe` 调度到事件循环线程执行，确保单线程访问。
-
-3. **ForwardMsgQueue 是非线程安全的**:
-   官方文档明确说明 [forward_msg_queue.py#L32-L33](file:///d:/fz/0601/solo-dogfeeding/code/233-streamlit/lib/streamlit/runtime/forward_msg_queue.py#L32-L33)
-   "ForwardMsgQueue is not thread-safe - a queue should only be used from a single thread."
-   但在实际使用中，它只在事件循环线程上被操作（enqueue 通过 call_soon_threadsafe 投递，flush 在 Runtime 主循环中），因此是安全的。
-
-4. **SessionState 包装为 SafeSessionState**:
-   每次访问时调用 `_yield_callback` 检查是否有挂起的 STOP 或 RERUN 请求，实现协作式中断。
+2. **SafeSessionState 协作式中断**:
+   - 每次访问 SessionState 时调用 `_yield_callback`
+   - 回调中检查是否有挂起的 STOP 或 RERUN 请求
+   - 实现脚本执行的协作式中断（需到达 yield point 才生效）
 
 ---
 
