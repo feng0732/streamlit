@@ -33,7 +33,7 @@
 
 图表 API 通过多重继承挂载到 `DeltaGenerator`：
 
-- `lib/streamlit/delta_generator.py` 中 `class DeltaGenerator` 继承了所有图表 Mixin
+- [delta_generator.py](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/delta_generator.py) 中 `class DeltaGenerator` 继承了所有图表 Mixin
 - 每个图表类型独立实现为 Mixin（如 `VegaChartsMixin`、`PlotlyMixin`、`PydeckMixin`、`GraphvizMixin`）
 - Mixin 中的方法最终调用 `self.dg._enqueue(element_type, proto)` 发送消息
 
@@ -72,10 +72,10 @@ st.line_chart / st.bar_chart / st.area_chart / st.scatter_chart
 
 | 组件 | 位置 | 说明 |
 |------|------|------|
-| VegaChartsMixin | `lib/streamlit/elements/vega_charts.py` | line_chart/bar_chart/area_chart/scatter_chart/altair_chart/vega_lite_chart 全部实现 |
-| generate_chart | `lib/streamlit/elements/lib/built_in_chart_utils.py` | 内置图表主入口，返回 Altair Chart |
-| _vega_lite_chart | `lib/streamlit/elements/vega_charts.py` | Vega-Lite 最终入队方法 |
-| _marshall_chart_data | `lib/streamlit/elements/vega_charts.py` | 数据序列化为 Arrow 并填充 proto |
+| VegaChartsMixin | [vega_charts.py](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/vega_charts.py) | line_chart/bar_chart/area_chart/scatter_chart/altair_chart/vega_lite_chart 全部实现 |
+| generate_chart | [built_in_chart_utils.py](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/lib/built_in_chart_utils.py) | 内置图表主入口，返回 Altair Chart |
+| _vega_lite_chart | [vega_charts.py](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/vega_charts.py) | Vega-Lite 最终入队方法 |
+| _marshall_chart_data | [vega_charts.py](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/vega_charts.py) | 数据序列化为 Arrow 并填充 proto |
 
 #### 数据预处理流水线（generate_chart 内部）
 
@@ -111,7 +111,7 @@ st.plotly_chart(figure_or_data)
           └─► self.dg._enqueue("plotly_chart", proto)
 ```
 
-位置：`lib/streamlit/elements/plotly_chart.py`
+位置：[plotly_chart.py](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/plotly_chart.py)
 
 ### 2.4 Matplotlib / Pyplot 链路
 
@@ -126,20 +126,28 @@ st.pyplot(fig)
           └─► self.dg._enqueue("imgs", proto)
 ```
 
-位置：`lib/streamlit/elements/pyplot.py`
+位置：[pyplot.py](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/pyplot.py)
 
 ### 2.5 Graphviz / PyDeck / Map 链路
 
 | 图表类型 | 后端序列化方式 | proto |
 |----------|---------------|-------|
 | st.graphviz_chart | DOT source string | `graphviz_chart` (spec, engine) |
-| st.pydeck_chart | Deck.GL JSON via pydeck.Deck.to_json() | `deck_gl_json_chart` |
-| st.map | 内部调用 `_map()`，转 Arrow bytes + Deck.GL JSON | `deck_gl_json_chart` |
+| st.pydeck_chart | `pydeck_obj is None` 时序列化为 `EMPTY_MAP`（仅 initialViewState，无 layers）；否则 `pydeck_obj.to_json()` 生成完整 Deck.GL JSON | `deck_gl_json_chart` |
+| st.map | `data is None` 或 `data.empty` 时序列化为 `_DEFAULT_MAP`（同 EMPTY_MAP）；有数据时深拷贝 `_DEFAULT_MAP`，覆盖 initialViewState 为自动计算的居中坐标和缩放级别，并追加 `layers` 数组含 ScatterplotLayer | `deck_gl_json_chart` |
+
+> **注意**：PyDeck 和 st.map 都**不使用 Arrow IPC** 传输数据，而是将图层数据序列化为 JSON 内嵌在 spec 中。st.map 的 ScatterplotLayer 数据通过 `df.to_dict(orient="records")` 转为对象数组，直接嵌入 Deck.GL JSON 的 `layers[0].data` 字段。
+>
+> **st.map 空数据 vs 有数据的关键差异**：
+> - **空数据**（None / empty df）：`EMPTY_MAP` / `_DEFAULT_MAP` 只有 `{"initialViewState": {"latitude": 0, "longitude": 0, "pitch": 0, "zoom": 1}}`，**无 layers 字段**，前端渲染一个以 (0,0) 为中心 zoom=1 的空底图
+> - **有数据**：深拷贝 `_DEFAULT_MAP` 后通过 `_get_viewport_details(df, lat, lon, zoom)` 自动计算居中坐标（经纬度中点）和缩放级别（基于经纬度范围查 `_ZOOM_LEVELS` 表），然后添加 ScatterplotLayer
+>
+> 代码位置：[map.py](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/map.py) `to_deckgl_json()` / `_get_viewport_details()` / `_get_zoom_level()`
 
 ### 2.6 Bokeh 状态
 
 Bokeh 已废弃，仅显示 deprecation warning 不做任何渲染：
-`lib/streamlit/elements/bokeh_chart.py`
+[bokeh_chart.py](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/bokeh_chart.py)
 
 ---
 
@@ -147,7 +155,7 @@ Bokeh 已废弃，仅显示 deprecation warning 不做任何渲染：
 
 ### 3.1 统一数据转换入口：convert_anything_to_arrow_bytes
 
-`lib/streamlit/dataframe_util.py` 中 `convert_anything_to_arrow_bytes()` 是 Arrow 型图表数据序列化的统一入口，支持：
+[dataframe_util.py](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/dataframe_util.py) 中 `convert_anything_to_arrow_bytes()` 是 Arrow 型图表数据序列化的统一入口，支持：
 
 - `pa.Table`
 - Polars DataFrame / LazyFrame
@@ -195,7 +203,7 @@ ForwardMsg
 
 ### 4.1 Vega-Lite / Altair 前端渲染
 
-核心组件：`frontend/lib/src/components/elements/ArrowVegaLiteChart/ArrowVegaLiteChart.tsx`
+核心组件：[ArrowVegaLiteChart.tsx](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/frontend/lib/src/components/elements/ArrowVegaLiteChart/ArrowVegaLiteChart.tsx)
 
 ```
 ArrowVegaLiteChart (接收 element: VegaLiteChartProto)
@@ -237,7 +245,7 @@ ArrowVegaLiteChart (接收 element: VegaLiteChartProto)
 
 ### 4.2 Plotly 前端渲染
 
-核心组件：`frontend/lib/src/components/elements/PlotlyChart/PlotlyChart.tsx`
+核心组件：[PlotlyChart.tsx](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/frontend/lib/src/components/elements/PlotlyChart/PlotlyChart.tsx)
 
 ```
 PlotlyChart
@@ -255,7 +263,7 @@ PlotlyChart
 
 ### 4.3 Graphviz 前端渲染
 
-组件：`frontend/lib/src/components/elements/GraphVizChart/GraphVizChart.tsx`
+组件：[GraphVizChart.tsx](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/frontend/lib/src/components/elements/GraphVizChart/GraphVizChart.tsx)
 
 ```
 GraphVizChart
@@ -278,6 +286,7 @@ DeckGlJsonChart
     │
     ├─► useDeckGl() Hook
     │     ├─► JSON5.parse(element.json) 解析 Deck.GL JSON spec
+    │     │     ⚠️ 无 try/catch，解析失败直接抛错到祖先 ErrorBoundary
     │     ├─► 无 mapStyle 时按明/暗主题注入 Carto 底图（positron / dark-matter）
     │     ├─► Carto 底图未配 key → 自动注入 Streamlit 公用 cartoKey="x7g2plm9yq8vfrc"
     │     ├─► jsonConverter.convert() 将 @@type/@= 语法转为 Deck 图层实例
@@ -290,13 +299,19 @@ DeckGlJsonChart
     │     ├─► sanitizeSelection() 清理孤儿索引
     │     │     ├─► filterValidIndicesForLayer() 过滤越界索引，重新拉取当前对象
     │     │     └─► 图层无 ID / 非数组数据（URL/GeoJSON）→ 保留但无法验证
+    │     ├─► viewState 初始化：
+    │     │     useState(null) → useEffect 监听 deck.initialViewState 变化 → setViewState
+    │     │     首帧 viewState===null，<DeckGL> 不挂载（条件渲染）
     │     └─► useStWidthHeight 尺寸计算
     │           fallback: initialViewState.height → theme.sizes.defaultMapHeight
     │
     ├─► registerLoaders([CSVLoader, GLTFLoader])  注册数据加载器
-    ├─► viewState === null ? null : <DeckGL>   （避免 deck.gl runtime assertion）
+    ├─► viewState === null ? null : <DeckGL>   （null 时不挂载，避免 deck.gl runtime assertion）
     ├─► isInitialized 延迟一帧注入 layers（修复 HexagonLayers 首帧不渲染 bug）
     ├─► usesMapbox 检测 → 注入 MapBoxCss
+    ├─► 空数据场景（EMPTY_MAP）：
+    │     deck.layers 为空数组，仅渲染底图瓦片，无数据图层
+    │     initialViewState.latitude=0, longitude=0, zoom=1 → 非洲外海
     └─► Toolbar 提供全屏 / 清除选择等操作
 ```
 
@@ -308,13 +323,13 @@ DeckGlJsonChart
 
 | 边界问题 | 处理方式 | 位置 |
 |----------|---------|------|
-| facet / hconcat / repeat 图表 width=stretch 崩溃 | 后端 `_vega_lite_chart()` 检测这些类型，自动用 `width="content"` | `lib/streamlit/elements/vega_charts.py` |
+| facet / hconcat / repeat 图表 width=stretch 崩溃 | 后端 `_vega_lite_chart()` 检测这些类型，自动用 `width="content"` | [vega_charts.py](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/vega_charts.py) |
 | 嵌套 vconcat+hconcat infinite extent 错误 | `_has_nested_composition(spec)` 前后端双重检测，禁用强制宽度 | 前后端各一份实现 |
-| null legend title 导致无图例 | `_patch_null_legend_titles()` 把 `null` 替换为 `" "`（空格字符串） | `lib/streamlit/elements/vega_charts.py` |
-| autosize 配置冲突 | `_prepare_vega_lite_spec()` 统一处理：pad 类型 / fit 类型 / step 类型分别适配 | `lib/streamlit/elements/vega_charts.py` |
-| Altair 全局计数器导致每次 rerun spec 变化 | `_stabilize_vega_json_spec()` 正则替换 `param_\d+` / `view_\d+` 后缀 | `lib/streamlit/elements/vega_charts.py` |
-| 数据增量更新闪烁 | useVegaEmbed.updateData() 基于数据 hash 做 insert/remove/data 增量变更 | useVegaEmbed.ts |
-| CSP 合规（禁止 `new Function`） | vegaEmbed 选项 `ast: true` 将表达式编译为 AST 而非函数字符串 | ArrowVegaLiteChart.tsx |
+| null legend title 导致无图例 | `_patch_null_legend_titles()` 把 `null` 替换为 `" "`（空格字符串） | [vega_charts.py](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/vega_charts.py) |
+| autosize 配置冲突 | `_prepare_vega_lite_spec()` 统一处理：pad 类型 / fit 类型 / step 类型分别适配 | [vega_charts.py](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/vega_charts.py) |
+| Altair 全局计数器导致每次 rerun spec 变化 | `_stabilize_vega_json_spec()` 正则替换 `param_\d+` / `view_\d+` 后缀 | [vega_charts.py](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/vega_charts.py) |
+| 数据增量更新闪烁 | useVegaEmbed.updateData() 基于数据 hash 做 insert/remove/data 增量变更 | [useVegaEmbed.ts](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/frontend/lib/src/components/elements/ArrowVegaLiteChart/useVegaEmbed.ts) |
+| CSP 合规（禁止 `new Function`） | vegaEmbed 选项 `ast: true` 将表达式编译为 AST 而非函数字符串 | [ArrowVegaLiteChart.tsx](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/frontend/lib/src/components/elements/ArrowVegaLiteChart/ArrowVegaLiteChart.tsx) |
 
 ### 5.2 Plotly 渲染边界
 
@@ -336,17 +351,17 @@ DeckGlJsonChart
 
 | 边界问题 | 处理方式 | 位置 |
 |----------|---------|------|
-| viewState 为 null | `viewState && <DeckGL>` 条件渲染，避免 deck.gl runtime assertion error | DeckGlJsonChart.tsx |
-| HexagonLayers 首帧不渲染 | `useEffect` 延迟一帧 `setIsInitialized(true)`，`layers={isInitialized ? deck.layers : EMPTY_LAYERS}` | DeckGlJsonChart.tsx |
-| 无 mapStyle 配置 | 按明/暗主题自动注入 Carto 公共底图（positron-gl-style / dark-matter-gl-style） | useDeckGl.tsx |
-| Carto 底图未配 key | 自动注入 Streamlit 公用 cartoKey | useDeckGl.tsx |
-| 未定义 `views` 字段引发控制台警告 | `delete jsonCopy?.views` 主动移除 | useDeckGl.tsx |
-| 高度无配置 fallback | initialViewState.height → `theme.sizes.defaultMapHeight` | useDeckGl.tsx |
-| **后端**：data=None 或 df.empty | 使用 `EMPTY_MAP = {initialViewState: {lat:0, lon:0, zoom:1}}` 渲染空白世界地图 | deck_gl_json_chart.py / map.py |
-| **后端**：缺 lat/lon 列 | `StreamlitAPIException`，列出允许列名与现有列名 | map.py `_get_lat_or_lon_col_name()` |
-| **后端**：lat/lon 列含 NaN/NaT/None | `StreamlitAPIException` 禁止空值 | map.py `_get_lat_or_lon_col_name()` |
-| **后端**：color 列颜色格式非法 | `StreamlitAPIException: Column "X" does not appear to contain valid colors.` | map.py `_convert_color_arg_or_column()` |
-| **后端**：pandas 3.x 兼容性 | `_prepare_pydeck_for_json()` 把 Layer DataFrame 弱引用转为 `list[dict]`（pydeck vars() 访问 DataFrame 在 pd3 失效） | deck_gl_json_chart.py |
+| viewState 为 null | `viewState` 初始为 `null`（[useDeckGl.tsx](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/frontend/lib/src/components/elements/DeckGlJsonChart/useDeckGl.tsx) `useState<...|null>(null)`），由 `useEffect` 监听 `deck.initialViewState` 变化后才 `setViewState`。渲染侧 `viewState && <DeckGL>` 条件渲染，null 时不挂载 DeckGL，避免 deck.gl runtime assertion error | [DeckGlJsonChart.tsx](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/frontend/lib/src/components/elements/DeckGlJsonChart/DeckGlJsonChart.tsx) |
+| HexagonLayers 首帧不渲染 | `useEffect` 延迟一帧 `setIsInitialized(true)`，`layers={isInitialized ? deck.layers : EMPTY_LAYERS}` | [DeckGlJsonChart.tsx#L101-L106](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/frontend/lib/src/components/elements/DeckGlJsonChart/DeckGlJsonChart.tsx#L101-L106) |
+| 无 mapStyle 配置 | 按明/暗主题自动注入 Carto 公共底图（positron-gl-style / dark-matter-gl-style） | [useDeckGl.tsx#L397-L401](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/frontend/lib/src/components/elements/DeckGlJsonChart/useDeckGl.tsx#L397-L401) |
+| Carto 底图未配 key | 自动注入 Streamlit 公用 cartoKey=`x7g2plm9yq8vfrc` | [useDeckGl.tsx#L407-L413](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/frontend/lib/src/components/elements/DeckGlJsonChart/useDeckGl.tsx#L407-L413) |
+| 未定义 `views` 字段引发控制台警告 | `delete jsonCopy?.views` 主动移除 | [useDeckGl.tsx#L533](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/frontend/lib/src/components/elements/DeckGlJsonChart/useDeckGl.tsx#L533) |
+| 高度无配置 fallback | initialViewState.height → `theme.sizes.defaultMapHeight` | [useDeckGl.tsx#L335-L343](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/frontend/lib/src/components/elements/DeckGlJsonChart/useDeckGl.tsx#L335-L343) |
+| **后端**：data=None 或 df.empty | 序列化为 `EMPTY_MAP = {"initialViewState": {"latitude": 0, "longitude": 0, "pitch": 0, "zoom": 1}}`，**无 layers 字段**，仅渲染一个以 (0,0) 为中心、zoom=1 的空底图（无任何数据图层） | [deck_gl_json_chart.py](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/deck_gl_json_chart.py) EMPTY_MAP 定义 / [map.py](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/map.py) `_DEFAULT_MAP = dict(EMPTY_MAP)` |
+| **后端**：缺 lat/lon 列 | `StreamlitAPIException`，列出允许列名（`lat`, `latitude`, `LAT`, `LATITUDE`）与现有列名 | [map.py#L373-L380](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/map.py#L373-L380) |
+| **后端**：lat/lon 列含 NaN/NaT/None | `StreamlitAPIException` 禁止空值 | [map.py#L389-L393](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/map.py#L389-L393) |
+| **后端**：color 列颜色格式非法 | `StreamlitAPIException: Column 'X' does not appear to contain valid colors.` | [map.py#L452-L454](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/map.py#L452-L454) |
+| **后端**：pandas 3.x 兼容性 | `_prepare_pydeck_for_json()` 把 Layer DataFrame 弱引用转为 `list[dict]`（pydeck vars() 访问 DataFrame 在 pd3 失效） | [deck_gl_json_chart.py#L642-L680](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/deck_gl_json_chart.py#L642-L680) |
 
 ### 5.5 通用尺寸边界
 
@@ -360,7 +375,7 @@ DeckGlJsonChart
 
 ### 6.1 后端异常类型
 
-定义于 `lib/streamlit/errors/`，图表相关：
+定义于 [errors/](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/errors/)，图表相关：
 
 | 异常类 | 触发场景 |
 |--------|---------|
@@ -380,7 +395,7 @@ DeckGlJsonChart
 
 ### 6.3 前端异常兜底
 
-**React ErrorBoundary**：`frontend/lib/src/components/shared/ErrorBoundary/ErrorBoundary.tsx`
+**React ErrorBoundary**：[ErrorBoundary.tsx](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/frontend/lib/src/components/shared/ErrorBoundary/ErrorBoundary.tsx)
 
 - `getDerivedStateFromError` 捕获 React 渲染异常，降级显示 `ErrorElement`
 - `ChunkLoadError` 特殊处理：提示用户刷新页面（Streamlit 升级时前端代码版本不一致）
@@ -502,15 +517,16 @@ getDataArray(quiver)  arrowUtils.ts [L138-L201]
 
 | 场景 | 处理方式 | 位置 |
 |------|---------|------|
-| `st.pydeck_chart(None)` | `json.dumps(EMPTY_MAP)`，渲染空白世界地图（经纬度 0,0，zoom=1） | [deck_gl_json_chart.py#L65-L67](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/deck_gl_json_chart.py#L65-L67) |
-| `st.map(None)` / `st.map(empty_df)` | 复用 `_DEFAULT_MAP`（同 EMPTY_MAP） | [map.py#L53](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/map.py#L53) |
+| `st.pydeck_chart(None)` | `json.dumps(EMPTY_MAP)`，`EMPTY_MAP` **仅含 initialViewState、无 layers 字段**，前端渲染一个以 (0,0) 为中心、zoom=1 的空底图（只有 Carto 底图瓦片，无数据图层） | [deck_gl_json_chart.py](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/deck_gl_json_chart.py) EMPTY_MAP 定义 / `marshall()` 内 `pydeck_obj is None` 分支 |
+| `st.map(None)` / `st.map(empty_df)` | 复用 `_DEFAULT_MAP = dict(EMPTY_MAP)`，同样无 layers，渲染空底图 | [map.py](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/map.py) `to_deckgl_json()` 中 `data is None` / `data.empty` 分支 |
+| `st.map(df)` 有数据时 | 深拷贝 `_DEFAULT_MAP` 后**覆盖 initialViewState 为自动计算的居中坐标和缩放级别**，并添加 `layers` 数组含 ScatterplotLayer，数据通过 `df.to_dict("records")` 内嵌 | [map.py](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/map.py) `to_deckgl_json()` 中 `_get_viewport_details()` 自动居中 + `_get_zoom_level()` 自动缩放 |
 | PyDeck selection_mode 非法值 | `StreamlitAPIException` 列出合法选项 `{"single-object", "multi-object"}` | [deck_gl_json_chart.py#L93-L97](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/deck_gl_json_chart.py#L93-L97) |
 | PyDeck selection_mode 传集合（多值） | `StreamlitAPIException` 不支持多值 | [deck_gl_json_chart.py#L88-L91](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/deck_gl_json_chart.py#L88-L91) |
 | PyDeck on_select 非 `ignore/rerun/callable` | `StreamlitAPIException` | [deck_gl_json_chart.py#L548-L552](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/deck_gl_json_chart.py#L548-L552) |
 | pandas 3.x + pydeck DataFrame 序列化失败 | `_prepare_pydeck_for_json()` 将 DataFrame 弱引用转为 `list[dict]` | [deck_gl_json_chart.py#L642-L680](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/deck_gl_json_chart.py#L642-L680) |
-| `st.map` 找不到经纬度列 | `StreamlitAPIException` 列出候选列名与现有列名 | [map.py `_get_lat_or_lon_col_name()`] |
-| `st.map` 经纬度列含空值 | `StreamlitAPIException` 禁止 NaN/NaT/None | [map.py `_get_lat_or_lon_col_name()`] |
-| `st.map` color 列值非法 | `StreamlitAPIException` 提示颜色格式不合法 | [map.py `_convert_color_arg_or_column()`] |
+| `st.map` 找不到经纬度列 | `StreamlitAPIException` 列出候选列名与现有列名 | [map.py#L353-L395](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/map.py#L353-L395) |
+| `st.map` 经纬度列含空值 | `StreamlitAPIException` 禁止 NaN/NaT/None | [map.py#L389-L393](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/map.py#L389-L393) |
+| `st.map` color 列值非法 | `StreamlitAPIException` 提示颜色格式不合法 | [map.py#L427-L450](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/map.py#L427-L450) |
 | Mapbox token 缺失 | 优先取 pydeck_obj.mapbox_key，fallback 到 `config.get_option("mapbox.token")` | [deck_gl_json_chart.py#L538-L543](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/deck_gl_json_chart.py#L538-L543) |
 
 **前端兜底**：[useDeckGl.tsx](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/frontend/lib/src/components/elements/DeckGlJsonChart/useDeckGl.tsx)
@@ -521,7 +537,7 @@ getDataArray(quiver)  arrowUtils.ts [L138-L201]
 | 图层 id 缺失导致选择状态不可追踪 | `hasUnknownLayerId` 标记，所有旧选择被丢弃但不崩溃 | [useDeckGl.tsx#L185-L197](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/frontend/lib/src/components/elements/DeckGlJsonChart/useDeckGl.tsx#L185-L197) |
 | 数据长度缩水、选择索引越界 | `filterValidIndicesForLayer()` 过滤越界索引，重新拉取当前数据对象 | [useDeckGl.tsx#L224-L247](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/frontend/lib/src/components/elements/DeckGlJsonChart/useDeckGl.tsx#L224-L247) |
 | 图层被移除后仍保留旧选择 | `sanitizeSelection()` 检测 layerId 不存在则丢弃（全部无 id 时例外保留） | [useDeckGl.tsx#L255-L302](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/frontend/lib/src/components/elements/DeckGlJsonChart/useDeckGl.tsx#L255-L302) |
-| 视图状态 viewState 未初始化 | `viewState && <DeckGL>` 条件渲染，避免 deck.gl runtime assertion | [DeckGlJsonChart.tsx#L239-L270](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/frontend/lib/src/components/elements/DeckGlJsonChart/DeckGlJsonChart.tsx#L239-L270) |
+| 视图状态 viewState 未初始化 | `viewState` 初始值为 `null`（[useDeckGl.tsx](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/frontend/lib/src/components/elements/DeckGlJsonChart/useDeckGl.tsx) `useState(null)`），通过 `useEffect` 监听 `deck.initialViewState` 变化时才 `setViewState`。渲染侧 `viewState && <DeckGL>` 条件渲染，null 时不挂载 DeckGL 避免其内部 assertion error | [DeckGlJsonChart.tsx](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/frontend/lib/src/components/elements/DeckGlJsonChart/DeckGlJsonChart.tsx) |
 | HexagonLayers 首帧不渲染 bug | `useEffect` 延迟一帧 `setIsInitialized(true)`，layers 延迟注入 | [DeckGlJsonChart.tsx#L101-L106](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/frontend/lib/src/components/elements/DeckGlJsonChart/DeckGlJsonChart.tsx#L101-L106) |
 | WebGL 上下文不足 | 浏览器自动回收最早的 WebGL 上下文，Streamlit 仅文档提示 ≤8 张图 | [deck_gl_json_chart.py#L346-L352](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/lib/streamlit/elements/deck_gl_json_chart.py#L346-L352) |
 | tooltip 模板变量不存在（`{col_not_exist}`） | `interpolate()` 未匹配则保留原模板字符串，不抛错 | [useDeckGl.tsx#L104-L121](file:///d:/fz/0601/solo-dogfeeding/code/223-streamlit/frontend/lib/src/components/elements/DeckGlJsonChart/useDeckGl.tsx#L104-L121) |
@@ -576,7 +592,84 @@ def deserialize(self, ui_value: str | None) -> PydeckState:
 
 ---
 
-## 8. 扩展图表类型的接入范式
+## 8. 完整端到端示例：st.map(df)
+
+```
+用户代码: st.map(df, latitude="lat", longitude="lon", size=100, color="#ff0000")
+    │
+    ▼
+[Python] MapMixin.map()
+    │
+    ├─ to_deckgl_json(df, lat="lat", lon="lon", size=100, color="#ff0000", zoom=None)
+    │    ├─ data is None? No → 不走 EMPTY_MAP
+    │    ├─ convert_anything_to_pandas_df(df)
+    │    ├─ _get_lat_or_lon_col_name(df, "latitude", "lat", {"lat","latitude","LAT","LATITUDE"})
+    │    ├─ _get_lat_or_lon_col_name(df, "longitude", "lon", {"lon","longitude","LON","LONGITUDE"})
+    │    ├─ _get_value_and_col_name(df, 100, _DEFAULT_SIZE=100) → ("100", None)
+    │    ├─ _convert_color_arg_or_column(df, "#ff0000", None) → (255, 0, 0, 255)
+    │    ├─ _get_viewport_details(df, "lat", "lon", None)
+    │    │    ├─ center_lat = (max_lat + min_lat) / 2.0
+    │    │    ├─ center_lon = (max_lon + min_lon) / 2.0
+    │    │    └─ zoom = _get_zoom_level(max(range_lat, range_lon))  查 _ZOOM_LEVELS 表
+    │    │
+    │    └─ 构建 JSON:
+    │         default = copy.deepcopy(_DEFAULT_MAP)
+    │         default["initialViewState"]["latitude"] = center_lat    ← 覆盖默认 0
+    │         default["initialViewState"]["longitude"] = center_lon   ← 覆盖默认 0
+    │         default["initialViewState"]["zoom"] = zoom              ← 覆盖默认 1
+    │         default["layers"] = [{
+    │             "@@type": "ScatterplotLayer",
+    │             "getPosition": "@@=[lon, lat]",
+    │             "getRadius": "100",
+    │             "radiusMinPixels": 3,
+    │             "radiusUnits": "meters",
+    │             "getFillColor": [255, 0, 0, 255],
+    │             "data": df.to_dict("records")    ← 内嵌 JSON
+    │         }]
+    │
+    └─ marshall(map_proto, deck_gl_json) → _enqueue("deck_gl_json_chart", ...)
+         │
+         ▼
+[WebSocket] ForwardMsg { delta: { new_element: { deck_gl_json_chart: { json: "..." } } } }
+         │
+         ▼
+[React] DeckGlJsonChart
+    ├─ useDeckGl: JSON5.parse(element.json) → ParsedDeckGlConfig
+    │    ├─ 无 mapStyle → 注入 Carto 底图 (positron/dark-matter)
+    │    ├─ Carto 底图 → 注入 cartoKey="x7g2plm9yq8vfrc"
+    │    ├─ jsonConverter.convert() → DeckObject (layers 解析为 Deck 层实例)
+    │    └─ useEffect: deck.initialViewState 变化 → setViewState
+    │
+    ├─ viewState !== null → <DeckGL viewState={...} layers={deck.layers}>
+    │    └─ <StaticMap mapStyle={deck.mapStyle} mapboxApiAccessToken={...} />
+    │
+    └─ 渲染: Carto 底图 + ScatterplotLayer 散点
+```
+
+### 对比：st.map(None) 空数据链路
+
+```
+用户代码: st.map(None)
+    │
+    ▼
+[Python] to_deckgl_json(data=None, ...)
+    └─ data is None → return json.dumps(_DEFAULT_MAP)
+         _DEFAULT_MAP = {"initialViewState": {"latitude": 0, "longitude": 0, "pitch": 0, "zoom": 1}}
+         ⚠️ 无 layers 字段！
+    │
+    ▼
+[React] DeckGlJsonChart
+    ├─ useDeckGl: JSON5.parse → { initialViewState: {...} }，无 layers
+    │    ├─ 无 mapStyle → 注入 Carto 底图
+    │    └─ jsonConverter.convert() → deck.layers 为空数组 []
+    │
+    └─ 渲染: Carto 底图瓦片，以 (0,0) 为中心 zoom=1 → 非洲外海
+         无任何数据图层、无散点
+```
+
+---
+
+## 9. 扩展图表类型的接入范式
 
 新增一种图表库 X 的典型步骤：
 
