@@ -1,5 +1,13 @@
 # st.form 批量提交模型代码协作分析
 
+## 阅读说明
+
+- 本文档分析 Streamlit `st.form` 批量提交模型的前后端协作机制,涵盖表单收集、批量提交、校验反馈、局部更新四大阶段。
+- 正文中的源码引用统一指向**文末第九章的代码索引**,使用「索引名称」标注,点击文末对应条目可直接跳转到源码行。
+- 代码块中的 `# 文件名 - 函数名 第X行` 为上下文注释,非可点击链接。
+
+---
+
 ## 一、整体架构概览
 
 st.form 的批量提交模型是一个跨前后端的完整协作体系,核心围绕 **"表单收集 → 批量提交 → 校验反馈 → 局部更新"** 四个阶段展开。
@@ -39,10 +47,7 @@ st.form 的批量提交模型是一个跨前后端的完整协作体系,核心�
 
 ### 2.1 后端:Form 容器与 Widget 归属
 
-**核心文件:**
-- [form.py](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/lib/streamlit/elements/form.py)
-- [form_utils.py](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/lib/streamlit/elements/lib/form_utils.py)
-- [button.py](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/lib/streamlit/elements/widgets/button.py)
+> 对应代码索引:「Form 容器创建」「Form 归属判断」「Submit Button 创建+注册」,详见文末第九章
 
 #### Form 容器的创建
 
@@ -69,12 +74,12 @@ class FormData(NamedTuple):
 每个 widget 创建时通过 `current_form_id(dg)` 判断自己是否在表单内:
 
 ```python
-# form_utils.py - current_form_id()
+# form_utils.py - _current_form()
 def _current_form(this_dg: DeltaGenerator) -> FormData | None:
     # 方式1: 直接检查 dg._form_data
     if this_dg._form_data is not None:
         return this_dg._form_data
-    
+
     # 方式2: 通过 st.xxx 调用时,遍历 context_dg_stack 向上查找
     if this_dg == this_dg._main_dg:
         for dg in reversed(context_dg_stack.get()):
@@ -94,7 +99,7 @@ def _current_form(this_dg: DeltaGenerator) -> FormData | None:
 每个 widget 的 protobuf 消息中都会携带 `form_id` 字段,以 button 为例:
 
 ```python
-# button.py - _button() 第1650行
+# button.py - _button()
 form_id = current_form_id(self.dg) if is_form_submitter else ""
 button_proto.form_id = form_id
 ```
@@ -103,8 +108,7 @@ button_proto.form_id = form_id
 
 ### 2.2 前端:WidgetStateManager 的双状态存储
 
-**核心文件:**
-- [WidgetStateManager.ts](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/frontend/lib/src/WidgetStateManager.ts)
+> 对应代码索引:「表单值写入分流」「值读取(表单优先)」,详见文末第九章
 
 前端通过 `WidgetStateManager` 管理所有 widget 状态,采用 **双层存储** 设计:
 
@@ -148,14 +152,12 @@ private createWidgetState(widget: WidgetInfo, source: Source): WidgetState {
 
 ### 3.1 提交触发点
 
-**核心文件:**
-- [FormSubmitButton.tsx](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/frontend/lib/src/components/widgets/Form/FormSubmitButton.tsx)
-- [useSubmitFormViaEnterKey.ts](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/frontend/lib/src/hooks/useSubmitFormViaEnterKey.ts)
+> 对应代码索引:「提交按钮组件」「Enter 键提交 Hook」,详见文末第九章
 
 #### 方式1:点击提交按钮
 
 ```typescript
-// FormSubmitButton.tsx - handleSubmit() 第65行
+// FormSubmitButton.tsx - handleSubmit()
 const handleSubmit = useCallback((): void => {
   if (isDisabled) return
   widgetMgr.submitForm(element.formId, fragmentId, element)
@@ -175,10 +177,12 @@ if (widgetMgr.allowFormEnterToSubmit(formId)) {
 
 ### 3.2 submitForm 核心流程
 
+> 对应代码索引:「submitForm 核心流程」,详见文末第九章
+
 `submitForm` 是批量提交的核心方法,执行以下关键步骤:
 
 ```typescript
-// WidgetStateManager.ts - submitForm() 第346行
+// WidgetStateManager.ts - submitForm()
 public submitForm(
   formId: string,
   fragmentId: string | undefined,
@@ -275,10 +279,7 @@ private scheduleFlush(fragmentId: string | undefined): void {
 
 ## 3.5 后端状态恢复与脚本重跑完整链路
 
-**核心文件:**
-- [app_session.py](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/lib/streamlit/runtime/app_session.py)
-- [script_runner.py](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/lib/streamlit/runtime/scriptrunner/script_runner.py)
-- [session_state.py](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/lib/streamlit/runtime/state/session_state.py)
+> 对应代码索引:「AppSession 接收 rerun」「后端脚本主循环」「状态同步+回调触发入口」「回调调度(两条路径)」,详见文末第九章
 
 当后端收到前端发来的 rerun 消息(带 widget_states)后,完整执行链路如下:
 
@@ -437,7 +438,10 @@ def _call_callbacks(self) -> None:
 
 > **表单提交回调在哪里触发?**
 > FormSubmitButton 使用 `trigger_value` 类型,前端在 `submitForm()` 中把它设为 `true`。
-> 在 `_dispatch_trigger_callbacks` 中,`widget_proto_state.trigger_value == true` 会匹配并执行 `metadata.callbacks["click"]`(即用户的 `on_click`)。
+> 由于 `on_click` 注册在 `metadata.callback`(单回调字段),它通过**路径 1**触发:
+> `_widget_changed()` 检测到值从 `False → True`,然后 `call_callback()` 直接执行 `metadata.callback`。
+> `_dispatch_trigger_callbacks` 只处理 `json_trigger_value`(Component v2 多事件),不处理 bool 类型的 `trigger_value`。
+> 详见第八章 8.1 节深度分析。
 
 #### Step 5: on_script_finished —— 运行后清理
 
@@ -620,8 +624,7 @@ public allowFormEnterToSubmit(formId: string): boolean {
 
 ### 4.1 缺失提交按钮警告
 
-**核心文件:**
-- [Form.tsx](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/frontend/lib/src/components/widgets/Form/Form.tsx)
+> 对应代码索引:「Form 容器组件」,详见文末第九章
 
 Form 组件会检测表单内是否有 submit button,没有则显示错误警告:
 
@@ -642,8 +645,7 @@ if (!hasSubmitButton && !showWarning && scriptNotRunning) {
 
 ### 4.2 提交按钮注册与 FormsContext
 
-**核心文件:**
-- [FormsContext.tsx](file:///d:/fz/0601/solo-dogfeeding/code/219-streamlit/frontend/lib/src/components/core/FormsContext.tsx)
+> 对应代码索引:「Forms 上下文」「提交按钮组件」,详见文末第九章
 
 `FormsContext` 提供表单状态的 React 订阅机制,数据来源于 `WidgetStateManager.formsData`:
 
