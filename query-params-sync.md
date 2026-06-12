@@ -36,9 +36,9 @@ Streamlit 的查询参数同步采用 **前后端分离 + WebSocket 消息驱动
 
 ## 三、URL 播种：值落到了哪些状态区
 
-### 3.1 播种触发条件
+### 3.1 播种触发条件：URL 播种不仅限于首次加载
 
-URL 播种只在以下条件同时满足时发生 [session_state.py#L1135-L1146](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/lib/streamlit/runtime/state/session_state.py#L1135-L1146)：
+`_handle_query_param_binding` 中的条件组合 [session_state.py#L1135-L1146](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/lib/streamlit/runtime/state/session_state.py#L1135-L1146)：
 
 ```python
 # _handle_query_param_binding 中
@@ -47,7 +47,8 @@ if widget_id in self._new_widget_state:
 
 is_initial_load = widget_id not in self._old_state
 if not is_initial_load and user_key in self._new_session_state:
-    return False          # ❷ 非首次加载且代码设置了值 → 不播种
+    return False          # ❷ 【关键】非首次加载 且 代码设置了值 → 才不播种
+                            # 注意：是 AND 关系，不是 OR！
 
 url_value = self.query_params.get_initial_value(user_key)
 if url_value is None:
@@ -56,7 +57,66 @@ if url_value is None:
 return self._seed_widget_from_url(...)  # ❹ 全部通过 → 播种
 ```
 
-**结论**：URL 播种只在 **首次加载 + URL 有值 + 无用户交互 + 无代码设置** 时发生。
+**关键分析条件 ❷**：`if not is_initial_load and user_key in self._new_session_state`
+
+这是 **AND**（且）关系，不是 **OR**（或）关系。这意味着：
+- **条件 ❷ 只阻止一种情况**：`非首次加载` **同时** `代码设置了该 user_key 的值`
+- **条件 ❷ 不阻止以下情况**：
+  - `非首次加载` **但** `代码没有设置值` → **不 return False → 继续检查 URL → 可能播种！**
+
+**播种场景汇总**（满足 ❶+❷+❸ 就播种）：
+
+| 场景 | widget_id in _new_widget_state | is_initial_load | user_key in _new_session_state | URL 有值 | 是否播种 |
+|------|-------------------------------|-----------------|-------------------------------|---------|---------|
+| 首次加载，URL 有值 | ❌ | ✅ | ❌ | ✅ | ✅ 播种 |
+| 首次加载，URL 无值 | ❌ | ✅ | ❌ | ❌ | ❌ |
+| 非首次加载，代码设置了值 | ❌ | ❌ | ✅ | ✅ | ❌ 条件❷阻止 |
+| **非首次加载，代码没设置值，URL 有值** | ❌ | ❌ | ❌ | ✅ | ✅ **播种！** |
+| 有用户交互 | ✅ | — | — | ✅ | ❌ 条件❶阻止 |
+
+**非首次加载但仍会播种的真实场景**：
+
+```
+场景：同页面内的非首次 rerun
+  ① 初始加载：URL ?page=50 → slider 播种，值=50
+     → _new_session_state["page"] = 50
+     → on_script_finished → _compact_state()
+     → _old_state["$$slider-1"] = 50, _old_state["page"] = 50
+     → _new_session_state.clear() → 清空！
+
+  ② 同一页面后续 rerun（比如点击按钮触发）：
+     → _new_session_state 初始为空
+     → widget_id="$$slider-1" in _old_state → is_initial_load=False
+     → 检查条件❷：False AND ("page" in _new_session_state)
+                             → False AND False → False
+                             → 不 return False！
+     → get_initial_value("page") → _initial_query_params 仍然有 "page" = "50"
+     → ✅ 播种！（虽然值没变，但逻辑上确实会重新播种）
+```
+
+```
+场景：条件渲染 widget 重新出现（但 widget_id 仍在 _old_state 中）
+  ① 初始加载：if checkbox: slider(key="page", bind="query-params") → URL ?page=75
+     → 勾选 checkbox → slider 渲染，播种成功，值=75 存入 _old_state
+
+  ② 取消 checkbox → slider 变为 stale：
+     → _remove_stale_widgets：bound_preserved["page"] = 75
+     → _old_state["$$slider-1"] 删除，但 _old_state["page"] = 75 保留
+
+  ③ 重新勾选 checkbox → slider 重新渲染：
+     → 注意：widget_id 是否相同取决于 key 是否相同
+     → 如果 key 没变：widget_id 相同 → widget_id 在 _old_state？
+       · 等等，_old_state["$$slider-1"] 被删了，但 _old_state 里有 "page"=75
+       · is_initial_load 判断的是 widget_id 是否在 _old_state 中
+       · _old_state 中存了 widget_id 和 user_key 两种 key
+       · widget_id 被删了，但 user_key 保留了
+       · 所以：widget_id NOT in _old_state → is_initial_load = True
+       · 当做首次加载处理 → 播种
+     → 如果 widget_id 变了（fragment 等情况）：
+       · is_initial_load = True → 播种
+```
+
+**结论**：URL 播种在 **widget_id 不在 _old_state（真正首次）** 或 **widget_id 在 _old_state 但 _new_session_state 中无该值** 时都会发生。播种的核心前提是：`_initial_query_params` 中存在该参数，且优先级更高的值来源（用户交互、代码设置）未提供值。
 
 ### 3.2 播种后的值去向
 
@@ -303,18 +363,123 @@ def populate_from_query_string(self, query_string, valid_script_hashes):
 | URL 中的自由参数 | ✅ 保留（如果没被前端清掉） | 没有 binding 的参数直接保留 |
 | embed 参数 | ✅ 保留 | 前端已保留在 query_string 中，后端遍历设置时正常存入 |
 
-### 5.3 两层过滤的净效果
+### 5.3 两层过滤各自真正影响的参数
 
-由于前端已经清除了自由参数，后端的自由参数保留逻辑实际上起不到作用。最终净效果：
+**前端过滤（filterParamsForPageChange）的作用**：
+- **影响范围**：自由参数（st.query_params 直接设置的非绑定参数）
+- **不影响**：绑定参数、embed 参数
 
-| 参数类型 | 跨页面导航后 |
-|---------|------------|
-| 当前页面 + 主页面的绑定参数 | ✅ 保留 |
-| 其他页面的绑定参数 | ❌ 清除（后端按 script_hash 过滤） |
-| 自由参数 | ❌ 清除（前端已过滤） |
-| embed 参数 | ✅ 始终保留 |
+| 参数 | 前端过滤前 | 前端过滤后 | 原因 |
+|------|----------|----------|------|
+| `embed=true` | ✅ 存在 | ✅ 保留 | `preserveEmbedQueryParams()` 单独提取 |
+| `page=75`（Page A 绑定 param） | ✅ 存在 | ✅ 保留 | Page A 的 paramKeyToWidgetId 中存在 |
+| `foo=bar`（自由参数） | ✅ 存在 | ❌ 清除 | 不在 paramKeyToWidgetId 中 |
+| `theme=dark`（Home 绑定，如已渲染） | ✅ 存在 | ✅ 保留 | 如果 Home 的 widget 在当前 session 中渲染过且在 Map 中 |
 
-### 5.4 同页面刷新 vs 跨页面导航对比
+> **注意**：前端过滤的是**切换前页面（Page A）**的绑定参数。这意味着 Page A 的所有绑定 widget 的参数都会被保留并发送给后端，即使这些参数在 Page B 中根本不存在对应的 widget。
+
+**后端过滤（populate_from_query_string）的作用**：
+- **影响范围**：**非当前页 / 非主页**的绑定参数（按 script_hash 过滤）
+- **不影响**：主页面绑定参数、embed 参数、无 binding 的自由参数（但前端已清除）
+
+| 参数 | 后端过滤前（前端传来的） | 后端过滤后（_query_params） | 原因 |
+|------|------------------------|---------------------------|------|
+| `embed=true` | ✅ 存在 | ✅ 保留 | 无 binding，不进入 script_hash 检查 |
+| `page=75`（Page A 绑定） | ✅ 存在 | ❌ 清除 | binding.script_hash = Page A，不在 {main_hash, Page B_hash} |
+| `theme=dark`（Home 绑定） | ✅ 存在（如果前端保留） | ✅ 保留 | binding.script_hash = main_hash，永远在白名单内 |
+| `foo=bar`（自由参数） | ❌ 已被前端清除 | — | 前端没传过来 |
+
+**两层过滤的分工总结**：
+```
+URL 初始参数:  embed=true, page=75(A绑定), theme=dark(Home绑定), foo=bar(自由)
+  ↓
+前端过滤:     embed=true, page=75(A绑定), theme=dark(Home绑定)   ← 清除 foo=bar
+  ↓
+后端过滤:     embed=true, theme=dark(Home绑定)                   ← 清除 page=75(A的script_hash不在白名单)
+```
+
+**关键洞察**：
+1. **主页面绑定参数是天然跨页面的**：`main_script_hash` 永远在白名单内，Home 页面的绑定 widget 参数会**自动跨所有页面保留**，无需任何额外机制
+2. **普通页面绑定参数只能跨一次**：Page A 的参数前端会保留给后端，但后端会按 script_hash 清掉——除非 Page B 有相同 user_key 的绑定 widget 通过 bound_preserved 机制恢复
+3. **自由参数只能死在前端**：后端有"保留无 binding 参数"的逻辑，但前端已经把它们过滤掉了，实际上到不了后端
+
+### 5.4 跨页面切换后绑定值保留并显示在地址栏的精确条件
+
+Page A（有 `key="page"` 的绑定 slider，值=75，URL `?page=75`）→ 导航到 Page B → 什么情况下 `?page=75` 仍然显示？
+
+#### 完整流程追踪（Page A → Page B）
+
+```
+① 前端: onPageChange(PageB, preserveQueryParams=false)
+  → filterParamsForPageChange:
+    · embed=true → 保留
+    · page=75 (Page A paramKeyToWidgetId 中有) → 保留
+  → sendRerunBackMsg(queryString="embed=true&page=75")
+  ↓
+② 后端: populate_from_query_string("embed=true&page=75", {main_hash, PageB_hash})
+  → clear_with_no_forward_msg() → 清空 _query_params
+  → 遍历 parsed:
+    · key=embed: binding=None → set ✅ 保留
+    · key=page:  binding=Page_A_widget's binding, script_hash=A_hash
+              A_hash NOT in {main, B_hash} → ❌ 清除
+              stale_widget_ids.append(PageA_widget_id)
+  → unbind_widget(PageA_widget_id) → Page A 的 binding 被清除
+  → stale_widget_ids 非空 → _send_query_param_msg()
+    · urlencode(_query_params) → "embed=true"  (page=75 不在了！)
+  → 前端 handlePageInfoChanged → pushState → URL 变为 ?embed=true
+  ↓
+③ 后端: set_initial_query_params_from_current()
+  → _initial_query_params = {"embed": ["true"]}  (page 已经没有了)
+  ↓
+④ 后端: on_script_finished(widget_ids)
+  → widget_ids 来自 rerun_data.widget_states，通常为空（Page B 还没渲染 widget）
+  → _remove_stale_widgets(empty_frozenset):
+    · 所有旧 widget（包括 Page A 的 slider）都是 stale
+    · bound_preserved["page"] = _getitem() 读到的最新值 = 75
+    · _old_state[PageA_widget_id] 删除
+    · _old_state.update(bound_preserved) → _old_state["page"] = 75
+  → bound_preserved 机制确保值不丢，但 URL 中已经没有 page=75
+  ↓
+⑤ 【分支一】Page B 没有 key="page" 的绑定 widget
+  → 不注册任何对应 binding
+  → 最终 URL: ?embed=true (page=75 不显示)
+  → 但后端 _old_state["page"] = 75 仍然保存着
+
+⑤ 【分支二】Page B **也有** st.slider(key="page", bind="query-params")
+  → Page B 的 slider 调用 register_widget:
+    · _handle_query_param_binding:
+      widget_id_B in _new_widget_state? → No
+      is_initial_load = widget_id_B NOT in _old_state → YES (B 是新 widget id)
+      get_initial_value("page") → _initial_query_params 中没有 page → None
+      → return False (不播种，因为 URL 中已经没有 page 了)
+    · widget_value = self["page"]
+      → _old_state["page"] = 75 (bound_preserved 保留的值！)
+    · 后半段 URL 同步 [session_state.py#L1067-L1076]:
+      widget_value (75) != default_value (0) → YES
+      user_key ("page") in _old_state → YES (bound_preserved 保留)
+      not self.query_params.has_param("page") → YES (URL 中没有 page)
+      user_key not in _new_session_state → YES
+      → 四个条件全部满足！
+      → self.query_params.set_corrected_value("page", "75", "int_value")
+      → _send_query_param_msg() → ForwardMsg.page_info_changed
+  → 前端 handlePageInfoChanged:
+    pushState → URL 变为 ?embed=true&page=75  ✅ 回来了！
+```
+
+#### 绑定值保留并显示在地址栏的 4 个必要条件
+
+| 条件 | 代码位置 | 说明 |
+|------|---------|------|
+| ① Page B **也有**相同 `user_key` 的绑定 widget | — | `st.slider(key="page", bind="query-params")` 必须也出现在 Page B |
+| ② bound_preserved 保留了值 | [session_state.py#L912-L932](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/lib/streamlit/runtime/state/session_state.py#L912-L932) | 跨页面时 Page A 的值通过 `_old_state[user_key]` 保留 |
+| ③ widget_value **不等于默认值** | [session_state.py#L1066](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/lib/streamlit/runtime/state/session_state.py#L1066-L1066) | 默认值会被折叠，不会写回 URL |
+| ④ 四个条件全部满足（restore 分支） | [session_state.py#L1067-L1070](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/lib/streamlit/runtime/state/session_state.py#L1067-L1070) | `user_key in _old_state AND not has_param(user_key) AND user_key not in _new_session_state` |
+
+> **如果 Page B 没有对应 widget**：值仍然保留在 `_old_state["page"]` 中（可以通过 `st.session_state["page"]` 读取），但 URL 中不会显示。之后再切回 Page A 时会通过同样的机制恢复到 URL。
+
+> **如果是 Home 页面绑定的参数**：不需要 bound_preserved 机制！Home 页面 binding 的 script_hash = main_hash，永远在后端白名单中，URL 参数会**自然保留**跨所有页面。
+
+### 5.5 同页面刷新 vs 跨页面导航对比
 
 | 维度 | 同页面刷新（F5） | 跨页面导航（Page A → B） |
 |------|----------------|------------------------|
@@ -654,6 +819,8 @@ embed 参数通过专用函数读取，而不是通过 `st.query_params`：
 2. **后端防循环**：三道防线确保用户交互不会触发二次回写
 3. **URL 是可选项**：等于默认值时折叠，只保留有意义的状态
 4. **值比 URL 更持久**：Stale widget 的值通过 `bound_preserved` 保留在 `_old_state[user_key]`，URL 参数和 binding 被清除，重新出现时恢复
-5. **跨页面两层过滤**：前端清自由参数、保留 embed，后端按 script_hash 清其他页面的绑定、重设 embed
-6. **受保护参数双重标准**：`embed` / `embed_options` 在内部存储中正常存在，但通过公共 API 访问时不可见且不可修改，内部方法可以自由操作
-7. **公共 API 与内部方法分离**：`_set_item_in_dict`（公共路径）检查 embed，但 `set_with_no_forward_msg`（内部方法）不检查，确保用户不能操作 embed 但系统机制可以
+5. **URL 播种不仅限于首次加载**：`if not is_initial_load AND user_key in _new_session_state` 是 AND 关系，非首次加载但代码没设值时仍然播种
+6. **跨页面两层过滤分工明确**：前端只杀自由参数；后端按 script_hash 杀非主/当前页绑定；主页面绑定天然跨页，普通页绑定需 bound_preserved + 新页同名 widget 才能恢复 URL 显示
+7. **绑定值跨页显示需四条件**：新页有同名绑定 widget、bound_preserved 保留了值、值≠默认值、restore 分支四条件命中；不满足时值仍在 `_old_state`，但 URL 不显示
+8. **受保护参数双重标准**：`embed` / `embed_options` 在内部存储中正常存在，但通过公共 API 访问时不可见且不可修改，内部方法可以自由操作
+9. **公共 API 与内部方法分离**：`_set_item_in_dict`（公共路径）检查 embed，但 `set_with_no_forward_msg`（内部方法）不检查，确保用户不能操作 embed 但系统机制可以
