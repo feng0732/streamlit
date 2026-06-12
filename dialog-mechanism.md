@@ -291,3 +291,191 @@ if (!isDialogWithDifferentIdentity) {
 | 渲染树 | [AppRoot.ts](file:///d:/fz/0601/solo-dogfeeding/code/231-streamlit/frontend/lib/src/render-tree/AppRoot.ts) | 四容器树结构、弹层身份防重 |
 | 上下文隔离 | [IsDialogContext.ts](file:///d:/fz/0601/solo-dogfeeding/code/231-streamlit/frontend/lib/src/components/core/IsDialogContext.ts) | 弹层内 React Context 标记 |
 | Widget 管理 | [WidgetStateManager.ts](file:///d:/fz/0601/solo-dogfeeding/code/231-streamlit/frontend/lib/src/WidgetStateManager.ts) | setTriggerValue 触发 dismiss 回调 |
+
+---
+
+## 七、边界问题：三个关键概念
+
+### 7.1 关闭弹层后重跑的范围
+
+弹层的「关闭触发重跑」与「弹层内 Widget 交互触发重跑」属于两种完全不同的重跑范围，核心区别在于重跑的**调度单位**：
+
+#### 重跑范围的层级模型
+
+可以把 Streamlit 脚本的重跑范围想象为三层嵌套结构：
+
+```
+┌─────────────────────────────────────────────────┐
+│  L3: 完整脚本重跑（Full Script Rerun）            │
+│  ┌─────────────────────────────────────────────┐ │
+│  │  L2: 弹层 Fragment 重跑（仅执行弹层内容函数） │ │
+│  │  ┌───────────────────────────────────────┐  │ │
+│  │  │  L1: 弹层内 Widget 级局部状态          │  │ │
+│  │  └───────────────────────────────────────┘  │ │
+│  └─────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────┘
+```
+
+- **L2 弹层 Fragment 重跑**：弹层内 Widget（如输入框、按钮、滑块）的交互。此时仅执行弹层装饰器包裹的那一个函数，主脚本其他部分（主页面所有逻辑）**完全不执行**。这是 Fragment 执行模型的天然特性——弹层本质上就是一个「自动 Fragment」。
+
+- **L3 完整脚本重跑**：以下事件会触发最外层的完整重跑：
+  1. 用户在弹层内显式调用 `st.rerun()`（无 scope 参数时默认全脚本）
+  2. `on_dismiss="rerun"` 配置下，用户手动关闭弹层（点击遮罩 / X 按钮 / ESC）
+  3. `on_dismiss=callable` 配置下，用户手动关闭弹层（先执行 callback，再做完整重跑）
+  4. 主页面上的 Widget 交互（此时弹层函数是否被调用取决于外层条件判断）
+
+#### on_dismiss 对重跑范围的决定作用
+
+`on_dismiss` 实际上是一个「关闭动作是否穿透到主脚本」的开关：
+
+| on_dismiss 配置 | 关闭时重跑范围 | 说明 |
+|---|---|---|
+| `"ignore"` | **无重跑** | 纯前端行为，弹层 DOM 被卸载，后端不感知。这是默认值——因为大多数弹层关闭后不应无条件重跑。 |
+| `"rerun"` | **完整脚本重跑** | 关闭动作等价于一个「触发型 Widget」被激活，后端按 widget 交互处理，进入标准的完整脚本执行流程。 |
+| `callable 回调` | **完整脚本重跑 + 回调优先** | 回调函数在主脚本执行之前被调用，属于 Widget 的 on_change 机制。若回调内部再次触发重跑，则在同一轮调度中合并处理。 |
+
+> **关键理解**：`on_dismiss` 的 `"rerun"` 和回调模式，本质是将弹层本身注册为一个**一次性触发 Widget**（trigger_value 类型）。当用户关闭弹层时，前端向该 Widget 写入 `true`，后端在重跑前读取此值并触发相应的 on_change 逻辑。重跑范围之所以是完整脚本，是因为 Widget 重跑范围由 Widget 所在的 Fragment 层级决定——而「弹层作为触发型 Widget」的 ID 被注册在 EVENT 容器、而非弹层内部的 Fragment 中，因此属于最顶层 Fragment，触发完整重跑。
+
+#### 典型场景的重跑路径
+
+**场景 A：弹层内提交按钮 → 关闭弹层**
+
+```
+用户点击弹层内「提交」按钮
+  → 按钮属于弹层内 Fragment 的 Widget
+  → 先执行弹层 Fragment 重跑
+  → 按钮回调中执行 st.rerun()
+  → st.rerun() 抛出 RerunException，向上冒泡到脚本运行器
+  → 脚本运行器中断当前 Fragment 执行，调度一次完整脚本重跑
+  → 完整脚本重跑时，外层 if 条件（如 st.button 状态）通常已不满足
+  → 弹层函数不被调用，弹层自然消失
+```
+
+**场景 B：点击弹层遮罩 → on_dismiss="rerun"**
+
+```
+用户点击弹层外遮罩
+  → 前端 Dialog 组件执行 handleClose
+  → 检查到 dialog.id 存在（因为 on_dismiss≠ignore）
+  → 通过 WidgetStateManager.setTriggerValue 写入 trigger_value=true
+  → 前端发送 updateWidgets 消息
+  → 后端识别该 Widget 属于顶层（fragment_id 为空或不匹配任何 Fragment）
+  → 执行完整脚本重跑
+  → 若脚本中弹层打开条件未变，则弹层可能再次打开（这是用户需要避免的常见 bug）
+```
+
+> 场景 B 提示一个重要的工程惯例：如果 `on_dismiss` 设为 `"rerun"` 或回调，通常需要配合 Session State 中的「弹层已关闭」标记来防止重跑后条件判断仍为真，导致弹层立即重新弹出。
+
+---
+
+### 7.2 弹层内容多次重跑时保留哪些状态
+
+弹层的重跑分为「同一次打开期间内的多次 Fragment 重跑」和「跨越完整脚本重跑的再次打开」两种情况，状态保留规则截然不同。
+
+#### 情况一：同一次打开期间的 Fragment 重跑
+
+这是最常见的场景：用户在弹层内操作 Widget（如输入文字、切换开关），弹层持续打开，内容函数被反复执行。此时保留的状态分为五类：
+
+| 状态类别 | 是否保留 | 保留机制 |
+|---|---|---|
+| **弹层内 Widget 的值** | ✅ 保留 | 标准的 Widget State 机制。Widget ID 由「弹层稳定 ID + 写入位置」共同确定，Fragment 级重跑不会清空 Widget 值。输入框中已输入的文字、滑块位置、开关状态全部保留。 |
+| **st.session_state（全局会话状态）** | ✅ 保留 | Session State 是会话级全局存储，任何层级的重跑都不影响。弹层内对 Session State 的写入对主页面立即可见（重跑后主页面能读到）。 |
+| **Fragment 定义时的游标快照** | ✅ 保留 | Fragment 在首次注册时对 cursors（元素写入游标）和 dg_stack（容器栈）做深拷贝。每次 Fragment 重跑时用快照恢复，确保第 N 次重跑的元素写入位置与第 1 次完全一致，不会因主页面元素增减而错位。 |
+| **弹层内的局部变量** | ❌ 不保留 | 每次 Fragment 重跑都是从头执行内容函数，函数内部声明的普通变量（`x = 1` 之类）每次都重新初始化。需要跨重跑持久化请使用 `st.session_state` 或 `st.cache_data`。 |
+| **弹层的打开/关闭状态（前端 isOpen）** | ✅ 保留 | 前端用 React `useState` 持有 `isOpen`。Fragment 级重跑只更新 `children`（弹层内容），不卸载 Dialog 组件本体，因此 `isOpen` 保持为 `true`，弹层不会意外关闭。 |
+
+#### 情况二：完整脚本重跑后再次打开弹层
+
+用户完成交互后关闭弹层，触发完整脚本重跑，之后再次点击按钮打开同一个弹层。此时：
+
+| 状态类别 | 是否保留 | 说明 |
+|---|---|---|
+| **弹层内 Widget 的值** | ❌ 不保留 | 完整脚本重跑会执行 `_reset_triggers` 重置所有 trigger_value，但更关键的是：若弹层函数未被调用，则弹层内的 Widget 根本不会被注册到当前脚本运行的活跃 Widget 集合中。下次打开时 Widget 的值由 Session State 中的初始值或 `value` 参数决定。 |
+| **st.session_state** | ✅ 保留 | 会话级全局存储，与弹层是否打开无关。如果在弹层关闭前将重要值写入 Session State，下次打开时可恢复。 |
+| **Fragment Storage 中的函数定义** | ✅ 保留 | 完整脚本重跑会清理部分 Fragment，但如果弹层函数在完整脚本中再次被执行（同一段装饰器代码），Fragment 会重新注册。若装饰器代码位置相同、调用栈相同，则 fragment_id 相同，注册覆盖旧条目。 |
+| **前端已有的弹层 DOM 节点** | ✅ 选择性保留 | 如果新弹层的稳定 ID（block.id）与旧弹层相同 → 继承已有子节点（React state 保留）。如果稳定 ID 不同 → 卸载旧弹层 DOM，创建全新弹层。这是防止「串弹层」的关键机制（详见 7.3 节）。 |
+
+#### 状态保留中的陷阱：非 dismissible + Widget 缓存
+
+如果一个弹层设置 `dismissible=False`（不可手动关闭），且用户在弹层内操作 Widget 触发 Fragment 重跑，此时如果 Widget 触发了完整脚本重跑（例如按钮回调里调了 `st.rerun()`），需要注意：
+
+1. 完整脚本重跑会将 `has_dialog_opened` 标志重置为 `False`，因此新脚本运行中可以再次打开弹层。
+2. 但如果弹层打开条件仍为真，**新弹层和旧弹层可能拥有相同的稳定 ID**，这意味着前端会复用旧弹层的 DOM 节点。如果弹层内部依赖「首次打开时初始化某些局部状态」，这些状态不会被重新初始化。
+3. 解决方案是在每次弹层打开时显式重置依赖的状态，或利用不同参数生成不同的弹层稳定 ID（通过 title / icon / on_dismiss 等参数的差异化）。
+
+---
+
+### 7.3 如何避免旧弹层内容串到主页面
+
+「串弹层」指以下两种异常表现：
+
+- **类型 A**：打开弹层 B 时，看到弹层 A 的残留内容（widget、文本、图表等）
+- **类型 B**：弹层关闭后，主页面出现本该在弹层内的元素（主页面「串」进了弹层内容）
+
+这两类异常的根本原因和防护机制完全不同。
+
+#### 类型 A：弹层之间互相串内容 —— 机制与防护
+
+**根本原因**：前端渲染树在替换 Block 节点时，默认会**继承同类型旧节点的子节点**，以保留 React 组件内部状态（如未提交的输入、折叠状态等）。如果没有弹层身份区分，打开新弹层时前端不会清空旧弹层的 children，直接复用旧 DOM，导致内容混杂。
+
+**防护机制：弹层稳定 ID （block.id）的身份比对**
+
+每个弹层在创建时都会根据自身属性（title、dismissible、width、icon、on_dismiss 配置）计算一个稳定的哈希 ID，并写入 BlockProto 的顶层 `id` 字段。前端在替换 dialog block 时执行如下判断逻辑：
+
+```
+收到新的 dialog Block：
+  1. 在渲染树中定位 delta_path 相同位置的旧节点
+  2. 判断「旧节点也是 dialog 类型」且「新旧 block.id 不同」？
+     ├─ 是（身份不同的弹层）→ 不继承子节点，children = [] 新建
+     └─ 否（同身份弹层更新）→ 继承旧节点的 children，保留 React state
+```
+
+**设计意图**：稳定 ID 相同说明是「同一个弹层的内容刷新」（如 Fragment 重跑更新内容），此时保留子节点可以避免 Widget 值丢失、减少 DOM 重建闪烁。稳定 ID 不同说明是「不同弹层的切换」，必须彻底清空才能避免串内容。
+
+**典型风险场景**：如果开发者用完全相同的标题、配置依次打开两个不同的弹层（例如 A 和 B 都是 `@st.dialog("确认")`，默认 small、dismissible=True），则两者的稳定 ID 完全相同，前端会误认为是同弹层更新而串内容。这种情况需要通过 icon 或 on_dismiss 参数人为区分，或在逻辑上确保不会交替出现配置完全相同的不同弹层。
+
+#### 类型 B：弹层内容串到主页面 —— 机制与防护
+
+**根本原因**：弹层内容在后端是通过 DeltaGenerator 的「写入游标（cursor）」定位到 EVENT 容器中的某个 delta_path。如果在完整脚本重跑或 Fragment 重跑时，cursor 的起始位置没有正确恢复，弹层内容的 delta_path 可能落到 MAIN 容器（主页面）范围内，前端就会将其渲染在主页面中。
+
+**防护机制：四层防线**
+
+**防线 1 — 独立容器（EVENT 根容器）**
+
+弹层永远写入 EVENT 容器（delta_path 第一个索引为 2，而非 MAIN 的 0 或 SIDEBAR 的 1），在渲染树层级上与主页面是兄弟节点，天然不可能交叉进入主页面的 DOM 结构中。即使前端渲染出错，也是 EVENT 容器下的内容错乱，不会影响 MAIN 容器。
+
+**防线 2 — Fragment 注册时的游标快照**
+
+弹层内容函数在首次注册为 Fragment 时，对 ScriptRunContext 的 `cursors` 字典（按 root_container 索引的游标集合）和 `context_dg_stack` 做深拷贝。每次 Fragment 重跑时，在执行内容函数之前先执行：
+
+```
+ctx.cursors = deepcopy(快照中的 cursors)
+context_dg_stack.set(deepcopy(快照中的 dg_stack))
+```
+
+这确保了无论主页面在上一次完整脚本运行后增加或减少了多少元素，弹层 Fragment 内部写入元素时的起始位置始终与首次注册时一致，不会因主页面游标偏移而错位写入其他容器。
+
+**防线 3 — 弹层注册位置绑定 event_dg**
+
+`@st.dialog` 装饰器内部显式使用 `event_dg._dialog(...)` 创建弹层 Block，而非用户当前上下文的 dg。即使用户在 `with st.sidebar:` 内部调用弹层函数（当前 dg_stack 指向 SIDEBAR 容器），弹层 Block 仍会写入 EVENT 容器。这从源头上杜绝了「在 Sidebar 里调用的弹层写入 Sidebar 区域」的可能。
+
+**防线 4 — 完整脚本重跑时的容器清理**
+
+每次完整脚本重跑时，前端渲染树对 EVENT 容器的处理与 MAIN、SIDEBAR、BOTTOM 容器完全对称：
+- `clearStaleNodes`：按 scriptRunId 标记并移除不在当前脚本运行中的节点
+- `clearTransientNodes`：清理瞬时元素（Toast、Balloon 等）
+- `filterMainScriptElements`：页面切换时保留/过滤对应脚本哈希的元素
+
+即使某次 Fragment 重跑出现异常写入（例如游标计算 bug），下一次完整脚本重跑也会把不属于当前运行的节点全部清掉，不会永久累积脏数据。
+
+#### 串弹层异常的排查思路
+
+如果实际观察到了串内容现象，可以按以下路径定位：
+
+1. **类型 A（弹层互串）**：检查两个弹层是否配置完全相同 → 尝试在 title 末尾加空格或设置不同 icon，确认稳定 ID 是否区分开
+2. **类型 B（串到主页面）**：在弹层函数内打印 `st.container()` 的类型信息，确认 dg_stack 顶层容器是否为 EVENT → 检查是否有代码在弹层内修改了全局 cursors（不允许的操作）
+3. **Fragment 重跑异常**：对比完整脚本重跑与 Fragment 重跑时，主页面元素的 delta_path 是否变化 → 如果主页面每次重跑后 delta_path 不同，说明有条件性渲染在主页面产生了不确定元素数，需要固定渲染顺序
+
+---
+
+> 三个边界问题的统一心智模型：把弹层想象为「附着在 EVENT 容器上的独立小窗口」，窗口内部有自己的状态空间（Fragment），窗口之间靠身份牌（稳定 ID）区分，窗口与主页面之间靠物理边界（EVENT vs MAIN 容器）隔离。任何「串」类异常，本质上都是身份牌被混淆或物理边界被突破。
