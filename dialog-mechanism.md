@@ -2,232 +2,172 @@
 
 ## 一、整体架构概览
 
-Streamlit 的模态弹层实现横跨 **Python 后端** 和 **TypeScript 前端**，涉及装饰器、DeltaGenerator、Protobuf 传输、Fragment 执行模型和 React 组件树等多个层次。核心路径如下：
+模态弹层的实现横跨 Python 后端与 TypeScript 前端，涉及装饰器封装、增量写入协议、二进制消息传输、Fragment 执行模型和 React 组件树渲染等多个层次。核心协作路径如下：
 
 ```
-@st.dialog 装饰器 → Dialog._create（注册 Block） → Dialog.open（发送 is_open=true）
-       → _fragment 包裹内容 → FragmentStorage.register
-       → 前端 Block.tsx 识别 dialog block → Dialog.tsx 渲染 Modal
-       → 用户关闭 → handleClose → WidgetStateManager.setTriggerValue
-       → 后端回调 on_dismiss / rerun
-```
-
----
-
-## 二、弹层注册
-
-### 2.1 装饰器入口
-
-[dialog_decorator](file:///d:/fz/0601/solo-dogfeeding/code/231-streamlit/lib/streamlit/elements/dialog_decorator.py#L142) 是用户侧入口 `@st.dialog("title")` 的实现。核心逻辑在 [_dialog_decorator](file:///d:/fz/0601/solo-dogfeeding/code/231-streamlit/lib/streamlit/elements/dialog_decorator.py#L62)：
-
-1. **校验**：检查不嵌套（`_assert_no_nested_dialogs`）、不在 parallel fragment 中（`_check_not_parallel_worker`）
-2. **创建 Dialog Block**：通过 `event_dg._dialog(...)` 创建 `Dialog` 实例
-3. **调用 `dialog.open()`**：发送 `is_open=True` 的 Protobuf 消息
-4. **将内容包裹为 Fragment**：用 `_fragment` 装饰 `dialog_content`，注册到 `FragmentStorage`
-5. **在 Dialog 上下文中执行 Fragment**：`with dialog: fragmented_dialog_content()`
-
-### 2.2 event_dg — 独立的渲染容器
-
-弹层不在 MAIN/SIDEBAR 容器中渲染，而是使用 `event_dg`（RootContainer.EVENT）。这保证了弹层不受父容器主题影响（例如 sidebar 中的按钮触发弹层，弹层不会继承 sidebar 样式）。
-
-[DeltaGeneratorSingleton](file:///d:/fz/0601/solo-dogfeeding/code/231-streamlit/lib/streamlit/delta_generator_singletons.py#L95) 初始化了四个根容器：
-
-```python
-self._main_dg    = DeltaGenerator(root_container=_RootContainer.MAIN)
-self._sidebar_dg = DeltaGenerator(root_container=_RootContainer.SIDEBAR)
-self._event_dg   = DeltaGenerator(root_container=_RootContainer.EVENT)
-self._bottom_dg  = DeltaGenerator(root_container=_RootContainer.BOTTOM)
-```
-
-对应 [RootContainer.proto](file:///d:/fz/0601/solo-dogfeeding/code/231-streamlit/proto/streamlit/proto/RootContainer.proto#L24) 中的枚举 `MAIN=0, SIDEBAR=1, EVENT=2, BOTTOM=3`。
-
-前端的 [AppRoot](file:///d:/fz/0601/solo-dogfeeding/code/231-streamlit/frontend/lib/src/render-tree/AppRoot.ts#L139) 按顺序维护四个子 BlockNode：
-
-```typescript
-const main    = new BlockNode(mainScriptHash, mainNodes, ...)
-const sidebar = new BlockNode(mainScriptHash, [], ...)
-const event   = new BlockNode(mainScriptHash, [], ...)   // ← Dialog 渲染在这里
-const bottom  = new BlockNode(mainScriptHash, [], ...)
-```
-
-### 2.3 Dialog._create — Block Proto 构建
-
-[Dialog._create](file:///d:/fz/0601/solo-dogfeeding/code/231-streamlit/lib/streamlit/elements/lib/dialog.py#L83) 执行以下步骤：
-
-1. **构建 BlockProto**：设置 `block_proto.dialog.title`、`dismissible`、`width`（映射为枚举）、`icon`
-2. **计算 element_id**：通过 `compute_and_register_element_id` 生成稳定 ID，基于 `title + dismissible + width + icon + on_dismiss` 的组合。此 ID 用于：
-   - 前端区分不同弹层，防止显示旧弹层的内容（issue #10907）
-   - 作为 widget 注册标识（当 `on_dismiss` 被激活时）
-3. **设置 block_proto.id**：始终设置，用于前端弹层身份识别
-4. **条件性 Widget 注册**：仅当 `on_dismiss != "ignore"` 时：
-   - 设置 `block_proto.dialog.id = element_id`（前端据此判断是否触发 rerun）
-   - 调用 `register_widget(element_id, ..., value_type="trigger_value")` 注册为 trigger 类型 widget
-5. **记录 delta_path**：保存当前游标的 delta_path，供后续 `_update` 方法使用
-6. **创建 Dialog 实例**：通过 `parent._block(block_proto=block_proto, dg_type=Dialog)` 创建
-
-### 2.4 单例保护 — 一次只允许一个弹层
-
-[_assert_first_dialog_to_be_opened](file:///d:/fz/0601/solo-dogfeeding/code/231-streamlit/lib/streamlit/elements/lib/dialog.py#L57) 检查 `ScriptRunContext.has_dialog_opened` 标志：
-
-- 当 `should_open=True` 且已有弹层打开时，抛出 `StreamlitAPIException`
-- 首次打开时将 `script_run_ctx.has_dialog_opened = True`
-- 该标志在 `ScriptRunContext.reset()` 中被重置为 `False`（每次脚本运行开始时）
-
-[ScriptRunContext.has_dialog_opened](file:///d:/fz/0601/solo-dogfeeding/code/231-streamlit/lib/streamlit/runtime/scriptrunner_utils/script_run_context.py#L224) 的重置时机：
-
-```python
-def reset(self, ...):
-    ...
-    self.has_dialog_opened = False
-```
-
-### 2.5 嵌套保护
-
-[_assert_no_nested_dialogs](file:///d:/fz/0601/solo-dogfeeding/code/231-streamlit/lib/streamlit/elements/dialog_decorator.py#L35) 检查当前 DeltaGenerator 栈中是否已有 `dialog` 类型的祖先 block：
-
-```python
-last_dg_in_current_context = get_last_dg_added_to_context_stack()
-if last_dg_in_current_context and "dialog" in set(
-    last_dg_in_current_context._ancestor_block_types
-):
-    raise StreamlitAPIException("Dialogs may not be nested inside other dialogs.")
+装饰器入口 → 弹层 Block 注册（EVENT 容器）→ 发送打开信号
+       → 内容函数包裹为 Fragment → 注册到存储
+       → 前端识别 dialog 类型 Block → 渲染为 Modal 组件
+       → 用户关闭 → 写入触发型 Widget 值
+       → 后端执行 dismiss 回调 / 调度脚本重跑
 ```
 
 ---
 
-## 三、事件触发
+## 二、弹层注册机制
 
-### 3.1 打开弹层 — Dialog.open
+### 2.1 装饰器入口：三层校验 + 两步封装
 
-[Dialog.open](file:///d:/fz/0601/solo-dogfeeding/code/231-streamlit/lib/streamlit/elements/lib/dialog.py#L195) 调用 `Dialog._update(True)`，该方法：
+用户侧的弹层装饰器在执行时按以下顺序工作：
 
-1. 调用 `_assert_first_dialog_to_be_opened(True)` 检查单例约束
-2. 构建 `ForwardMsg`，设置 `delta_path` 指向弹层 Block 位置
-3. 复制 `_current_proto` 到消息中，并设置 `dialog.is_open = True`
-4. 通过 `enqueue_message(msg)` 发送到前端
+1. **并行安全校验**：不允许在并行 Fragment 工作线程中打开弹层，避免多线程写入冲突
+2. **嵌套校验**：遍历当前容器栈，不允许在弹层内部再打开弹层
+3. **单例校验**：检查运行上下文的「已打开弹层」标志，同一脚本运行中只允许打开一个弹层
+4. **第一步封装：创建弹层 Block**：在 EVENT 容器中创建弹层节点，记录配置并发送打开信号
+5. **第二步封装：包裹内容函数为 Fragment**：将用户编写的弹层内容函数注册为 Fragment，在弹层容器上下文中执行
 
-### 3.2 关闭弹层 — 前端触发
+### 2.2 EVENT 容器：物理隔离的第四根容器
 
-前端 [Dialog.tsx](file:///d:/fz/0601/solo-dogfeeding/code/231-streamlit/frontend/lib/src/components/elements/Dialog/Dialog.tsx#L93) 的 `handleClose` 回调：
+弹层不在主区域（MAIN）或侧边栏（SIDEBAR）容器中渲染，而是使用独立的 EVENT 容器。整个页面共维护四根根容器：
 
-```typescript
-const handleClose = useCallback(() => {
-    setIsOpen(false)
-    if (id && widgetMgr) {
-        void widgetMgr.setTriggerValue(
-            { id, formId: "" },
-            { fromUi: true },
-            fragmentId
-        )
-    }
-}, [id, widgetMgr, fragmentId])
-```
+| 容器 | 用途 | 渲染位置 |
+|---|---|---|
+| MAIN | 主页面内容 | 页面中部流 |
+| SIDEBAR | 侧边栏内容 | 左侧抽屉 |
+| EVENT | 弹层与弹窗组件 | 覆盖在页面顶部 |
+| BOTTOM | 底部悬浮内容 | 页面底部固定层 |
 
-**关键判断**：当 `dialog.id` 存在时（即后端设置了 `on_dismiss != "ignore"`），关闭弹层会通过 `WidgetStateManager.setTriggerValue` 发送一个 trigger widget 事件到后端。
+EVENT 容器的设计保证了：
+- 弹层不继承父容器（如 Sidebar）的主题样式
+- 弹层不参与主区域的流式布局计算
+- 弹层节点的清理、渲染与主页面独立处理
 
-`setTriggerValue` 将 `triggerValue = true` 写入 widget state proto，并通过 `updateWidgets` 消息发送到后端。后端 `SessionState` 在脚本运行前读取此值，调用注册的 `on_change_handler`（即 `on_dismiss` 回调），并决定是否 rerun。
+### 2.3 稳定身份：弹层 ID 的双重作用
 
-### 3.3 on_dismiss 的三种模式
+每个弹层在创建时根据自身配置（标题、可关闭性、宽度、图标、关闭行为）计算一个稳定哈希 ID。此 ID 承担两个互不相同的职责：
 
-| on_dismiss 值 | dialog.id 设置 | Widget 注册 | 关闭行为 |
+**职责一：前端身份识别**
+- 始终写入 Block 的顶层 id 字段
+- 前端替换弹层节点时，通过比对 ID 判断是「同弹层内容刷新」还是「不同弹层切换」
+- ID 不同则不继承旧节点的子元素，防止内容串扰
+
+**职责二：后端 Widget 注册（条件性）**
+- 仅当关闭行为不为 ignore 时，才将该 ID 注册为触发型 Widget
+- 注册后前端关闭弹层时会向此 Widget 写入触发值，后端据此调度重跑或执行回调
+
+### 2.4 单例约束：一次运行一个弹层
+
+脚本运行上下文中维护一个「已打开弹层」标志：
+- 每次脚本运行开始时重置为 False
+- 首个弹层打开时置为 True
+- 后续弹层尝试打开时抛出 API 异常
+
+此约束防止在同一次脚本执行中产生多个弹层节点，简化前端弹层栈的管理。
+
+---
+
+## 三、事件触发机制
+
+### 3.1 打开弹层：信号与内容分离
+
+弹层打开分为两个独立步骤，均通过二进制消息发送到前端：
+
+1. **打开信号**：携带 `is_open=True` 标志，指向已创建的弹层 Block 位置。前端收到后将弹层组件的可见状态切换为显示。
+2. **内容写入**：由 Fragment 执行产生，作为弹层 Block 的子节点追加。内容可以多次增量更新（每次 Fragment 重跑）。
+
+信号与内容分离的设计使得弹层可以「先弹出框架，再异步填充内容」，也允许内容重跑时不反复触发打开动画。
+
+### 3.2 关闭弹层：前端动作与后端感知的分层
+
+关闭弹层有两条路径，对应不同的后端感知方式：
+
+**路径一：纯前端关闭（on_dismiss="ignore"）**
+- 用户点击遮罩、X 按钮或按 ESC
+- 前端组件将自身可见状态切换为隐藏
+- 不向后端发送任何消息，后端无感知
+- 适用于纯展示型弹层，关闭后无需更新主页面状态
+
+**路径二：Widget 触发关闭（on_dismiss="rerun" 或回调）**
+- 用户触发关闭动作
+- 前端检查到弹层有 ID（说明已注册为 Widget）
+- 前端通过 Widget 状态管理器写入 trigger_value=true
+- 该消息作为 Widget 更新送达后端
+- 后端在脚本重跑前读取 Widget 状态，执行 on_change 回调（若有），然后调度完整脚本重跑
+
+### 3.3 关闭行为的三种模式
+
+| on_dismiss 配置 | 注册为 Widget | 关闭时后端行为 | 适用场景 |
 |---|---|---|---|
-| `"ignore"` | 不设置 | 不注册 | 纯 UI 关闭，不触发 rerun |
-| `"rerun"` | 设置 | 注册（无 callback） | 关闭时触发完整 rerun |
-| `callable` | 设置 | 注册（有 callback） | 关闭时触发 rerun，先执行 callback |
+| ignore | 否 | 无感知 | 纯展示、确认提示 |
+| rerun | 是（无回调） | 完整脚本重跑 | 关闭后需刷新主页面 |
+| 回调函数 | 是（有回调） | 先执行回调，再完整重跑 | 关闭时需持久化状态、清理资源 |
 
-### 3.4 非 dismissible 弹层的键盘拦截
+**设计本质**：将「用户关闭弹层」建模为一次 Widget 交互，复用已有的 Widget → 回调 → 重跑链路，无需为弹层单独设计关闭协议。
 
-当 `dismissible=False` 时，Dialog.tsx 会拦截 `R` 键的快捷键行为（防止用户按 R 触发 rerun 绕过弹层）：
+### 3.4 不可关闭弹层的键盘保护
 
-```typescript
-if (isOpen && e.key.toLowerCase() === "r" && !element.dismissible) {
-    // 不在输入框中时阻止 R 键冒泡
-    e.preventDefault()
-    e.stopPropagation()
-}
-```
-
-使用 `capture: true` 在 document 级别拦截，优先于 App 层的快捷键处理。
+当弹层配置为不可手动关闭（dismissible=False）时，前端会在文档捕获阶段拦截 R 键的快捷键：
+- 阻止 R 键触发全局脚本重跑
+- 仅在非输入框聚焦时生效
+- 防止用户通过快捷键绕过弹层的强制交互流程
 
 ---
 
-## 四、页面状态隔离
+## 四、状态隔离机制
 
-### 4.1 Fragment 执行模型
+### 4.1 Fragment 执行模型：弹层即自动 Fragment
 
-Dialog 的内容函数被 `_fragment` 包裹，继承 Fragment 的所有隔离特性：
+弹层的内容函数在注册时自动包裹为 Fragment，继承 Fragment 的所有隔离特性：
 
-[dialog_decorator.py#L100-105](file:///d:/fz/0601/solo-dogfeeding/code/231-streamlit/lib/streamlit/elements/dialog_decorator.py#L100)：
+| 特性 | 作用 |
+|---|---|
+| 局部重跑 | 弹层内 Widget 交互只重跑弹层函数，主页面不执行 |
+| 游标快照 | 注册时深拷贝写入游标和容器栈，重跑时恢复，确保写入位置与首次注册一致 |
+| 独立存储 | Fragment 函数以基于模块名 + 位置的哈希为 key，存储在运行上下文中 |
 
-```python
-fragmented_dialog_content = cast(
-    "Callable[[], None]",
-    _fragment(
-        dialog_content, additional_hash_info=get_object_name(non_optional_func)
-    ),
-)
+这使得弹层内的高频交互（如滑块拖动、输入框打字）不会触发整个页面的重绘，性能与交互体验更好。
+
+### 4.2 EVENT 容器的三层隔离
+
+弹层写入 EVENT 容器而非 MAIN 容器，从三个维度实现隔离：
+
+**布局隔离**
+- 弹层不参与主区域的流式布局
+- 始终以 Modal 形式覆盖在页面最上层
+- 不受主页面容器宽度、边距、排列方式影响
+
+**主题隔离**
+- 不继承 Sidebar、Bottom 等容器的主题变量覆盖
+- 使用全局默认主题渲染，保证视觉一致性
+
+**渲染树隔离**
+- 在前端组件树中，EVENT 容器与 MAIN、SIDEBAR、BOTTOM 为兄弟节点
+- 节点清理、瞬时元素清除、多页面元素过滤等操作按容器独立执行
+- 主页面的元素增减不影响 EVENT 容器内部节点的 delta_path
+
+### 4.3 React Context 标记：IsDialogContext
+
+前端通过 React Context 向弹层内所有子组件传递「当前处于弹层中」的布尔标记。该标记影响以下组件行为：
+
+- **Markdown 标题**：弹层内的标题不生成锚点链接（弹层内无法跳转锚点）
+- **全屏模式禁用**：弹层及其子容器自动向下传播 disableFullscreenMode，图表、图片等组件不显示全屏按钮
+
+Context 标记是一种「软隔离」机制——不限制组件渲染，但调整组件的行为模式以适配弹层环境。
+
+### 4.4 弹层身份防重：防止旧内容残留
+
+前端在替换弹层类型的 Block 节点时，执行身份比对逻辑：
+
+```
+收到新的 dialog Block：
+  ├─ 旧节点也是 dialog 且 新旧 block.id 不同？
+  │   ├─ 是 → 不继承子节点，children = []（彻底清空）
+  │   └─ 否 → 继承旧节点 children（保留 React state）
 ```
 
-这意味着：
-- **Widget 交互只 rerun Fragment**：弹层内的 widget 交互（如 text_input、button）只重新执行弹层函数，不触发全脚本 rerun
-- **FragmentStorage 注册**：弹层内容函数作为 Fragment 注册到 `ctx.fragment_storage`，key 为基于函数模块名 + delta_path 的哈希
-- **独立 cursor 快照**：Fragment 创建时保存 `cursors` 和 `dg_stack` 的深拷贝，rerun 时恢复，确保元素写入正确位置
-
-### 4.2 EVENT 容器隔离
-
-弹层写入 EVENT 容器而非 MAIN 容器，实现了：
-
-1. **布局隔离**：弹层不参与主区域的流式布局，始终以 Modal 形式覆盖在页面上方
-2. **主题隔离**：不继承 sidebar/bottom 等容器的主题样式
-3. **渲染树隔离**：在 AppRoot 中，event 是独立的 BlockNode 子树，clearStaleNodes 等操作按容器分别处理
-
-### 4.3 IsDialogContext — React Context 隔离
-
-[IsDialogContext](file:///d:/fz/0601/solo-dogfeeding/code/231-streamlit/frontend/lib/src/components/core/IsDialogContext.ts) 是一个 React Context，默认值 `false`。当组件在 Dialog 内部渲染时被设置为 `true`：
-
-```tsx
-function DialogWithProvider(props) {
-    return (
-        <IsDialogContext.Provider value={true}>
-            <Dialog {...props} />
-        </IsDialogContext.Provider>
-    )
-}
-```
-
-消费此 Context 的组件包括：
-- **StreamlitMarkdown**：在弹层内禁用锚点标题的 heading anchor 链接
-- **Heading**：同上，弹层内的标题不生成锚点
-
-### 4.4 disableFullscreenMode 传播
-
-[Block.tsx](file:///d:/fz/0601/solo-dogfeeding/code/231-streamlit/frontend/lib/src/components/core/Block/Block.tsx#L286) 中，Dialog block 自动向下传播 `disableFullscreenMode=true`：
-
-```typescript
-const disableFullscreenMode =
-    props.disableFullscreenMode ||
-    notNullOrUndefined(node.deltaBlock.dialog) ||
-    notNullOrUndefined(node.deltaBlock.popover)
-```
-
-弹层内的元素（如图表、图片）不会显示全屏按钮。
-
-### 4.5 弹层身份防重 — 防止旧内容残留
-
-[AppRoot.addBlock](file:///d:/fz/0601/solo-dogfeeding/code/231-streamlit/frontend/lib/src/render-tree/AppRoot.ts#L471) 中，当替换 dialog block 时检查身份：
-
-```typescript
-const isDialogWithDifferentIdentity =
-    block.dialog &&
-    existingNode.deltaBlock.dialog &&
-    block.id !== existingNode.deltaBlock.id
-
-if (!isDialogWithDifferentIdentity) {
-    children = existingNode.children  // 继承子节点
-}
-```
-
-如果新旧 dialog 的 `block.id` 不同（即属性不同的弹层），不继承旧弹层的子节点，防止显示上一个弹层残留的元素内容。
+此机制的设计权衡：
+- ID 相同 → 视为同弹层内容刷新，保留子节点以避免 Widget 值丢失、减少 DOM 闪烁
+- ID 不同 → 视为不同弹层切换，不继承子节点以彻底隔离
 
 ---
 
@@ -236,61 +176,58 @@ if (!isDialogWithDifferentIdentity) {
 ### 5.1 首次打开弹层
 
 ```
-用户代码: vote("A")  →  _dialog_decorator.wrap()
-  ├─ _check_not_parallel_worker()         ← 并行 fragment 安全检查
-  ├─ _assert_no_nested_dialogs()          ← 嵌套检查
-  ├─ event_dg._dialog(title, ...)         ← 在 EVENT 容器创建 Dialog Block
-  │    └─ Dialog._create()
-  │         ├─ compute_and_register_element_id()  ← 生成稳定 ID
-  │         ├─ register_widget() (条件)           ← on_dismiss 时注册
-  │         └─ parent._block(block_proto)          ← 创建 Block 节点
-  ├─ dialog.open()                         ← 发送 is_open=True 的 ForwardMsg
-  │    └─ _update(True)
-  │         ├─ _assert_first_dialog_to_be_opened(True)  ← 单例检查
-  │         └─ enqueue_message(msg)          ← 通过 WebSocket 发送
-  ├─ _fragment(dialog_content)             ← 包裹为 Fragment
-  │    └─ fragment_storage.register(fragment_id, wrapped_fragment)
-  └─ with dialog: fragmented_dialog_content()  ← 在 Dialog 上下文中执行
+用户调用弹层函数
+  ├─ 并行安全校验 → 通过
+  ├─ 嵌套校验 → 通过
+  ├─ 创建弹层 Block（EVENT 容器）
+  │    ├─ 计算稳定 ID（基于配置）
+  │    ├─ 条件性注册为触发型 Widget（on_dismiss ≠ ignore 时）
+  │    └─ 写入 Block 节点
+  ├─ 发送打开信号（is_open=True）
+  ├─ 内容函数包裹为 Fragment → 注册存储
+  └─ 在弹层容器上下文中执行 Fragment → 写入弹层内容
 ```
 
-### 5.2 弹层内 Widget 交互（Fragment rerun）
+### 5.2 弹层内 Widget 交互（Fragment 重跑）
 
 ```
-用户在弹层内操作 widget
-  → 前端 WidgetStateManager 发送 widget update
-  → ScriptRunner 检测到 fragment_id 对应的 widget
-  → 仅执行该 Fragment 的 wrapped_fragment()
-  → 弹层内容更新，主页面不 rerun
+用户操作弹层内 Widget
+  → 前端 Widget 状态管理器发送更新消息
+  → 后端识别 Widget 所属的 Fragment ID
+  → 仅执行该 Fragment 的内容函数
+  → 游标快照恢复 → 写入更新 → 发送增量消息
+  → 前端更新弹层内容，主页面不变
 ```
 
 ### 5.3 关闭弹层
 
-**程序关闭**：弹层内调用 `st.rerun()`，触发完整脚本 rerun。由于条件不再满足，弹层函数不会被调用，新脚本运行中弹层自然消失。
+**程序关闭（弹层内调用重跑）**：
+- 弹层内按钮触发 Fragment 重跑
+- 重跑中抛出重跑异常，冒泡到脚本运行器
+- 调度完整脚本重跑
+- 新脚本运行中弹层函数未被调用（外层条件不满足）
+- 弹层自然消失
 
-**用户关闭**（点击遮罩/X 按钮/ESC）：
-- `on_dismiss="ignore"`：纯前端 `setIsOpen(false)`，无后端通知
-- `on_dismiss="rerun"`：`setTriggerValue` → 后端 rerun 整个脚本
-- `on_dismiss=callback`：`setTriggerValue` → 后端先执行 callback，再 rerun
+**用户关闭（点击遮罩/X/ESC）**：
+- ignore 模式：纯前端隐藏，后端无感知
+- rerun / 回调模式：前端写入 trigger_value → 后端识别顶层 Widget → 完整脚本重跑 → 若条件仍满足则弹层复现
 
 ---
 
-## 六、关键文件索引
+## 六、模块职责总览
 
-| 层级 | 文件 | 职责 |
+| 模块层级 | 职责 | 核心机制 |
 |---|---|---|
-| 装饰器 | [dialog_decorator.py](file:///d:/fz/0601/solo-dogfeeding/code/231-streamlit/lib/streamlit/elements/dialog_decorator.py) | `@st.dialog` 入口，校验与 Fragment 包裹 |
-| Dialog 类 | [dialog.py](file:///d:/fz/0601/solo-dogfeeding/code/231-streamlit/lib/streamlit/elements/lib/dialog.py) | Block 创建、open/close、Widget 注册 |
-| DG 单例 | [delta_generator_singletons.py](file:///d:/fz/0601/solo-dogfeeding/code/231-streamlit/lib/streamlit/delta_generator_singletons.py) | event_dg 等根容器初始化 |
-| Fragment | [fragment.py](file:///d:/fz/0601/solo-dogfeeding/code/231-streamlit/lib/streamlit/runtime/fragment.py) | Fragment 执行模型、存储 |
-| 运行上下文 | [script_run_context.py](file:///d:/fz/0601/solo-dogfeeding/code/231-streamlit/lib/streamlit/runtime/scriptrunner_utils/script_run_context.py) | `has_dialog_opened` 状态、消息队列 |
-| Proto 定义 | [Block.proto](file:///d:/fz/0601/solo-dogfeeding/code/231-streamlit/proto/streamlit/proto/Block.proto#L118) | Dialog 消息结构 |
-| 根容器 Proto | [RootContainer.proto](file:///d:/fz/0601/solo-dogfeeding/code/231-streamlit/proto/streamlit/proto/RootContainer.proto) | EVENT 容器枚举 |
-| 前端 Dialog | [Dialog.tsx](file:///d:/fz/0601/solo-dogfeeding/code/231-streamlit/frontend/lib/src/components/elements/Dialog/Dialog.tsx) | React 弹层组件、关闭处理 |
-| 前端 Modal | [Modal.tsx](file:///d:/fz/0601/solo-dogfeeding/code/231-streamlit/frontend/lib/src/components/shared/Modal/Modal.tsx) | 底层 Modal 渲染（react-aria） |
-| Block 渲染 | [Block.tsx](file:///d:/fz/0601/solo-dogfeeding/code/231-streamlit/frontend/lib/src/components/core/Block/Block.tsx) | 识别 dialog block 并渲染 Dialog |
-| 渲染树 | [AppRoot.ts](file:///d:/fz/0601/solo-dogfeeding/code/231-streamlit/frontend/lib/src/render-tree/AppRoot.ts) | 四容器树结构、弹层身份防重 |
-| 上下文隔离 | [IsDialogContext.ts](file:///d:/fz/0601/solo-dogfeeding/code/231-streamlit/frontend/lib/src/components/core/IsDialogContext.ts) | 弹层内 React Context 标记 |
-| Widget 管理 | [WidgetStateManager.ts](file:///d:/fz/0601/solo-dogfeeding/code/231-streamlit/frontend/lib/src/WidgetStateManager.ts) | setTriggerValue 触发 dismiss 回调 |
+| 装饰器层 | 用户 API 入口 | 校验、封装为 Fragment、绑定 EVENT 容器 |
+| Dialog 抽象层 | 弹层 Block 管理 | 稳定 ID 计算、打开/关闭信号、Widget 注册 |
+| 根容器层 | 四容器隔离 | MAIN / SIDEBAR / EVENT / BOTTOM 独立游标与渲染树 |
+| Fragment 层 | 局部执行 | 游标快照、局部重跑、函数存储 |
+| 运行上下文层 | 脚本运行期状态 | 单例标志、消息队列、Fragment 注册表 |
+| 协议层 | 前后端通信 | Block 消息结构、根容器枚举、Widget trigger 机制 |
+| 前端 Dialog 组件 | 弹层 UI 渲染 | Modal 组件、关闭处理、键盘拦截 |
+| 前端渲染树层 | 组件树管理 | 四容器树结构、弹层身份比对、节点清理 |
+| 前端 Context 层 | 环境标记传递 | IsDialogContext、disableFullscreenMode 传播 |
+| 前端 Widget 管理层 | Widget 状态同步 | trigger_value 写入、跨端消息发送 |
 
 ---
 
@@ -316,8 +253,8 @@ if (!isDialogWithDifferentIdentity) {
 
 | on_dismiss 配置 | 重跑范围 | 行为本质 |
 |---|---|---|
-| `ignore` | 无重跑 | 纯前端 DOM 操作，后端无感知 |
-| `rerun` | 完整脚本重跑 | 将弹层本身注册为触发型 Widget，关闭 = Widget 激活 |
+| ignore | 无重跑 | 纯前端 DOM 操作，后端无感知 |
+| rerun | 完整脚本重跑 | 将弹层本身注册为触发型 Widget，关闭 = Widget 激活 |
 | 回调函数 | 完整脚本重跑 + 回调优先 | 回调在主脚本执行前运行，属 Widget 的 on_change 机制 |
 
 **关键协作关系**：`on_dismiss` 之所以触发**完整脚本**而非弹层 Fragment 重跑，是因为「弹层作为触发型 Widget」注册在 EVENT 容器顶层，不在弹层内部的 Fragment 层级中。这是一个有意的设计：关闭弹层应视为一次全局性交互。
