@@ -231,23 +231,41 @@ function safeFormatNumber(value: string, format: string): string {
 
 #### `formatNumber()` — [formatNumber.ts:91-202](file:///d:/fz/0601/solo-dogfeeding/code/235-streamlit/frontend/lib/src/util/formatNumber.ts#L91-L202)
 
-支持的 format 类型与实现库：
+所有本地化/单位化的格式化均通过浏览器原生 **`Intl.NumberFormat`** 实现，并统一通过 `formatIntlNumberWithLocales()` 辅助函数读取 `navigator.languages`（用户浏览器首选语言列表）；若语言抛出 `RangeError`，回退到 `undefined`（即浏览器默认 locale）。
 
-| format 值 | 实现方式 | 示例输入 → 输出 |
-|-----------|---------|----------------|
-| `undefined`/`""` | **numbro**（自动 mantissa） | `1234.56789` → `"1234.5679"` |
-| `"plain"` | numbro（mantissa=20, trimMantissa） | `1234.567` → `"1234.567"` |
-| `"localized"` | **Intl.NumberFormat** 本机语言 | 1234.567 → 中文环境 `"1,234.567"` |
-| `"percent"` | Intl（style:"percent"） | `12.345` → `"1,234.50%"` |
-| `"dollar"` | Intl（currency:"USD" narrowSymbol） | `1234.567` → `"$1,234.57"` |
-| `"euro"` | Intl（currency:"EUR"） | `1234.567` → `"€1,234.57"` |
-| `"yen"` | Intl（currency:"JPY", 0 位小数） | `1234.567` → `"¥1,235"` |
-| `"accounting"` | numbro（千分位 + 括号负数） | `-1234` → `"(1,234.00)"` |
-| `"bytes"` | Intl（compact+byte 单位，替换"BB"→"GB"） | `1234` → `"1.2KB"` |
-| `"compact"` / `"scientific"` / `"engineering"` | Intl（notation） | `1234` → `"1.2K"` |
-| printf 格式（`"%.2f"`, `"%,d"`） | **sprintf.js**（支持 `,` `_` 千分位标志） | `1234.567, "%.2f"` → `"1234.57"` |
+```typescript
+// [formatNumber.ts:48-63]
+function formatIntlNumberWithLocales(value, options = {}) {
+  const locales = navigator.languages
+  try {
+    return new Intl.NumberFormat(locales, options).format(value)
+  } catch (error) {
+    if (error instanceof RangeError)
+      return new Intl.NumberFormat(undefined, options).format(value)
+    throw error
+  }
+}
+```
 
-> **与后端的协同边界**：后端不做任何本地化格式化，只转纯数字串；前端根据浏览器语言环境做本地化。**同一个 format 参数在中美用户浏览器上会显示不同的千分位样式**。
+支持的 format 类型与实现库（所有 Intl 输出均 **依 locale 而变**，示例以 `en-US` 环境为准）：
+
+| format 值 | 实现方式 | Intl option | `en-US` 示例 | `zh-CN` 示例 |
+|-----------|---------|-------------|-------------|-------------|
+| `undefined`/`""` | **numbro**（自动 mantissa，无本地化） | — | `1234.56789` → `"1234.5679"` | 同左（纯数字，无 locale 差异） |
+| `"plain"` | numbro（mantissa=20, trimMantissa，无本地化） | — | `1234.567` → `"1234.567"` | 同左 |
+| `"localized"` | **Intl.NumberFormat** 本机语言 | 默认 | `1234.567` → `"1,234.567"` | `"1,234.567"`（中文与英文千分位相同） |
+| `"percent"` | Intl `style:"percent"` | `style:"percent"` | `0.12345` → `"12.35%"` <br>`12.345` → `"1,234.50%"` | `"12.35%"` <br>`"1,234.50%"` |
+| `"dollar"` | Intl `currency:"USD" narrowSymbol` | `currency:"USD"` | `1234.567` → `"$1,234.57"` | `"$1,234.57"` |
+| `"euro"` | Intl `currency:"EUR" narrowSymbol` | `currency:"EUR"` | `1234.567` → `"€1,234.57"` | `"€1,234.57"` |
+| `"yen"` | Intl `currency:"JPY"`（0 位小数） | `currency:"JPY"` | `1234.567` → `"¥1,235"` | `"¥1,235"` |
+| `"accounting"` | numbro（千分位 + 括号负数，无本地化） | — | `-1234` → `"(1,234.00)"` | 同左 |
+| `"bytes"` | Intl `notation:"compact"` + `style:"unit" unit:"byte"` + `BB→GB` 替换 | `unit:"byte"`, `notation:"compact"`, `maxFractionDigits:1` | `1234` → `"1.2KB"` <br>`1234567` → `"1.2MB"` | `1234` → `"1.2KB"` <br>`1234567` → `"123.5万 B"`（注意：中文 locale 下按"万"进位） |
+| `"compact"` | **Intl `notation:"compact"`** | `notation:"compact"` | `1234567` → `"1.2M"` <br>`1234` → `"1.2K"` | `1234567` → `"123万"` <br>`1234` → `"1234"`（千级在中文无缩写） |
+| `"scientific"` | **Intl `notation:"scientific"`** | `notation:"scientific"` | `1234567` → `"1.235E6"` | `"1.235E6"` |
+| `"engineering"` | **Intl `notation:"engineering"`** | `notation:"engineering"` | `1234567` → `"1.235E6"` <br>`1234` → `"1.234E3"` | `"1.235E6"` <br>`"1.234E3"` |
+| printf 格式（`"%.2f"`, `"%,d"`, `"%,.2f"`） | **sprintf.js**（支持 `,` / `_` 千分位标志，无本地化） | — | `1234.567, "%.2f"` → `"1234.57"` <br>`1234, "%,d"` → `"1,234"` | 同左（纯英文逗号千分位） |
+
+> **与后端的协同边界**：后端不做任何本地化格式化，只转纯数字串；前端根据 `navigator.languages` 做浏览器级本地化。**同一个 `format="compact"` 在不同 locale 用户上会输出完全不同的结果**：例如 `1234567` 在英文环境是 `"1.2M"`，在中文环境是 `"123万"`，在德文环境是 `"1,2 Mio."`，在法文环境是 `"1,2 M"`。这是 Intl.NumberFormat 的预期行为，也是 Streamlit 前端统一做本地化的根本原因。
 
 #### `isNumericString()` — [formatNumber.ts:215-221](file:///d:/fz/0601/solo-dogfeeding/code/235-streamlit/frontend/lib/src/util/formatNumber.ts#L215-L221)
 
@@ -282,14 +300,16 @@ const formattedDelta =
 
 **实际效果示例**：
 
-| Python 调用 | 后端 body 字符串 | 前端显示 (无 format) | 前端显示 (format="compact") |
-|------------|----------------|---------------------|----------------------------|
-| `st.metric("A", 1234567)` | `"1234567"` | `"1234567"` | `"1.2M"` |
-| `st.metric("A", 12.3456789)` | `"12.3456789"` | `"12.3456789"` | `"12.3457"` (numbro 自动精度) |
-| `st.metric("A", None)` | `"—"` | `"—"` | `"—"` |
-| `st.metric("A", "70 °F")` | `"70 °F"` | `"70 °F"` | `"70 °F"` (非数字，format 忽略) |
+| Python 调用 | 后端 body 字符串 | 前端显示 (无 format) | 前端显示 (`format="compact"`, `en-US`) | 前端显示 (`format="compact"`, `zh-CN`) |
+|------------|----------------|---------------------|--------------------------------------|--------------------------------------|
+| `st.metric("A", 1234567)` | `"1234567"` | `"1234567"` | `"1.2M"` (Intl `notation:"compact"`) | `"123万"` (中文万进制) |
+| `st.metric("A", 12.3456789)` | `"12.3456789"` | `"12.3456789"` | `"12.3456789"` (Intl 对 < 1000 的数字不缩写) | `"12.3456789"` |
+| `st.metric("A", None)` | `"—"` | `"—"` | `"—"` | `"—"` |
+| `st.metric("A", "70 °F")` | `"70 °F"` | `"70 °F"` | `"70 °F"` (非数字，format 忽略) | `"70 °F"` (非数字，format 忽略) |
 
-> **重要区分**：`format` 参数的默认值 `None` ≠ `formatNumber(..., undefined)`。`formatNumber` 在 `format=undefined` 时会使用 numbro 做自动精度格式化，但 Metric 组件在 `format` 未传入时**根本不会调用 formatNumber**，直接走原始字符串分支。这是有意为之的设计：保证向后兼容，不改变老版本用户既有的显示效果。
+> **重要区分一**：`format` 参数的默认值 `None` ≠ `formatNumber(..., undefined)`。`formatNumber` 在 `format=undefined` 时会使用 numbro 做自动精度格式化（如 `1234.56789` → `"1234.5679"`，保留 4 位有效小数），但 **Metric 组件** 在 `format` 未传入时根本不会调用 `formatNumber`，直接走原始字符串分支（显示 `"1234.56789"`）。这是有意为之的设计：保证向后兼容，不改变老版本用户既有的显示效果。
+>
+> **重要区分二**：`format="compact"` 走的是 **Intl.NumberFormat `notation:"compact"`**，与 numbro 的 "averageFormat" 缩写逻辑完全不同。其缩写规则（K/M/B vs. 万/亿）由浏览器 locale 决定，无法在 Python 端统一控制。
 
 最终展示时，`formattedMetricValue` / `formattedDelta` 会被传入 `<StreamlitMarkdown>` 组件渲染（参考 [Metric.tsx:367-373](file:///d:/fz/0601/solo-dogfeeding/code/235-streamlit/frontend/lib/src/components/elements/Metric/Metric.tsx#L367-L373) 和 [Metric.tsx:396-402](file:///d:/fz/0601/solo-dogfeeding/code/235-streamlit/frontend/lib/src/components/elements/Metric/Metric.tsx#L396-L402)），支持有限的 Markdown 语法（粗体、斜体、内联代码、链接等），但禁止原始 HTML。
 
@@ -591,11 +611,12 @@ delta_generator._enqueue("metric", proto)
   ▼
 Metric 组件渲染
   │
-  ├─ 格式化阶段：
+  ├─ 格式化阶段（所有输出均依赖 `navigator.languages`，以下以 `en-US` 为例）：
   │    ├─ format="dollar" && isNumericString("12345.67")
-  │    │   → formatNumber(12345.67, "dollar") = "$12,345.67"   [按浏览器本地化]
+  │    │   → Intl.NumberFormat(locales, {style:"currency", currency:"USD", currencyDisplay:"narrowSymbol", minFracDigits:2, maxFracDigits:2})
+  │    │   → en-US 下结果 = "$12,345.67"；zh-CN 下同样为 "$12,345.67"（USD 符号国际化一致，千分位也一致）
   │    └─ format="dollar" && isNumericString("-830")
-  │        → formatNumber(-830, "dollar") = "-$830.00"
+  │         → Intl.NumberFormat(...) → "-$830.00"；de-DE 下为 "-830,00 $"（符号位后置 + 逗号小数）
   │
   ├─ 颜色阶段：
   │    ├─ color=GREEN
@@ -620,9 +641,11 @@ Metric 组件渲染
 
 2. **格式化的前后端边界与默认行为**
    - 后端只保证数字→可被解析的字符串，**不做本地化**
-   - 前端利用浏览器 `Intl.NumberFormat` 按用户语言环境格式化
+   - 前端本地化/单位化格式化统一走浏览器 `Intl.NumberFormat`（通过 `navigator.languages` 取浏览器语言，失败回退默认 locale），核心辅助函数为 `formatIntlNumberWithLocales()`
+   - **`compact` / `scientific` / `engineering` / `bytes`** 全部通过 Intl 的 `notation` 选项实现，缩写规则由 locale 决定（`en-US` 为 K/M/B，`zh-CN` 为万/亿）
    - 通过 `isNumericString` 守门，避免对已格式化的字符串重复处理
    - **默认 `format=None` 时完全跳过格式化**，直接使用后端原始字符串（经 StreamlitMarkdown 渲染），保证向后兼容不破坏既有显示。这是一个"功能默认关闭"的渐进式设计。
+   - `numbro`（自动 mantissa、accounting）和 `sprintf.js`（printf）处理的是无本地化场景，始终与 locale 无关
 
 3. **颜色的多重视觉通道**
    同一个 `color` 枚举统一驱动：差值徽章 **文字色 + 背景色** + sparkline 图表 **主线色/面积填充色** + **hover 高亮圆点颜色**。四处使用不同函数映射，既保证徽章的文本对比度，又保证图表视觉层次，还保持交互反馈的语义一致性。
