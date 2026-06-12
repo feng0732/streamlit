@@ -58,13 +58,13 @@
 
 | 用户 API | 实现类/方法 | 文件 |
 |---|---|---|
-| `st.image()` | `ImageMixin.image()` | [image.py](file:///d:/fz/0601/solo-dogfeeding/code/229-streamlit/lib/streamlit/elements/image.py#L48-L242) |
-| `st.audio()` | `MediaMixin.audio()` | [media.py](file:///d:/fz/0601/solo-dogfeeding/code/229-streamlit/lib/streamlit/elements/media.py#L70-L226) |
-| `st.video()` | `MediaMixin.video()` | [media.py](file:///d:/fz/0601/solo-dogfeeding/code/229-streamlit/lib/streamlit/elements/media.py#L227-L408) |
+| `st.image()` | `ImageMixin.image()` | [image.py](lib/streamlit/elements/image.py#L48-L242) |
+| `st.audio()` | `MediaMixin.audio()` | [media.py](lib/streamlit/elements/media.py#L70-L226) |
+| `st.video()` | `MediaMixin.video()` | [media.py](lib/streamlit/elements/media.py#L227-L408) |
 
 ### 2.2 图片格式归一化：`image_to_url()`
 
-核心逻辑在 [image_utils.py](file:///d:/fz/0601/solo-dogfeeding/code/229-streamlit/lib/streamlit/elements/lib/image_utils.py#L235-L346)。
+核心逻辑在 [image_utils.py](lib/streamlit/elements/lib/image_utils.py#L235-L346)。
 
 **分支处理顺序：**
 
@@ -98,14 +98,14 @@
 ### 2.3 音视频格式归一化
 
 - **音频 Numpy 数组** → `_make_wav()` 封装为 PCM WAV bytes
-  [media.py](file:///d:/fz/0601/solo-dogfeeding/code/229-streamlit/lib/streamlit/elements/media.py#L742-L762)
+  [media.py](lib/streamlit/elements/media.py#L742-L762)
 - **视频 YouTube URL** → `_reshape_youtube_url()` 正则提取 video_id，重写为 embed 链接
-  [media.py](file:///d:/fz/0601/solo-dogfeeding/code/229-streamlit/lib/streamlit/elements/media.py#L415-L446)
+  [media.py](lib/streamlit/elements/media.py#L415-L446)
 - **字幕文件** → `process_subtitle_data()` 同样注册到 MediaFileManager
 
 ### 2.4 MediaFileManager：注册与生成 URL
 
-核心类在 [media_file_manager.py](file:///d:/fz/0601/solo-dogfeeding/code/229-streamlit/lib/streamlit/runtime/media_file_manager.py#L82-L409)。
+核心类在 [media_file_manager.py](lib/streamlit/runtime/media_file_manager.py#L82-L409)。
 
 **关键数据结构：**
 ```python
@@ -123,7 +123,7 @@ self._files_by_session_and_coord: dict[session_id, dict[coordinates, file_id]]
 
 ### 2.5 MemoryMediaFileStorage：内存存储实现
 
-[memory_media_file_storage.py](file:///d:/fz/0601/solo-dogfeeding/code/229-streamlit/lib/streamlit/runtime/memory_media_file_storage.py)
+[memory_media_file_storage.py](lib/streamlit/runtime/memory_media_file_storage.py)
 
 **`load_and_get_id()`：**
 - 若是文件路径字符串，先读成 bytes
@@ -144,11 +144,153 @@ return f"{self._media_endpoint}/{file_id}{extension}"
 
 ---
 
-## 三、传输：Protobuf + WebSocket
+## 三、MediaFileManager 与 MediaFileStorage 职责边界深度解析
 
-### 3.1 Protobuf 定义
+### 3.1 接口抽象层：MediaFileStorage 协议
 
-**Image**：[Image.proto](file:///d:/fz/0601/solo-dogfeeding/code/229-streamlit/proto/streamlit/proto/Image.proto)
+[media_file_storage.py](lib/streamlit/runtime/media_file_storage.py#L42-L143) 定义了纯抽象接口（Protocol），定义存储层必须实现的三个核心能力：
+
+```python
+class MediaFileStorage(Protocol):
+    def load_and_get_id(self, path_or_data, mimetype, kind, filename) -> str:
+        # 输入：原始数据或文件路径 + 元数据
+        # 输出：全局唯一的 file_id
+        # 职责：读取/存储内容，计算内容哈希，去重
+
+    def get_url(self, file_id: str) -> str:
+        # 输入：file_id
+        # 输出：相对 URL 路径（如 /media/abc123.jpg）
+        # 职责：根据 mimetype 拼接扩展名，构造可被路由识别的 URL
+
+    def delete_file(self, file_id: str) -> None:
+        # 输入：file_id
+        # 输出：无
+        # 职责：物理删除内容，释放资源
+```
+
+> **设计意图**：通过 Protocol 抽象，存储层可以有多种实现（内存、S3、本地磁盘等），Manager 层不感知具体存储介质。
+
+### 3.2 维护的状态对比
+
+| 状态 | MediaFileManager | MediaFileStorage (Memory) |
+|---|---|---|
+| **二进制内容** | ❌ 不持有 | ✅ `_files_by_id: dict[str, MemoryFile]` |
+| **内容元数据** | ✅ `_file_metadata: dict[str, MediaFileMetadata]` (kind, is_marked_for_delete) | ✅ 内嵌于 `MemoryFile` (mimetype, kind, filename) |
+| **Session 引用关系** | ✅ `_files_by_session_and_coord: dict[session_id, dict[coord, file_id]]` | ❌ 不感知 |
+| **延迟执行逻辑** | ✅ `_deferred_callables: dict[str, DeferredCallableEntry]` | ❌ 不感知 |
+| **线程安全** | ✅ `_lock: threading.Lock` | ❌ 不做同步（由 Manager 保证） |
+| **URL 前缀配置** | ❌ 不持有 | ✅ `_media_endpoint: str` (如 "/media") |
+| **统计信息** | ❌ 不提供 | ✅ 实现 `StatsProvider` 接口，提供内存使用统计 |
+
+**核心结论**：
+- **Storage 层** 维护「内容本身」：bytes 存哪里、怎么存、怎么取、怎么算 ID
+- **Manager 层** 维护「生命周期」：谁在用、用在哪、什么时候删、并发安全
+
+### 3.3 媒体 URL 生成流程（写路径）
+
+调用链：`image_to_url()` → `MediaFileManager.add()` → `Storage.load_and_get_id()` → `Storage.get_url()`
+
+```
+用户数据 (bytes/str/PIL/numpy)
+        │
+        ▼
+image_to_url() — 格式归一化为 bytes + mimetype
+        │
+        ▼
+MediaFileManager.add(data, mimetype, coordinates)
+  1. _get_session_id() → "session_abc123"
+  2. self._lock.acquire()
+  3. storage.load_and_get_id(data, mimetype, kind, filename)
+     ├─ 若 data 是文件路径 → _read_file() 读为 bytes
+     ├─ _calculate_file_id(bytes, mimetype, filename) → "file_xyz789"
+     └─ 若 ID 不存在 → _files_by_id["file_xyz789"] = MemoryFile(bytes, ...)
+  4. _file_metadata["file_xyz789"] = MediaFileMetadata(kind=MEDIA)
+  5. _files_by_session_and_coord["session_abc123"][coordinates] = "file_xyz789"
+  6. storage.get_url("file_xyz789")
+     ├─ get_file("file_xyz789") → MemoryFile
+     ├─ get_extension_for_mimetype("image/jpeg") → ".jpg"
+     └─ return "/media/file_xyz789.jpg"
+  7. self._lock.release()
+        │
+        ▼
+返回: "/media/file_xyz789.jpg"
+```
+
+**关键分层点**：
+- Manager 不知道 file_id 怎么算的，也不知道 URL 怎么拼的
+- Storage 不知道 session_id 是什么，也不知道 coordinates 有什么用
+- 两者通过 `file_id` 这个唯一标识符解耦
+
+### 3.4 媒体 URL 读取流程（读路径 / HTTP 层）
+
+调用链：`GET /media/file_xyz789.jpg` → `Starlette _media_endpoint` → `Storage.get_file()`
+
+```
+HTTP Request: GET /media/file_xyz789.jpg
+        │
+        ▼
+Starlette 路由匹配 {file_id:path} = "file_xyz789.jpg"
+        │
+        ▼
+media_storage.get_file("file_xyz789.jpg")
+  1. os.path.splitext("file_xyz789.jpg")[0] → "file_xyz789"
+  2. _files_by_id["file_xyz789"] → MemoryFile(content=bytes, mimetype="image/jpeg", ...)
+        │
+        ▼
+返回 Response:
+  body = bytes
+  Content-Type = "image/jpeg"
+  Accept-Ranges = "bytes"
+```
+
+**关键设计**：
+- URL 中的扩展名 `.jpg` 是**给浏览器看的**，Storage 实际通过去掉扩展名的部分 `file_xyz789` 来索引
+- HTTP 层**绕过 Manager 直接访问 Storage**，因为读取路径不需要生命周期管理
+- 这也解释了为什么 Storage 必须独立存在：它同时被 Manager（写路径）和 Starlette 路由（读路径）调用
+
+### 3.5 引用计数与垃圾回收
+
+`remove_orphaned_files()` 是 Manager 层的核心职责，完全基于自己维护的状态判断，Storage 不参与决策：
+
+```python
+def _get_inactive_file_ids(self) -> set[str]:
+    # 所有已知的 file_id
+    file_ids = set(self._file_metadata.keys())
+    # 减去所有 session 正在引用的 file_id
+    for session_file_ids_by_coord in self._files_by_session_and_coord.values():
+        file_ids.difference_update(session_file_ids_by_coord.values())
+    return file_ids  # 剩下的就是孤儿文件
+
+def remove_orphaned_files(self) -> None:
+    with self._lock:
+        for file_id in self._get_inactive_file_ids():
+            file = self._file_metadata[file_id]
+            if file.kind == MEDIA or file.is_marked_for_delete:
+                self._storage.delete_file(file_id)  # 通知 Storage 物理删除
+                del self._file_metadata[file_id]    # 清理自己的元数据
+```
+
+### 3.6 边界模糊点澄清
+
+**Q: 为什么 `MediaFileMetadata` 由 Manager 维护，而不是存到 Storage 里？**
+
+A: `MediaFileMetadata` 的 `is_marked_for_delete` 字段是生命周期状态（"这个文件被标记了，下次清理时再删"），不是内容属性。Storage 只关心"内容是什么"，不关心"用户还想不想留着它"。
+
+**Q: 为什么 `MediaFileManager.add()` 调用 `storage.get_url()` 而不是自己拼 URL？**
+
+A: URL 格式是存储层的内部约定。如果未来换成 S3 存储，URL 可能变成 `https://bucket.s3.amazonaws.com/file_xyz789.jpg`，Manager 层代码不需要改动。
+
+**Q: 为什么读路径不经过 Manager？**
+
+A: 读路径是高频的浏览器 HTTP 请求，不需要生命周期追踪、不需要线程锁、不需要 session 关联。直接访问 Storage 性能更好，职责也更清晰。
+
+---
+
+## 四、传输：Protobuf + WebSocket
+
+### 4.1 Protobuf 定义
+
+**Image**：[Image.proto](proto/streamlit/proto/Image.proto)
 ```protobuf
 message Image {
   string url = 3;       // /media/... 或外部 URL 或 data: URI
@@ -160,7 +302,7 @@ message ImageList {
 }
 ```
 
-**Audio**：[Audio.proto](file:///d:/fz/0601/solo-dogfeeding/code/229-streamlit/proto/streamlit/proto/Audio.proto)
+**Audio**：[Audio.proto](proto/streamlit/proto/Audio.proto)
 ```protobuf
 message Audio {
   string url = 5;
@@ -173,7 +315,7 @@ message Audio {
 }
 ```
 
-**Video**：[Video.proto](file:///d:/fz/0601/solo-dogfeeding/code/229-streamlit/proto/streamlit/proto/Video.proto)
+**Video**：[Video.proto](proto/streamlit/proto/Video.proto)
 ```protobuf
 message SubtitleTrack {
   string label = 1;
@@ -195,9 +337,9 @@ message Video {
 
 > **关键点**：protobuf 消息中只携带 `url`（相对路径或绝对地址），**从不携带二进制内容**。真正的 bytes 通过 HTTP `/media/...` 单独获取。
 
-### 3.2 序列化与入队
+### 4.2 序列化与入队
 
-以 image 为例，[image.py](file:///d:/fz/0601/solo-dogfeeding/code/229-streamlit/lib/streamlit/elements/image.py#L216-L237)：
+以 image 为例，[image.py](lib/streamlit/elements/image.py#L216-L237)：
 ```python
 image_list_proto = ImageListProto()
 marshall_images(..., image_list_proto, ...)   # 填充 proto 中的 url / caption
@@ -208,11 +350,11 @@ return self.dg._enqueue("imgs", image_list_proto, layout_config=layout_config)
 
 ---
 
-## 四、服务端：Starlette HTTP 媒体路由
+## 五、服务端：Starlette HTTP 媒体路由
 
-### 4.1 路由注册
+### 5.1 路由注册
 
-[starlette_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/229-streamlit/lib/streamlit/web/server/starlette/starlette_routes.py#L488-L590)
+[starlette_routes.py](lib/streamlit/web/server/starlette/starlette_routes.py#L488-L590)
 
 ```python
 BASE_ROUTE_MEDIA = "media"
@@ -220,7 +362,7 @@ _ROUTE_MEDIA = f"{BASE_ROUTE_MEDIA}/{{file_id:path}}"
 # 注册 GET / HEAD / OPTIONS 三种方法
 ```
 
-### 4.2 `_media_endpoint` 请求处理
+### 5.2 `_media_endpoint` 请求处理
 
 ```
 Request: GET /media/abc123def.jpg
@@ -244,11 +386,11 @@ Request: GET /media/abc123def.jpg
 
 ---
 
-## 五、前端：React 组件渲染
+## 六、前端：React 组件渲染
 
-### 5.1 URL 补全：DefaultStreamlitEndpoints
+### 6.1 URL 补全：DefaultStreamlitEndpoints
 
-[DefaultStreamlitEndpoints.ts](file:///d:/fz/0601/solo-dogfeeding/code/229-streamlit/frontend/connection/src/DefaultStreamlitEndpoints.ts#L187-L204)
+[DefaultStreamlitEndpoints.ts](frontend/connection/src/DefaultStreamlitEndpoints.ts#L187-L204)
 
 ```typescript
 public buildMediaURL(url: string): string {
@@ -269,9 +411,9 @@ public buildMediaURL(url: string): string {
 
 例如：`/media/abc123.jpg` → `http://localhost:8501/media/abc123.jpg`
 
-### 5.2 组件渲染
+### 6.2 组件渲染
 
-#### 图片组件 [ImageList.tsx](file:///d:/fz/0601/solo-dogfeeding/code/229-streamlit/frontend/lib/src/components/elements/ImageList/ImageList.tsx)
+#### 图片组件 [ImageList.tsx](frontend/lib/src/components/elements/ImageList/ImageList.tsx)
 
 ```tsx
 <img
@@ -285,7 +427,7 @@ public buildMediaURL(url: string): string {
 - caption 通过 `StreamlitMarkdown` 渲染在图片下方
 - 单图可包裹 `<StyledImageLink>` 实现点击跳转
 
-#### 音频组件 [Audio.tsx](file:///d:/fz/0601/solo-dogfeeding/code/229-streamlit/frontend/lib/src/components/elements/Audio/Audio.tsx)
+#### 音频组件 [Audio.tsx](frontend/lib/src/components/elements/Audio/Audio.tsx)
 
 ```tsx
 const uri = endpoints.buildMediaURL(element.url)
@@ -300,7 +442,7 @@ return <StyledAudio
 - `useEffect` 监听 `loadedmetadata` 后设置 `currentTime = startTime`
 - `timeupdate` 事件中实现 `end_time` 截断和 `loop` 逻辑（因为原生 HTML5 audio 不支持 end_time）
 
-#### 视频组件 [Video.tsx](file:///d:/fz/0601/solo-dogfeeding/code/229-streamlit/frontend/lib/src/components/elements/Video/Video.tsx)
+#### 视频组件 [Video.tsx](frontend/lib/src/components/elements/Video/Video.tsx)
 
 两种分支：
 
@@ -334,7 +476,7 @@ return <StyledAudio
 
 ---
 
-## 六、衔接点总结
+## 七、衔接点总结
 
 | 衔接环节 | 位置 | 关键数据 |
 |---|---|---|
@@ -348,7 +490,7 @@ return <StyledAudio
 
 ---
 
-## 七、关键设计决策
+## 八、关键设计决策
 
 1. **内容寻址去重**：file_id = hash(content + mimetype + filename)，相同内容的媒体文件在服务端只存一份，跨 session 共享。
 2. **二进制与控制信令分离**：protobuf 只传 URL 和元数据，大体积二进制走独立 HTTP 通道，避免 WebSocket 消息过大。
@@ -356,3 +498,4 @@ return <StyledAudio
 4. **部分哈希优化**：>1 MiB 文件只取头尾中段各 64 KiB 计算指纹，权衡碰撞概率与性能。
 5. **HTTP Range 支持**：视频无需完整下载即可拖动进度条播放，响应 `206 Partial Content`。
 6. **SVG 内联为 data URI**：避免额外 HTTP 请求，并解决 SVG xmlns 缺失导致浏览器不渲染的问题。
+7. **Manager 与 Storage 分层**：通过 Protocol 抽象解耦，Storage 管"内容"（存哪里、怎么取），Manager 管"生命周期"（谁在用、何时删），两者通过 file_id 唯一标识符协作。
