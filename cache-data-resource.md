@@ -831,6 +831,148 @@ def clear_session(self, session_id):
 - 或者用 `scope="global"` + `persist="disk"`（全局共享，没问题）
 - 避免 `scope="session"` + `persist="disk"` 这个组合
 
+### 6.13 persist=None 的禁用机制：LocalDiskCacheStorage 的自我禁用
+
+`persist=None`（默认值）时，`LocalDiskCacheStorage` 并不是被跳过了，而是它自己通过 `if self.persist == "disk"` 判断来禁用读写。
+
+**四种方法的行为差异**：
+
+| 方法 | `persist="disk"` | `persist=None` |
+|-----|-----------------|---------------|
+| `get(key)` | ✅ 读文件，不存在抛错 | ❌ **直接抛错**，不读文件<br>`"Local disk cache storage is disabled (persist=None)"` |
+| `set(key,value)` | ✅ 写文件，失败清理空文件 | ❌ **静默 return**，不写文件 |
+| `delete(key)` | ✅ `os.remove` 文件，不存在静默 | ❌ **静默 return**，不删文件 |
+| `clear()` | ✅ 遍历删除 `function_key-*.memo` | ✅ **同样遍历删除**，完全不检查 persist！ |
+
+源码为证：[local_disk_cache_storage.py#L137-L203](file:///d:/fz/0601/solo-dogfeeding/code/216-streamlit/lib/streamlit/runtime/caching/storage/local_disk_cache_storage.py#L137-L203)
+
+```python
+def get(self, key):
+    if self.persist == "disk":  # 读有判断
+        path = self._get_cache_file_path(key)
+        ...
+    else:
+        raise CacheStorageKeyNotFoundError(
+            f"Local disk cache storage is disabled (persist={self.persist})"
+        )
+
+def set(self, key, value):
+    if self.persist == "disk":  # 写有判断
+        ...
+
+def delete(self, key):
+    if self.persist == "disk":  # 删有判断
+        ...
+
+def clear(self):
+    cache_dir = get_cache_folder_path()
+    if os.path.isdir(cache_dir):
+        # ❗ 完全不检查 self.persist！
+        # We try to remove all files in the cache directory that start with
+        # the function key, whether `clear` called for `self.persist`
+        # storage or not, to avoid leaving orphaned files in the cache directory.
+        for file_name in os.listdir(cache_dir):
+            if self._is_cache_file(file_name):
+                os.remove(os.path.join(cache_dir, file_name))
+```
+
+**关键细节**：`set()` 和 `delete()` 在 `persist=None` 时是**静默返回**，不抛异常也不打日志，所以你完全意识不到它"什么也没做"。
+
+### 6.14 两种"空"存储的对比：LocalDiskCacheStorage(None) vs DummyCacheStorage
+
+`persist=None` 在两种运行模式下会走上不同的存储层，行为有细微差别：
+
+| 维度 | 常规 runtime + persist=None<br>`LocalDiskCacheStorage(persist=None)` | raw mode + 任意 persist<br>`DummyCacheStorage` |
+|-----|-------------------------------------------------------|---------------------------------------|
+| 存储管理器 | `LocalDiskCacheStorageManager` | `MemoryCacheStorageManager` |
+| `get()` | 抛 `CacheStorageKeyNotFoundError`，<br>消息明确说 "disabled (persist=None)" | 抛 `CacheStorageKeyNotFoundError`，<br>消息是 "Key not found in dummy cache" |
+| `set()` | 静默 return，什么也不做 | 静默 pass，什么也不做 |
+| `delete()` | 静默 return，什么也不做 | 静默 pass，什么也不做 |
+| `clear()` | ❗ **扫盘删除**所有 `function_key-*.memo` | ❌ **空操作**，什么也不做 |
+| `close()` | 空实现 | 空实现 |
+
+**最关键的区别**：
+- 常规 runtime 下即使 `persist=None`，调用 `clear()` 还是会**扫磁盘删除文件**
+- raw mode 下 `clear()` 完全是空操作，碰不到磁盘
+
+源码：[dummy_cache_storage.py#L42-L60](file:///d:/fz/0601/solo-dogfeeding/code/216-streamlit/lib/streamlit/runtime/caching/storage/dummy_cache_storage.py#L42-L60)
+
+```python
+class DummyCacheStorage(CacheStorage):
+    def get(self, key):
+        raise CacheStorageKeyNotFoundError("Key not found in dummy cache")
+    def set(self, key, value):
+        pass
+    def delete(self, key):
+        pass
+    def clear(self):
+        pass    # ❗ 永远不碰磁盘
+```
+
+### 6.15 function_key 不含 persist 导致的 clear() 跨模式扫盘
+
+**核心问题**：`function_key` 的计算完全不包含 `persist` 参数。
+
+源码位置：[cache_utils.py#L540-L578](file:///d:/fz/0601/solo-dogfeeding/code/216-streamlit/lib/streamlit/runtime/caching/cache_utils.py#L540-L578)
+
+```python
+def _make_function_key(cache_type, func):
+    func_hasher = util.create_fast_hasher()
+    # 只 hash 这两样，完全没有 persist！
+    update_hash((func.__module__, func.__qualname__), ...)
+    update_hash(source_code, ...)
+    return func_hasher.hexdigest()
+```
+
+这意味着：**同一个函数，无论 `persist=None` 还是 `persist="disk"`，function_key 完全相同。**
+
+**导致的后果**：
+
+```python
+# 版本 1：先写磁盘
+@st.cache_data(persist="disk")
+def load_data(url):
+    return requests.get(url).json()
+
+load_data("https://api.example.com/data")  # 写入磁盘 file: {func_key}-{val_key}.memo
+```
+
+```python
+# 版本 2：改成内存模式
+@st.cache_data(persist=None)  # 同一个函数，function_key 相同
+def load_data(url):
+    return requests.get(url).json()
+
+load_data.clear()  # ❗ 会把版本 1 写入的磁盘文件也删掉！
+```
+
+**为什么要这样设计？**
+
+看代码注释就明白了：[local_disk_cache_storage.py#L198-L200](file:///d:/fz/0601/solo-dogfeeding/code/216-streamlit/lib/streamlit/runtime/caching/storage/local_disk_cache_storage.py#L198-L200)
+
+```python
+# We try to remove all files in the cache directory that start with
+# the function key, whether `clear` called for `self.persist`
+# storage or not, to avoid leaving orphaned files in the cache directory.
+```
+
+设计意图是**防止孤儿文件**：你把 `persist="disk"` 改成 `persist=None` 后，如果 `clear()` 不扫盘，之前的磁盘文件就永远留在那里了。所以刻意让 `clear()` 忽略 persist 参数。
+
+**但这是一把双刃剑**：
+- ✅ 好处：改 persist 参数后 `clear()` 能把旧的磁盘文件也清掉，不留孤儿
+- ❌ 坏处：如果你有两个部署（或两次运行），一个用 `persist="disk"` 一个用 `persist=None`，但函数源码相同，后者的 `clear()` 会把前者的磁盘缓存删掉
+
+**完整的扫盘触发场景**：
+
+| 调用方 | persist | 是否扫磁盘 |
+|-------|---------|-----------|
+| `func.clear()`（按参数清除） | None / "disk" | ❌ 只调 `delete(key)`，persist=None 时不扫 |
+| `func.clear()`（无参，清空整个函数） | None | ✅ 扫！ |
+| `func.clear()`（无参，清空整个函数） | "disk" | ✅ 扫 |
+| `st.cache_data.clear()` | - | ✅ 直接 rmtree 整个 cache 目录 |
+| session 断开清理 + persist=None | None | ✅ 扫！（调用 `cache.clear()`） |
+| session 断开清理 + persist="disk" | "disk" | ✅ 扫 |
+
 ---
 
 ## 七、cache_data vs cache_resource 协作对比总结
@@ -919,6 +1061,18 @@ cache_resource:
 
 12. **「那 `scope=\"session\"` 到底隔离了什么？」**  
     只隔离了内存层的 `_function_caches` 字典（key 是 session_id），存储层（不管是内存包装层的 TTLCache 还是磁盘层）是每个缓存实例独立的。但对于 `persist="disk"`，磁盘是共享的，所以隔离不完整。对于 `persist=None`，每个 session 有独立的 `InMemoryCacheStorageWrapper` 实例，持久化层是 DummyCacheStorage，此时隔离是完整的。
+
+13. **「persist=None 时，LocalDiskCacheStorage 被跳过了吗？」**  
+    ❌ 没有被跳过，它仍然被实例化了，只是内部通过 `if self.persist == "disk"` 判断来禁用自己。`get()` 会明确抛错说 "disabled"，`set()`/`delete()` 静默 return，**但 `clear()` 完全不检查 persist，无论什么模式都会扫盘**。
+
+14. **「同样是 persist=None，raw mode 和正常运行有什么区别？」**  
+    正常运行用 `LocalDiskCacheStorage(persist=None)`，`clear()` 会扫盘删文件；raw mode 用 `DummyCacheStorage`，`clear()` 完全是空操作不碰磁盘。另外 `get()` 抛的错误消息也不一样，一个说 "disabled"，一个说 "dummy cache"。
+
+15. **「把函数从 persist=\"disk\" 改成 persist=None，调用 clear() 会怎样？」**  
+    ❗ 会把之前 persist=\"disk\" 时写入的磁盘文件也删掉！因为 function_key 只 hash 模块名+限定名+源码，不含 persist，所以两个模式共享同一个 function_key。而 `LocalDiskCacheStorage.clear()` 刻意忽略 persist，只要 function_key 匹配就删。设计意图是防止孤儿文件，但也可能误删。
+
+16. **「按参数清除 `func.clear(url=\"xxx\")` 也会扫盘吗？」**  
+    ❌ 不会。按参数清除走的是 `delete(key)` 而不是 `clear()`。`delete()` 在 persist=None 时是静默 return 不碰磁盘。只有无参的 `func.clear()`（清空整个函数）才会触发 `clear()` 扫盘。
 
 ---
 
