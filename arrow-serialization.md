@@ -590,7 +590,58 @@ private getCachedMessage(
 }
 ```
 
-#### 4.4.4 缓存过期与清理
+#### 4.4.4 缓存过期与清理：maxCachedMessageAge 的完整传递链
+
+**Age 算法**：不是标准的 LRU，而是基于"脚本运行次数"的 Age 算法。`ForwardMessageCache` 维护一个全局的 `scriptRunCount` 计数器，每次脚本运行完成（成功完成或 fragment 完成）时递增 1。每个缓存条目在被访问（`maybeCacheMessage` 写入或 `getCachedMessage` 读取）时，会更新 `entry.scriptRunCount = this.scriptRunCount`。条目年龄 `age = currentRunCount - entry.scriptRunCount`。
+
+`maxCachedMessageAge` 的值由 **四层链路** 确定：
+
+```
+第 1 层：配置文件
+   .streamlit/config.toml → global.maxCachedMessageAge
+   （默认值由后端 Server 配置决定）
+         │
+         ▼  proto
+第 2 层：NewSession 消息
+   NewSession.proto → Config.max_cached_message_age (int32, field 3)
+   见 [NewSession.proto L92-L97](./proto/streamlit/proto/NewSession.proto#L92-L97)
+         │
+         ▼  SessionInfo.propsFromNewSessionMessage()
+第 3 层：会话信息缓存
+   SessionInfo.ts → Props.maxCachedMessageAge
+   见 [SessionInfo.ts L40, L116](./frontend/lib/src/SessionInfo.ts#L40, L116)
+   在 NewSession 消息到达时被初始化，会话生命周期内不变
+         │
+         ▼  handleScriptFinished()
+第 4 层：调用时传入
+   App.tsx → this.sessionInfo.current.maxCachedMessageAge
+   作为 incrementMessageCacheRunCount 的第一个参数
+```
+
+**调用条件**（四层门禁）：
+```typescript
+// App.tsx L1641-L1656
+if (
+  this.connectionManager !== null &&
+  status !== ForwardMsg.ScriptFinishedStatus.FINISHED_EARLY_FOR_RERUN &&  // ⚠️ 被 rerun 打断的脚本 → 不清理！
+  this.sessionInfo.isSet &&                                                // 会话已初始化
+  this.hasReceivedNewSession                                               // 当前 run 的 NewSession 已收到
+) {
+  this.connectionManager.incrementMessageCacheRunCount(
+    this.sessionInfo.current.maxCachedMessageAge,  // ← 来自会话配置，不是硬编码的 1 或 2
+    this.state.fragmentIdsThisRun                   // ← 直接使用 state.fragmentIdsThisRun 数组
+  )
+}
+```
+
+**关键修正（与旧版描述的差异）**：
+1. ~~`FINISHED_EARLY_FOR_RERUN` 传入 `maxMessageAge = 2`~~ → **事实是 FINISHED_EARLY_FOR_RERUN 被直接排除，不会调用清理**。目的是避免 rerun 期间提前删除可能被新脚本需要的缓存消息。
+2. ~~`maxMessageAge` 是硬编码的 1 或 2~~ → **事实是来自 `sessionInfo.current.maxCachedMessageAge`，由后端配置决定**。
+3. ~~`fragmentIdsThisRun` 用 `currentFragmentId` 三元表达式构造~~ → **事实是直接使用 `this.state.fragmentIdsThisRun`**，该数组在 NewSession 消息到达时被赋值。
+
+---
+
+##### 完整清理逻辑：ForwardMessageCache.incrementRunCount()
 
 ```typescript
 // ForwardMessageCache.ts L70-L100
@@ -598,18 +649,25 @@ public incrementRunCount(
   maxMessageAge: number,
   fragmentIdsThisRun: string[]
 ): void {
+  // ── 全局计数器递增（无论是否 fragment run）──
+  // ⚠️ 已知限制：fragment run 也会递增全局 scriptRunCount，
+  // 导致非 fragment 消息的 age 同样增加。如果后续紧跟多次 fragment run
+  // 后才 full rerun，非 fragment 消息可能因 age 超标被误删。
+  // 注释说明："技术 overhead 大于收益，暂不做 per-fragment 计数"
   this.scriptRunCount += 1
 
   this.messages.forEach((entry, hash) => {
-    // 如果是 fragment run，只清理当前 fragment 相关的缓存
+    // ── 过滤 1：fragment run 专属逻辑 ──
     if (
       fragmentIdsThisRun.length > 0 &&
       (!entry.fragmentId || !fragmentIdsThisRun.includes(entry.fragmentId))
     ) {
+      // fragment run 期间：只处理属于本次 fragment 的消息
+      // 非本次 fragment 的消息 → 直接跳过（不判断 age，不删除）
       return
     }
 
-    // 超过 maxMessageAge 次 rerun 未被访问 → 清理
+    // ── 过滤 2：年龄判断 ──
     if (entry.getAge(this.scriptRunCount) > maxMessageAge) {
       LOG.info(`Removing expired ForwardMsg [hash=${hash}]`)
       this.messages.delete(hash)
@@ -618,27 +676,35 @@ public incrementRunCount(
 }
 ```
 
-**LRU 算法**：不是标准的 LRU，而是基于"脚本运行次数"的 Age 算法。每次脚本运行完成时，`scriptRunCount` 递增 1。缓存条目的 `age = currentRunCount - entry.scriptRunCount`。超过 `maxMessageAge`（默认值由服务器配置，通常为 1~2 次 rerun）就会被清理。
+**Fragment run 期间哪些消息会被纳入老化处理？**
 
-**调用时机**：在 `handleScriptFinished()` 中调用，见 [App.tsx](./frontend/app/src/App.tsx#L1634-L1645)：
+| 消息类型 | fragmentId 属性 | fragmentIdsThisRun 非空时 | 是否被老化判断 |
+|---------|----------------|-------------------------|--------------|
+| **主脚本完整 run 的消息** | `undefined` | `!entry.fragmentId` 为 true → 命中过滤 1 → return | ❌ 跳过 |
+| **本次 fragment 的消息** | `"frag_abc"` | 在 fragmentIdsThisRun 中 → 不命中过滤 1 → 继续 | ✅ 参与老化 |
+| **其他 fragment 的消息** | `"frag_xyz"` | 不在 fragmentIdsThisRun 中 → 命中过滤 1 → return | ❌ 跳过 |
+| **无 fragmentId 的消息** | `undefined` | `!entry.fragmentId` → 命中过滤 1 → return | ❌ 跳过 |
 
-```typescript
-// App.tsx L1634-L1645
-this.connectionManager?.incrementMessageCacheRunCount(
-  // maxMessageAge
-  status === ForwardMsg.ScriptFinishedStatus.FINISHED_EARLY_FOR_RERUN
-    ? 2
-    : 1,
-  // fragmentIdsThisRun
-  status === ForwardMsg.ScriptFinishedStatus.FINISHED_FRAGMENT_RUN_SUCCESSFUL
-    ? [this.state.currentFragmentId!]
-    : []
-)
-```
+**简而言之**：fragment run 期间，只有**属于本次 fragment 的消息**才会被纳入老化判断和可能的清理。非本次 fragment 的消息（包括主脚本消息、其他 fragment 消息）全部跳过。
+
+**但注意全局计数器的副作用**：即使非 fragment 消息不被清理，它们的 `age`（= currentRunCount - entry.scriptRunCount）仍在不断增大（因为 scriptRunCount 每次都 +1）。如果连续进行 N 次 fragment run 后才执行 full rerun，而 N > maxCachedMessageAge，那么即使非 fragment 消息从未被"跳过老化"，在随后的 full rerun 中也会因为 age 超标而被删除。
+
+---
+
+**ScriptFinishedStatus 触发时机总结**：
+
+| 状态值 | 含义 | 是否触发 clearStaleNodes | 是否触发 incrementMessageCacheRunCount |
+|-------|------|-------------------------|--------------------------------------|
+| `FINISHED_SUCCESSFULLY` (0) | 完整脚本运行成功 | ✅ 是 | ✅ 是（使用会话配置的 maxCachedMessageAge） |
+| `FINISHED_WITH_COMPILE_ERROR` (1) | 编译错误 | ❌ 否 | ❌ 否 |
+| `FINISHED_EARLY_FOR_RERUN` (2) | 被 rerun 打断 | ❌ 否（防止闪烁） | ❌ 否（防止误删） |
+| `FINISHED_FRAGMENT_RUN_SUCCESSFUL` (3) | fragment 运行成功 | ✅ 是 | ✅ 是（带 fragmentIdsThisRun 过滤） |
 
 **对于 Arrow 数据的意义**：几 MB 甚至几十 MB 的 Arrow bytes 不会在 rerun 时重复传输。当同一个 DataFrame 在多次 rerun 中出现时：
-- 第 1 次：发送完整消息 + `metadata.cacheable = true` → 前端缓存
-- 第 2 次及以后：只发送 `ForwardMsg{ref_hash: "abc123", metadata: {...}}`（约 50 字节），前端还原成原始消息
+- 第 1 次：发送完整消息 + `metadata.cacheable = true` → 前端缓存，`entry.scriptRunCount = currentRunCount`
+- 第 2 次：相同消息被访问 → `entry.scriptRunCount` 更新为新的 `currentRunCount` → age = 0
+- 第 3 次及以后：如果 `elementHash` 相同且未被清理（age ≤ maxCachedMessageAge），后端只需发送 `ForwardMsg{ref_hash: "abc123", metadata: {...}}`（约 50 字节），前端还原成原始消息
+- 超过 `maxCachedMessageAge` 次 rerun 未被访问 → 自动清理
 
 ---
 
