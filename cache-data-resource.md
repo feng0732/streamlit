@@ -596,7 +596,20 @@ LocalDiskCacheStorage 的 `get`/`set`/`delete`/`clear` 实现极其简单：
 
 ### 6.7 非 persist 模式的存储层
 
-当 `persist=None`（默认）时，使用的是 `MemoryCacheStorageManager`，其持久化层是 `DummyCacheStorage`：
+`persist=None`（默认）在**常规 runtime** 下并不是用 `DummyCacheStorage`，而是用 `LocalDiskCacheStorage(persist=None)`，它通过内部判断**自我禁用**读写，但 `clear()` 会扫盘。
+
+**正确的存储层结构（常规 runtime，persist=None）**：
+```
+InMemoryCacheStorageWrapper
+  ├─ 内存层: TTLCache（TTL 和 max_entries 完全生效）
+  └─ 持久化层: LocalDiskCacheStorage(persist=None)
+       ├─ get(): if persist == "disk": ... else: 抛错（不读磁盘）
+       ├─ set(): if persist == "disk": ... else: 静默 return（不写磁盘）
+       ├─ delete(): if persist == "disk": ... else: 静默 return（不删磁盘）
+       └─ clear(): **完全不检查 persist**，遍历扫盘删除 function_key-*.memo
+```
+
+**只有 raw mode 下才用 DummyCacheStorage**：
 
 源码位置：[dummy_cache_storage.py](file:///d:/fz/0601/solo-dogfeeding/code/216-streamlit/lib/streamlit/runtime/caching/storage/dummy_cache_storage.py)
 
@@ -609,13 +622,17 @@ class DummyCacheStorage(CacheStorage):
     def delete(self, key):
         pass
     def clear(self):
-        pass
+        pass    # ❗ raw mode 下 clear() 永远不碰磁盘
 ```
 
-也就是说：
-- 非 disk 模式下，`InMemoryCacheStorageWrapper` 仍然存在，但 `_persist_storage` 是个永远 miss 的空壳
-- 此时 TTL 和 max_entries **完全生效**，因为只有内存层在工作
-- 内存层就是真实的唯一存储，没有磁盘回源
+**两种模式的 clear() 行为差异**：
+- 常规 runtime + persist=None：`clear()` **会扫盘**（调用 `LocalDiskCacheStorage.clear()`）
+- raw mode + 任意 persist：`clear()` **不碰磁盘**（调用 `DummyCacheStorage.clear()`）
+
+**共同点**：
+- `InMemoryCacheStorageWrapper` 始终存在，内存层（TTLCache）TTL 和 max_entries **完全生效**
+- 持久化层的 `get()` 永远抛错，所以内存 miss 后不会有磁盘回源
+- 内存层就是事实的唯一存储
 
 ### 6.8 持久化缓存的失效边界总结
 
@@ -667,8 +684,8 @@ def get_storage_manager(self) -> CacheStorageManager:
 
 | 模式 | runtime.exists() | 存储管理器 | 持久化层 | 实际效果 |
 |-----|-----------------|-----------|---------|---------|
-| **正常运行**<br>(`streamlit run app.py`) | ✅ True | `LocalDiskCacheStorageManager` | `LocalDiskCacheStorage` | persist="disk" 时真正落盘，<br>persist=None 时 DummyCacheStorage |
-| **Raw Mode**<br>(`python app.py` 直接运行) | ❌ False | `MemoryCacheStorageManager` | `DummyCacheStorage` | 永远只用内存，persist 参数<br>被忽略，重启全部丢失 |
+| **正常运行**<br>(`streamlit run app.py`) | ✅ True | `LocalDiskCacheStorageManager` | `LocalDiskCacheStorage` | persist="disk" 时真正落盘，<br>persist=None 时自我禁用（clear() 仍扫盘） |
+| **Raw Mode**<br>(`python app.py` 直接运行) | ❌ False | `MemoryCacheStorageManager` | `DummyCacheStorage` | 永远只用内存，persist 参数<br>被忽略，clear() 不碰磁盘，重启全部丢失 |
 
 **Raw Mode 的持久化层是空壳**：
 
@@ -820,9 +837,9 @@ def clear_session(self, session_id):
 
 | 组合 | 内存层隔离 | 磁盘层隔离 | 实际效果 |
 |-----|-----------|-----------|---------|
-| `scope="global"` `persist=None` | 不隔离（共享） | 无磁盘层 | 正常，全局共享 |
+| `scope="global"` `persist=None` | 不隔离（共享） | 磁盘层存在但自我禁用<br>（`get/set/delete` 不碰磁盘，<br>**但 `clear()` 会扫盘**） | 正常，全局共享内存缓存，<br>`clear()` 会误删同函数的 disk 模式缓存 |
 | `scope="global"` `persist="disk"` | 不隔离（共享） | 不隔离（共享） | 正常，全局持久化 |
-| `scope="session"` `persist=None` | ✅ 按 session 隔离 | 无磁盘层 | 正常，会话级内存缓存 |
+| `scope="session"` `persist=None` | ✅ 按 session 隔离 | 磁盘层存在但自我禁用<br>（`get/set/delete` 不碰磁盘，<br>**但 `clear()` 会扫盘**） | 会话级内存缓存隔离完整，<br>但 session 断开时 `clear()` 会删<br>其他 session 的同函数磁盘缓存 |
 | `scope="session"` `persist="disk"` | ✅ 按 session 隔离 | ❌ 完全不隔离 | **有坑！** 磁盘数据跨 session 共享，<br>一个 session 断开会删除所有 session 的磁盘文件 |
 
 **最佳实践**：
@@ -964,14 +981,15 @@ load_data.clear()  # ❗ 会把版本 1 写入的磁盘文件也删掉！
 
 **完整的扫盘触发场景**：
 
-| 调用方 | persist | 是否扫磁盘 |
-|-------|---------|-----------|
-| `func.clear()`（按参数清除） | None / "disk" | ❌ 只调 `delete(key)`，persist=None 时不扫 |
-| `func.clear()`（无参，清空整个函数） | None | ✅ 扫！ |
-| `func.clear()`（无参，清空整个函数） | "disk" | ✅ 扫 |
-| `st.cache_data.clear()` | - | ✅ 直接 rmtree 整个 cache 目录 |
-| session 断开清理 + persist=None | None | ✅ 扫！（调用 `cache.clear()`） |
-| session 断开清理 + persist="disk" | "disk" | ✅ 扫 |
+| 调用方 | persist | 运行模式 | 是否扫磁盘 | 原因 |
+|-------|---------|---------|-----------|------|
+| `func.clear(url="xxx")`<br>（按参数清除） | None / "disk" | 任意 | ❌ 不扫 | 走 `delete(key)`，persist=None 时<br>LocalDiskCacheStorage 静默 return |
+| `func.clear()`<br>（无参，清空整个函数） | None | 常规 runtime | ✅ 扫！ | 走 `LocalDiskCacheStorage.clear()`，<br>不检查 persist 直接扫 |
+| `func.clear()`<br>（无参，清空整个函数） | None | raw mode | ❌ 不扫 | 走 `DummyCacheStorage.clear()`，<br>永远空操作 |
+| `func.clear()`<br>（无参，清空整个函数） | "disk" | 常规 runtime | ✅ 扫 | 走 `LocalDiskCacheStorage.clear()` |
+| `st.cache_data.clear()` | - | 任意 | ✅ 扫！ | 直接 `shutil.rmtree` 整个 cache 目录 |
+| session 断开清理 + persist=None | None | 常规 runtime | ✅ 扫！ | 调用 `cache.clear()` → `LocalDiskCacheStorage.clear()` |
+| session 断开清理 + persist="disk" | "disk" | 常规 runtime | ✅ 扫 | 调用 `cache.clear()` → `LocalDiskCacheStorage.clear()` |
 
 ---
 
@@ -1051,7 +1069,7 @@ cache_resource:
    ❌ 不会。源码变更会产生新的 function_key，旧 function_key 对应的所有 .memo 文件变成孤儿文件永远留在磁盘上。只有 `st.cache_data.clear()`（它会 rmtree 整个 cache 目录）才能清理掉。
 
 9. **「直接 `python app.py` 运行和 `streamlit run app.py` 运行，缓存行为有区别吗？」**  
-   ✅ 有很大区别。`streamlit run` 会启动 runtime，使用 `LocalDiskCacheStorageManager`，persist="disk" 会真正落盘。直接 `python app.py` 是 raw mode，`runtime.exists()` 返回 False，回退到 `MemoryCacheStorageManager`，持久化层是永远 miss 的 `DummyCacheStorage`，所有缓存只在内存里，重启就丢。
+   ✅ 有很大区别。`streamlit run` 会启动 runtime，使用 `LocalDiskCacheStorageManager`，persist="disk" 会真正落盘，**persist=None 时 `clear()` 仍会扫盘**。直接 `python app.py` 是 raw mode，`runtime.exists()` 返回 False，回退到 `MemoryCacheStorageManager`，持久化层是永远 miss 的 `DummyCacheStorage`，所有缓存只在内存里，**`clear()` 永远不碰磁盘**，重启就丢。
 
 10. **「`scope=\"session\" persist=\"disk\"` 能实现会话级别的持久化隔离吗？」**  
     ❌ 完全不能。`CacheStorageContext` 没有 session_id 字段，磁盘文件名也不含 session_id，不同 session 用相同参数调用会读写**同一个磁盘文件**。更严重的是，一个 session 断开清理缓存时会删除该 function_key 的**所有**磁盘文件，误伤其他还在连接的 session。
@@ -1060,7 +1078,7 @@ cache_resource:
     分情况：`cache_resource` 不会（只有内存层，每个 session 独立）。但 `cache_data(persist="disk")` 会！因为 `LocalDiskCacheStorage.clear()` 删除所有以 function_key 开头的 .memo 文件，不区分 session。session A 断开 → 删磁盘文件 → session B 过会儿内存过期 → 磁盘 miss → 重新计算。
 
 12. **「那 `scope=\"session\"` 到底隔离了什么？」**  
-    只隔离了内存层的 `_function_caches` 字典（key 是 session_id），存储层（不管是内存包装层的 TTLCache 还是磁盘层）是每个缓存实例独立的。但对于 `persist="disk"`，磁盘是共享的，所以隔离不完整。对于 `persist=None`，每个 session 有独立的 `InMemoryCacheStorageWrapper` 实例，持久化层是 DummyCacheStorage，此时隔离是完整的。
+    只隔离了内存层的 `_function_caches` 字典（key 是 session_id），存储层是每个缓存实例独立的。但对于 `persist="disk"`，磁盘文件名不含 session_id 是共享的，所以隔离不完整。对于 `persist=None`，每个 session 有独立的 `InMemoryCacheStorageWrapper` 实例，常规 runtime 下持久化层是 `LocalDiskCacheStorage(persist=None)`（自我禁用读写，但 `clear()` 仍会扫盘），所以内存层隔离是完整的，但 `clear()` 路径仍可能误伤同函数的 disk 模式缓存。只有 raw mode 下持久化层才是 `DummyCacheStorage`，此时隔离完全完整。
 
 13. **「persist=None 时，LocalDiskCacheStorage 被跳过了吗？」**  
     ❌ 没有被跳过，它仍然被实例化了，只是内部通过 `if self.persist == "disk"` 判断来禁用自己。`get()` 会明确抛错说 "disabled"，`set()`/`delete()` 静默 return，**但 `clear()` 完全不检查 persist，无论什么模式都会扫盘**。
