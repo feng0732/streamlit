@@ -1000,17 +1000,131 @@ addTransient(...): AppRoot {
 
 #### 4.6.6 读访问器：GetNodeByDeltaPathVisitor
 
-[GetNodeByDeltaPathVisitor.ts](./frontend/lib/src/render-tree/visitors/GetNodeByDeltaPathVisitor.ts) — 根据 `deltaPath` 定位节点。递归消耗 `deltaPath` 的头部索引，`TransientNode` 不消耗索引（透明穿透）。
+[GetNodeByDeltaPathVisitor.ts](./frontend/lib/src/render-tree/visitors/GetNodeByDeltaPathVisitor.ts) — 根据 `deltaPath` 定位节点。返回类型为 `AppNode | undefined`，所有"找不到"的情况都返回 `undefined`（而非抛出异常）。
 
-三种 `visit` 方法的行为差异：
+**逐方法精确语义分析**：
 
-| 方法 | 路径为空时 | 路径非空时 | 消耗路径索引？ |
-|------|-----------|-----------|--------------|
-| `visitElementNode()` | 返回 `undefined`（叶子，无可查找内容） | 抛异常（不应发生） | — |
-| `visitBlockNode()` | 返回 `undefined`（Block 自身不是查找目标，children 才是） | 取 `children[currentIndex]`：若 `remainingPath` 空则返回 child，否则递归 | ✅ 消耗 1 个 |
-| `visitTransientNode()` | 返回 `node.anchor`（把 anchor 当作该位置的实际节点） | `node.anchor?.accept(this)`（穿透到 anchor 继续处理） | ❌ 不消耗 |
+##### visitElementNode()：叶子节点，永远返回 undefined
 
-**`visitTransientNode` 的特殊性**：它是 TransientNode 透明性的核心保证——任何通过此 Visitor 查找的操作，都看不到 TransientNode 包装层，只看到内部的 anchor。这正是 `addBlock()` 中可以直接对查找结果做 `instanceof BlockNode` 判断的原因。
+```typescript
+// GetNodeByDeltaPathVisitor.ts L42-L45
+visitElementNode(_node: ElementNode): AppNode | undefined {
+  // ElementNodes have no children, so there is nothing to check
+  return undefined
+}
+```
+
+**关键：不检查路径，不抛出异常，无论空路径还是剩余路径，一律返回 undefined。**
+
+测试用例确认此行为：[GetNodeByDeltaPathVisitor.test.ts L27-L44](./frontend/lib/src/render-tree/visitors/GetNodeByDeltaPathVisitor.test.ts#L27-L44)
+- 路径 `[0]` → `undefined` ✅
+- 路径 `[]`（空路径）→ `undefined` ✅
+
+**为什么不抛错？设计理由**：
+1. **统一查找语义**：Visitor 的返回类型是 `AppNode | undefined`，`undefined` 统一表示"目标不存在"。查找失败是正常的业务情况（例如第一次写入某位置时就没有现有节点），不是异常。
+2. **调用方是 AppRoot.ts 的现有节点定位**：在 `applyDelta()` 的 `newElement` / `addBlock` 分支中，`GetNodeByDeltaPathVisitor.getNodeAtPath()` 用于查找 `existingNode`，结果为 `undefined` 时表示"该位置还没有节点"（全新写入），直接走正常新建分支即可，不需要额外的 try-catch 处理。
+3. **不会被错误调用**：正常调用链中，BlockNode 会在 `remainingPath.length === 0` 时直接返回 `node.children[currentIndex]`（不会再调用 `child.accept(childVisitor)`），只有当路径还有剩余层级时才会向下递归。如果 child 恰好是 ElementNode（说明路径写多了，层级过深），静默返回 `undefined` 比抛出更优雅——等同于"在这个过深的位置找不到节点"。
+
+---
+
+##### visitBlockNode()：递归消耗路径索引
+
+```typescript
+// GetNodeByDeltaPathVisitor.ts L47-L67
+visitBlockNode(node: BlockNode): AppNode | undefined {
+  // ── 情形 A：路径为空 ──
+  // Block 本身不是查找目标（只有 Block 的 children 才是）
+  // 空路径意味着"我已经到达 Block 节点自身的位置，但没有指定 child 索引"→ 返回 undefined
+  if (this.deltaPath.length === 0) {
+    return undefined
+  }
+
+  const [currentIndex, ...remainingPath] = this.deltaPath
+
+  // ── 情形 B：索引越界 ──
+  // children.length 是精确边界：0 <= index < children.length
+  if (currentIndex < 0 || currentIndex >= node.children.length) {
+    return undefined
+  }
+
+  // ── 情形 C：路径全部消耗完毕 ──
+  // remainingPath 为空 → children[currentIndex] 就是目标节点，直接返回
+  if (remainingPath.length === 0) {
+    return node.children[currentIndex]   // ← 命中！此分支不调用 .accept()
+  }
+
+  // ── 情形 D：还有剩余路径 ──
+  // 创建新 visitor（携带 remainingPath），继续向下递归消耗
+  const childVisitor = new GetNodeByDeltaPathVisitor(remainingPath)
+  return node.children[currentIndex].accept(childVisitor)
+}
+```
+
+**关键细节**：情形 C 命中时不调用 `child.accept()`，直接返回 child。这意味着目标节点若是 ElementNode，`visitElementNode()` 在查找成功场景下根本不会被调用。
+
+测试用例覆盖：[GetNodeByDeltaPathVisitor.test.ts L47-L146](./frontend/lib/src/render-tree/visitors/GetNodeByDeltaPathVisitor.test.ts#L47-L146)
+- 空路径 `[]` → `undefined`
+- 浅路径 `[0]` → 返回 `children[0]`
+- 深路径 `[1, 0]` → 递归后返回嵌套 child
+- 越界 `[-1]`/`[3]`/`[2]`（等于长度）→ `undefined`
+
+---
+
+##### visitTransientNode()：透明穿透，不消耗路径索引
+
+```typescript
+// GetNodeByDeltaPathVisitor.ts L69-L77
+visitTransientNode(node: TransientNode): AppNode | undefined {
+  // ── 情形 A：路径为空 ──
+  // 到达 TransientNode 自身的位置，把 anchor 当作该位置的实际内容
+  // ⚠️ 与 BlockNode 空路径行为不同！BlockNode 空路径返回 undefined，
+  //    TransientNode 空路径返回 node.anchor（TransientNode 认为自己的"内容"就是 anchor）
+  if (this.deltaPath.length === 0) {
+    return node.anchor   // 可能为 undefined（anchor 未设置时）
+  }
+
+  // ── 情形 B：还有剩余路径 ──
+  // 穿透到 anchor，使用 this（同一个 visitor，剩余路径保持不变！）
+  // ✅ 关键：不 new 新 visitor，this 的 deltaPath 没有被 consume
+  //         TransientNode 在 deltaPath 上是透明的，不占用任何索引位置
+  // ✅ 使用 ?. 可选链：anchor 为 undefined 时整个表达式返回 undefined（不抛错）
+  return node.anchor?.accept(this)
+}
+```
+
+**与 BlockNode 的对比差异**：
+
+| 维度 | BlockNode.visitBlockNode() | TransientNode.visitTransientNode() |
+|------|---------------------------|-----------------------------------|
+| 剩余路径非空时 | `new GetNodeByDeltaPathVisitor(remainingPath)` → **消耗 1 个索引** | `node.anchor?.accept(this)` → **不消耗索引** |
+| 空路径时 | 返回 `undefined` | 返回 `node.anchor`（可能仍为 undefined） |
+| 查找失败 | 索引越界/空块 → `undefined` | anchor 不存在 → `undefined` |
+
+测试用例验证：[GetNodeByDeltaPathVisitor.test.ts L182-L221](./frontend/lib/src/render-tree/visitors/GetNodeByDeltaPathVisitor.test.ts#L182-L221)
+- 空路径 `[]` + anchor = ElementNode → 返回该 anchor ✅
+- 路径 `[1]` + anchor = BlockNode(`[t1, t2]`) → 返回 `t2`（路径 [1] 在穿透到 BlockNode 后才被消耗，找到 Block.children[1]）✅
+- 越界路径 `[-1]`/`[5]` + anchor = ElementNode → `undefined`（穿透到 ElementNode 后路径仍有剩余，由 visitElementNode 返回 undefined）✅
+
+---
+
+##### 完整决策表（所有分支汇总）
+
+| 方法 | deltaPath 状态 | 附加条件 | 返回值 |
+|------|---------------|---------|-------|
+| **visitElementNode** | 任意（空/非空） | 任意 | `undefined` |
+| **visitBlockNode** | 空路径 `[]` | — | `undefined` |
+| | 非空 | `currentIndex` 越界 | `undefined` |
+| | 非空 | `remainingPath.length === 0` | `node.children[currentIndex]` |
+| | 非空 | `remainingPath` 还有剩余 | 递归：`node.children[currentIndex].accept(new Visitor(remainingPath))` |
+| **visitTransientNode** | 空路径 `[]` | — | `node.anchor`（可能为 undefined） |
+| | 非空 | anchor 存在 | `node.anchor.accept(this)`（同一 visitor，路径不消耗） |
+| | 非空 | anchor 不存在 | `undefined`（?. 短路） |
+
+**`visitTransientNode` 的透明性总结**：
+- TransientNode 在 `deltaPath` 的索引体系中**不占位置**——它的 wrapper 层对路径查找是不可见的
+- 穿透时使用同一个 `this` visitor，保证剩余路径被传递给 anchor 时不被修改
+- 空路径时直接暴露 anchor，这让上层调用 `GetNodeByDeltaPathVisitor.getNodeAtPath(root, deltaPath)` 在目标位置有 TransientNode 时也能拿到真实内容（如 `addBlock()` 中的 `existingNodeAtPath instanceof TransientNode ? ...anchor...` 分支）
+- **但注意**：空路径时 BlockNode 返回 undefined，而 TransientNode 返回 anchor，两者语义不一致。这是因为 BlockNode 认为"自己是容器、children 才是内容"，而 TransientNode 认为"anchor 就是自己的内容、transientNodes 只承载附加的临时显示层"。
 
 ---
 
