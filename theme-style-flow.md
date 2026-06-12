@@ -568,6 +568,7 @@ ThemedSidebar 组件 [ThemedSidebar.tsx]
 - 两个 EmotionThemeProvider 嵌套，内层覆盖外层的 theme 值
 - 共享同一个 emotion cache（`st-emotion-cache`），避免样式重复
 - 全局样式（`html { font-size }` / `body` 等）只在外层注入一次
+- **侧边栏 ThemeProvider 不注入 FontSources / FontFaceDeclaration**，侧边栏的字体文件依赖外层 ThemedApp 加载
 
 **核心文件**：
 - 入口组件：[ThemedSidebar.tsx](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/app/src/components/Sidebar/ThemedSidebar.tsx)
@@ -763,199 +764,322 @@ Python 启动 / 热重载
 
 ## 十一、深度解析专题
 
-### 11.1 专题一：侧边栏独立主题的真实渲染入口
+### 11.1 专题一：主题包装层的真实结构
 
-#### 容易混淆的认知
-
-很多人以为侧边栏的主题隔离是通过嵌套第二个 `RootStyleProvider` 实现的，但事实并非如此。
-
-#### 真实入口：ThemedSidebar 组件
-
-**位置**：[ThemedSidebar.tsx](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/app/src/components/Sidebar/ThemedSidebar.tsx)
-
-```tsx
-const ThemedSidebar = ({ children, ...sidebarProps }) => {
-  const { activeTheme } = useContext(ThemeContext)
-  const sidebarTheme = createSidebarTheme(activeTheme)
-
-  return (
-    <ThemeProvider theme={sidebarTheme.emotion} baseuiTheme={sidebarTheme.basewebTheme}>
-      <Sidebar {...sidebarProps}>{children}</Sidebar>
-    </ThemeProvider>
-  )
-}
-```
-
-#### 三层主题隔离架构
+#### 从 ThemedApp 到 Sidebar 的完整组件树
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  RootStyleProvider（主应用外层）                         │
-│  ├─ BaseProvider         ← BaseWeb 全局主题              │
-│  └─ CacheProvider        ← 共享 emotion cache           │
-│     └─ EmotionThemeProvider  ← 主主题 emotion            │
-│        ├─ Global(globalStyles) ← 全局 CSS（只注入一次）  │
-│        │                                                  │
-│        └─ ... 主内容区域 ...                              │
-│                                                           │
-│        └─ ThemedSidebar  ← 侧边栏主题入口                │
-│           └─ ThemeProvider（轻量版）                      │
-│              ├─ BaseUIThemeProvider  ← 侧边栏 BaseWeb    │
-│              └─ EmotionThemeProvider ← 侧边栏 Emotion    │
-│                 └─ Sidebar 组件及其子元素                 │
-└─────────────────────────────────────────────────────────┘
+ThemedApp
+  │
+  │  useThemeManager() → [themeManager, fontFaces, fontSources]
+  │  fontFaces/fontSources 来自 setFonts(themeInput)  ← 只执行一次
+  │
+  ├─ <RootStyleProvider theme={activeTheme}>
+  │     ├─ <BaseProvider theme={basewebTheme} zIndex={popup}>
+  │     └─ <CacheProvider value={cache}>
+  │          └─ <EmotionThemeProvider theme={emotion}>
+  │               ├─ <Global styles={globalStyles} />        ← body { font-family, bg, color }
+  │               ├─ <FontFaceDeclaration fontFaces={fontFaces} />  ← @font-face CSS
+  │               ├─ <FontSources fontSources={fontSources} />      ← <link rel=stylesheet>
+  │               │
+  │               └─ <AppWithScreencast theme={themeManager}>
+  │                    └─ <App>
+  │                         └─ <AppView>
+  │                              ├─ <ThemedSidebar>
+  │                              │     ├─ useContext(ThemeContext) → activeTheme
+  │                              │     ├─ createSidebarTheme(activeTheme)
+  │                              │     └─ <ThemeProvider theme={sidebarTheme.emotion}
+  │                              │                       baseuiTheme={sidebarTheme.basewebTheme}>
+  │                              │          ├─ <BaseUIThemeProvider>     ← 侧边栏 BaseWeb
+  │                              │          ├─ <EmotionThemeProvider>    ← 侧边栏 Emotion
+  │                              │          │   └─ <IsSidebarContext.Provider value={true}>
+  │                              │          │        └─ <Sidebar> ... </Sidebar>
+  │                              │          └─ （无 FontSources / FontFaceDeclaration）
+  │                              │
+  │                              └─ <StyledMainContent> ... </StyledMainContent>
 ```
 
-#### ThemeProvider（侧边栏用） vs RootStyleProvider（主应用用）
+#### 两层 Provider 的职责划分
 
-| 层级 | RootStyleProvider | ThemeProvider | 作用说明 |
-|------|------------------|---------------|---------|
-| BaseProvider | ✅ | ✅ (BaseUIThemeProvider) | BaseWeb 组件主题上下文 |
-| CacheProvider | ✅ | ❌ | 侧边栏复用外层 cache，避免重复 |
-| EmotionThemeProvider | ✅ | ✅ | 提供 `props.theme` 给 styled-components |
-| Global 全局样式 | ✅ | ❌ | html/body 等全局样式只注入一次 |
-| CSP nonce | ✅ | ❌ | nonce 在 cache 级别设置，一次即可 |
+| 能力 | RootStyleProvider（主应用） | ThemeProvider（侧边栏） |
+|------|---------------------------|----------------------|
+| BaseWeb 主题 | ✅ `BaseProvider` | ✅ `BaseUIThemeProvider` |
+| Emotion 缓存 | ✅ `CacheProvider`（创建 `st-emotion-cache`） | ❌ 复用外层缓存 |
+| Emotion 主题 | ✅ `EmotionThemeProvider` | ✅ `EmotionThemeProvider`（覆盖内层） |
+| 全局 CSS | ✅ `Global(globalStyles)` → body/html/滚动条 | ❌ 不重复注入 |
+| 字体源 `<link>` | ✅ `FontSources` → `<head>` 中 | ❌ 无 |
+| 字体声明 | ✅ `FontFaceDeclaration` → `@font-face` | ❌ 无 |
+| 侧边栏标志 | ❌ | ✅ `IsSidebarContext.Provider` |
 
-#### 关键技术点
-
-1. **嵌套 Provider 模式**：侧边栏在主 `EmotionThemeProvider` 内部再嵌套一个 `EmotionThemeProvider`，内层的 theme 值会覆盖外层。
-
-2. **共享 Cache**：不创建新的 emotion cache，所有样式都写入同一个 `st-emotion-cache`，避免样式重复和 CSS 体积膨胀。
-
-3. **createSidebarTheme 函数** [utils.ts L1562-L1612](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/lib/src/theme/utils.ts#L1562-L1612)
-   - 从 `activeTheme.themeInput.sidebar` 提取侧边栏配置
-   - 背景色默认用 `secondaryBg`（主主题的次背景）
-   - 用 `mergeWith` 合并：主主题配置 → 侧边栏配置 → 强制覆盖项
-   - 调用 `createTheme("Sidebar", mergedInput, undefined, inSidebar=true)` 完整构建
-
-4. **inSidebar 标志的作用**：在 `createEmotionTheme` 中设置 `theme.inSidebar = true`，供部分组件根据是否在侧边栏内调整样式（如阴影、边框等）。
-
-5. **IsSidebarContext**：除了主题隔离，侧边栏还通过 `IsSidebarContext.Provider value={true}` 提供上下文，通知子组件"我在侧边栏里"。
+**关键洞察**：侧边栏的 `ThemeProvider` 只覆盖了 Emotion 主题值（颜色、字体名、间距等），但不注入任何字体资源。侧边栏使用的字体依赖外层 `ThemedApp` 的 `FontSources` / `FontFaceDeclaration` 加载。
 
 ---
 
-### 11.2 专题二：浅色/深色分支下字体来源的真实注入路径
+### 11.2 专题二：六层配置段 → fontSources 的完整矩阵
 
-#### 容易混淆的认知
+#### 后端 _get_font_source_config_name 的"拧巴"之处
 
-既然有 `[theme.light]` 和 `[theme.dark]` 配置段，很多人自然以为每个模式下的字体配置（尤其是字体源 URL）是分开的，切换浅色/深色时会切换对应的字体。但事实并非如此。
+**位置**：[theme_util.py L81-L87](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/lib/streamlit/runtime/theme_util.py#L81-L87)
 
-#### 字体系统的两层分离
+```python
+def _get_font_source_config_name(property_name: str, section: str) -> str:
+    if section == "theme":
+        return property_name          # → "font", "codeFont", "headingFont"
+    return f"{property_name}-sidebar" # → "font-sidebar", "codeFont-sidebar", ...
+```
 
-Streamlit 的字体分为两个完全独立的层面：
+这个函数的逻辑是：**只有根段 `[theme]` 保留原名，其他所有段（包括 `[theme.light]`、`[theme.dark]`）都加 `-sidebar` 后缀**。
 
-| 层面 | 说明 | 随主题切换？ |
-|------|------|-------------|
-| **字体族名称** (font-family) | `bodyFont` / `headingFont` / `codeFont` 的名称 | ✅ 随主题切换 |
-| **字体来源** (font source) | `@font-face` 声明 / `<link>` 样式表 URL | ❌ 全局加载，不随主题切换 |
+这意味着后端生成的 fontSources config_name 矩阵如下：
 
-#### 字体来源的收集逻辑
+| 配置段 | section 参数 | font config_name | codeFont config_name | headingFont config_name |
+|--------|-------------|-----------------|---------------------|------------------------|
+| `[theme]` | `"theme"` | `font` | `codeFont` | `headingFont` |
+| `[theme.light]` | `"theme.light"` | `font-sidebar` | `codeFont-sidebar` | `headingFont-sidebar` |
+| `[theme.dark]` | `"theme.dark"` | `font-sidebar` | `codeFont-sidebar` | `headingFont-sidebar` |
+| `[theme.sidebar]` | `"theme.sidebar"` | `font-sidebar` | `codeFont-sidebar` | `headingFont-sidebar` |
+| `[theme.light.sidebar]` | `"theme.light.sidebar"` | `font-sidebar` | `codeFont-sidebar` | `headingFont-sidebar` |
+| `[theme.dark.sidebar]` | `"theme.dark.sidebar"` | `font-sidebar` | `codeFont-sidebar` | `headingFont-sidebar` |
+
+⚠️ **关键发现**：`[theme.light]` 和 `[theme.dark]` 中带 URL 的字体，config_name 被标记为 `-sidebar`，而非独立的 `font-light` / `font-dark`。这导致两个问题：
+1. 多个段使用相同的 config_name，若都被读取会互相覆盖
+2. 语义混淆：light/dark 段的字体源被标记为"sidebar"
+
+#### 前端 setFonts 实际读取的路径
 
 **位置**：[useThemeManager.ts L187-L212](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/app/src/util/useThemeManager.ts#L187-L212)
 
 ```typescript
 const setFonts = useCallback((themeInfo: ICustomThemeConfig): void => {
-  // 1. fontFaces: @font-face 声明
   if (themeInfo.fontFaces) {
-    setFontFaces(themeInfo.fontFaces)
+    setFontFaces(themeInfo.fontFaces)      // ① 只读根级 fontFaces
   }
-
-  // 2. fontSources: <link> 样式表 URL
   const allFontSources = [
-    ...(themeInfo.fontSources || []),           // 根级 [theme] 下的
-    ...(themeInfo.sidebar?.fontSources || []),   // [theme.sidebar] 下的
+    ...(themeInfo.fontSources || []),       // ② 只读根级 fontSources
+    ...(themeInfo.sidebar?.fontSources || []), // ③ 只读 [theme.sidebar] 的 fontSources
   ]
-  // ... 收集为 Record<configName, sourceUrl>
-  setFontSources(newFontSources)
+  // ... 转为 Record<configName, sourceUrl>
 }, [])
 ```
 
-⚠️ **关键发现**：`setFonts` 只读取了：
-- `themeInfo.fontFaces` → 根级
-- `themeInfo.fontSources` → 根级
-- `themeInfo.sidebar.fontSources` → 侧边栏级
+**完整读取矩阵**：
 
-**它没有读取 `themeInfo.light.fontSources`、`themeInfo.dark.fontSources`、`themeInfo.light.fontFaces`、`themeInfo.dark.fontFaces`！**
+| 配置段 | fontFaces 读取？ | fontSources 读取？ | font-family 名称生效？ |
+|--------|:---:|:---:|:---:|
+| `[theme]` | ✅ `themeInfo.fontFaces` | ✅ `themeInfo.fontSources` | ✅ 直接生效 |
+| `[theme.light]` | ❌ | ❌ | ✅ 通过 handleSectionInheritance |
+| `[theme.dark]` | ❌ | ❌ | ✅ 通过 handleSectionInheritance |
+| `[theme.sidebar]` | ❌ | ✅ `themeInfo.sidebar.fontSources` | ✅ 通过 createSidebarTheme |
+| `[theme.light.sidebar]` | ❌ | ❌ | ✅ 通过 handleSectionInheritance → createSidebarTheme |
+| `[theme.dark.sidebar]` | ❌ | ❌ | ✅ 通过 handleSectionInheritance → createSidebarTheme |
 
-这意味着：**`[theme.light]` 和 `[theme.dark]` 配置段中的 `fontFaces` 和 `fontSources` 配置是无效的，不会被加载。**
+**结论**：
+- **能注入页面的字体源**只有两个来源：`[theme]` 和 `[theme.sidebar]`
+- **字体族名称**在所有 6 个段都生效（通过继承合并链路）
+- **fontFaces（@font-face 声明）**只有 `[theme]` 根级生效
+- **light / dark / light.sidebar / dark.sidebar 的 fontSources 和 fontFaces 都不会注入页面**
 
-#### 完整的字体传递链路
+---
 
-```
-config.toml 配置
-  │
-  ├─ [theme]
-  │   ├─ font = "Inter:https://fonts.googleapis.com/..."
-  │   │   → 解析为: body_font = "Inter"
-  │   │             font_sources += { config_name: "font", source_url: "https://..." }
-  │   └─ fontFaces = [{ family: "MyFont", url: "/fonts/MyFont.woff2", ... }]
-  │       → 解析为: font_faces 列表
-  │
-  ├─ [theme.light]
-  │   └─ font = "Roboto:..."
-  │       → 仅影响 font-family 名称（继承合并时生效）
-  │       → ❌ fontSources 不会被 setFonts 读取！
-  │
-  └─ [theme.sidebar]
-      └─ font = "Mono:..."
-          → 影响侧边栏 font-family
-          → ✅ fontSources 会被 setFonts 读取（通过 themeInfo.sidebar.fontSources）
-```
+### 11.3 专题三：侧边栏分支里 fontSources 的来源合并细节
 
-#### 为什么字体源不随主题切换？
+#### 问题的"拧巴"之处
 
-设计上的考量：
-1. **字体文件体积大**：切换主题时重新加载字体会造成 FOIT（Flash Of Invisible Text）或 FOUT（Flash Of Unstyled Text），用户体验差。
-2. **通常同名字体深浅模式共用**：浅色和深色模式一般用同一字体，只是颜色不同。
-3. **全局 CSS 的限制**：`@font-face` 和 `<link>` 是全局的，不支持"只在某个主题下生效"的作用域。
+当用户选择了 "Custom Theme Light" 时，侧边栏的主题来自 `createSidebarTheme(activeTheme)`。此时 `activeTheme` 是经过 `handleSectionInheritance(themeInput, "light")` 合并后的结果，其 `themeInput.sidebar` 已经包含了 `[theme.sidebar]` + `[theme.light.sidebar]` 的合并配置。
 
-#### 那浅色/深色字体族名不同怎么办？
+但 `setFonts(themeInput)` 在 `processThemeInput` 中被调用时，使用的是**原始的 protobuf themeInput**，而不是合并后的 themeInput。
 
-字体族名称（font-family）是随主题切换的，因为它是通过 `handleSectionInheritance` 合并到每个主题的 `emotion.genericFonts` 中的：
+这意味着：
 
 ```
-theme.light.bodyFont → handleSectionInheritance → lightThemeInput
-                                             → createTheme → emotion.genericFonts.bodyFont
-                                             → 最终写入 CSS font-family 属性
+setFonts 读取的 fontSources:
+  ✅ themeInput.fontSources          ← 来自 [theme] 段
+  ✅ themeInput.sidebar.fontSources   ← 来自 [theme.sidebar] 段（仅此段！）
+
+侧边栏 Emotion 主题实际使用的 font-family:
+  ✅ 来自 handleSectionInheritance 合并后 →
+     activeTheme.themeInput.sidebar（含 [theme.sidebar] + [theme.light.sidebar] 的合并）
+
+两者不一致！
 ```
 
-所以：**字体族名称可以每个主题不同，但字体文件/样式表 URL 是全局共享的。**
+#### 具体场景推演
 
-#### 实际配置建议
-
-如果你确实需要浅色和深色模式用不同的字体（非常规场景）：
+假设配置如下：
 
 ```toml
-# ✅ 正确做法：把两个字体源都放在根级，名字分别配置
 [theme]
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter"
+
+[theme.light]
+# 浅色用不同字体，且带 URL
+font = "Roboto:https://fonts.googleapis.com/css2?family=Roboto"
+
+[theme.sidebar]
+font = "Fira Code:https://fonts.googleapis.com/css2?family=Fira+Code"
+
+[theme.light.sidebar]
+# 浅色侧边栏用不同字体
+font = "JetBrains Mono:https://fonts.googleapis.com/css2?family=JetBrains+Mono"
+```
+
+**后端 protobuf 输出**：
+
+```
+custom_theme.font_sources = [
+  { config_name: "font", source_url: "https://...Inter" }           ← [theme]
+]
+custom_theme.body_font = "Inter"
+
+custom_theme.light.font_sources = [
+  { config_name: "font-sidebar", source_url: "https://...Roboto" }  ← ⚠️ -sidebar 后缀！
+]
+custom_theme.light.body_font = "Roboto"
+
+custom_theme.sidebar.font_sources = [
+  { config_name: "font-sidebar", source_url: "https://...FiraCode" } ← [theme.sidebar]
+]
+custom_theme.sidebar.body_font = "Fira Code"
+
+custom_theme.light.sidebar.font_sources = [
+  { config_name: "font-sidebar", source_url: "https://...JetBrains" } ← [theme.light.sidebar]
+]
+custom_theme.light.sidebar.body_font = "JetBrains Mono"
+```
+
+**前端 setFonts 实际注入页面的 `<link>` 标签**：
+
+```
+① <link id="font" href="https://...Inter" rel="stylesheet">         ← ✅ 注入
+② <link id="font-sidebar" href="https://...FiraCode" rel="stylesheet"> ← ✅ 注入
+
+③ https://...Roboto      ← ❌ 未注入（light.fontSources 未被读取）
+④ https://...JetBrains   ← ❌ 未注入（light.sidebar.fontSources 未被读取）
+```
+
+**前端主题实际使用的 font-family**：
+
+| 区域 | 选中主题 | font-family 来源 | 字体文件是否已加载？ |
+|------|---------|-----------------|:---:|
+| 主内容区 | "Custom Theme Light" | `Roboto`（来自 light 段合并） | ❌ **未加载！** |
+| 侧边栏 | 侧边栏自动派生 | `JetBrains Mono`（来自 light.sidebar 合并） | ❌ **未加载！** |
+
+**结果**：页面回退到浏览器默认的 sans-serif 字体，因为 `Roboto` 和 `JetBrains Mono` 的 `<link>` 标签从未被注入 `<head>`。
+
+#### 正确的配置方式
+
+```toml
+[theme]
+# 把所有可能用到的字体源都放在根级
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter"
 fontFaces = [
-  { family = "LightFont", url = "/fonts/LightFont.woff2", weight_range = "400" },
-  { family = "DarkFont", url = "/fonts/DarkFont.woff2", weight_range = "400" },
+  { family = "Roboto", url = "https://fonts.gstatic.com/s/roboto.woff2", weight_range = "400" },
+  { family = "JetBrains Mono", url = "https://fonts.gstatic.com/s/jetbrainsmono.woff2", weight_range = "400" },
 ]
 
 [theme.light]
-font = "LightFont"   # 浅色用 LightFont
+font = "Roboto"           # 只写字体名，不写 URL（URL 在根级已声明）
 
-[theme.dark]
-font = "DarkFont"    # 深色用 DarkFont
+[theme.sidebar]
+# 侧边栏字体源可以放在 [theme.sidebar]（会被 setFonts 读取）
+font = "Fira Code:https://fonts.googleapis.com/css2?family=Fira+Code"
+
+[theme.light.sidebar]
+font = "JetBrains Mono"   # 只写字体名，不写 URL
 ```
 
-```toml
-# ❌ 错误做法：fontFaces 放在 light/dark 段下（不会被加载）
-[theme.light]
-font = "LightFont"
-fontFaces = [{ family = "LightFont", url = "/fonts/LightFont.woff2" }]
+**注入结果**：
 
-[theme.dark]
-font = "DarkFont"
-fontFaces = [{ family = "DarkFont", url = "/fonts/DarkFont.woff2" }]
+| 来源 | 注入方式 | 生效位置 |
+|------|---------|---------|
+| `Inter` URL | `<link id="font">` | 根主题主内容区 |
+| `Roboto` woff2 | `@font-face { font-family: Roboto }` | light 主题主内容区 |
+| `JetBrains Mono` woff2 | `@font-face { font-family: "JetBrains Mono" }` | light 主题侧边栏 |
+| `Fira Code` URL | `<link id="font-sidebar">` | 所有主题侧边栏 |
+
+---
+
+### 11.4 专题四：字体名 vs 字体源 — 两条独立的传递路径
+
+把完整的传递路径画清楚，可以看出字体名和字体源走的是完全不同的管道：
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        后端 (Python)                                    │
+│                                                                         │
+│  config.toml                                                            │
+│    ├─ font = "Inter:https://..."                                        │
+│    │     │                                                               │
+│    │     ├─→ msg.body_font = "Inter"             ← 字体名路径            │
+│    │     └─→ msg.font_sources.add(               ← 字体源路径            │
+│    │            config_name="font", source_url="https://...")            │
+│    │                                                                     │
+│    └─ [theme.light] font = "Roboto:https://..."                         │
+│          │                                                               │
+│          ├─→ msg.light.body_font = "Roboto"      ← 字体名路径            │
+│          └─→ msg.light.font_sources.add(         ← 字体源路径 ⚠️        │
+│                 config_name="font-sidebar", ... )  ← 拧巴的命名！        │
+└──────────────────────────┬──────────────────────────────────────────────┘
+                           │
+                     WebSocket (protobuf binary)
+                           │
+┌──────────────────────────▼──────────────────────────────────────────────┐
+│                        前端 (TypeScript/React)                          │
+│                                                                         │
+│  processThemeInput(themeInput)                                          │
+│    │                                                                    │
+│    ├─────────── 字体名路径 ──────────────┐                              │
+│    │                                     │                              │
+│    │  createCustomThemes(themeInput)     │                              │
+│    │    ├─ handleSectionInheritance      │                              │
+│    │    │   合并 light/dark/sidebar      │                              │
+│    │    │   fontSources 也被合并进结果    │← 但只是携带，不消费            │
+│    │    │                                │                              │
+│    │    └─ createTheme(name, mergedInput)│                              │
+│    │         ├─ parseFont(bodyFont)      │                              │
+│    │         │   → "Inter, sans-serif"   │  ← 字体名写入 Emotion 主题   │
+│    │         └─ emotion.genericFonts     │                              │
+│    │              .bodyFont = "Inter, ..."                              │
+│    │                                                                    │
+│    ├─────────── 字体源路径 ──────────────┐                              │
+│    │                                     │                              │
+│    │  setFonts(themeInput)               │  ← 用原始 themeInput！       │
+│    │    ├─ themeInput.fontSources        │  ← 只读根级                  │
+│    │    ├─ themeInput.sidebar.fontSources│  ← 只读 sidebar 级           │
+│    │    └─ → FontSources 组件            │                              │
+│    │         → <link id="font" ...>      │  ← 注入 <head>              │
+│    │         → <link id="font-sidebar" ...>                             │
+│    │                                                                    │
+│    │  ❌ themeInput.light.fontSources    │  ← 未读取！                  │
+│    │  ❌ themeInput.dark.fontSources     │  ← 未读取！                  │
+│    │  ❌ themeInfo.light.sidebar...      │  ← 未读取！                  │
+│    └─────────────────────────────────────┘                              │
+│                                                                         │
+│  侧边栏主题 (createSidebarTheme)                                        │
+│    ├─ activeTheme.themeInput.sidebar    ← 已合并的 sidebar 配置          │
+│    │   (含 baseSidebar + variantSidebar 的 fontSources)                  │
+│    ├─ mergedSidebarThemeInput           ← 与主主题 themeInput 再合并     │
+│    └─ createTheme("Sidebar", merged)                                        │
+│         └─ emotion.genericFonts.bodyFont ← 字体名生效                    │
+│              但字体源是否加载？                                           │
+│              → 取决于根级/根sidebar级的 fontSources 是否已包含该字体      │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### 字体注入的两个组件对比
+#### 总结：各配置段字体配置的实际效果
 
-| 组件 | 实现方式 | 数据源 | 注入位置 |
-|------|---------|--------|---------|
-| [FontSources.tsx](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/app/src/components/FontSources/FontSources.tsx) | react-helmet-async 的 `<Helmet>` 生成 `<link>` 标签 | `fontSources` Record | `<head>` 中 |
-| [FontFaceDeclaration.tsx](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/app/src/components/FontFaceDeclaration/FontFaceDeclaration.tsx) | Emotion 的 `<Global>` 注入 `@font-face` CSS | `fontFaces` 数组 | Emotion 样式表中 |
+| 配置段 | 字体名生效？ | 字体源 URL 注入页面？ | @font-face 注入页面？ |
+|--------|:---:|:---:|:---:|
+| `[theme]` font="Name:URL" | ✅ 直接 | ✅ `<link id="font">` | ✅ fontFaces 生效 |
+| `[theme.light]` font="Name:URL" | ✅ 合并后 | ❌ **URL 丢失** | ❌ fontFaces 不读取 |
+| `[theme.dark]` font="Name:URL" | ✅ 合并后 | ❌ **URL 丢失** | ❌ fontFaces 不读取 |
+| `[theme.sidebar]` font="Name:URL" | ✅ 派生主题 | ✅ `<link id="font-sidebar">` | — |
+| `[theme.light.sidebar]` font="Name:URL" | ✅ 派生主题 | ❌ **URL 丢失** | — |
+| `[theme.dark.sidebar]` font="Name:URL" | ✅ 派生主题 | ❌ **URL 丢失** | — |
 
-两者都在 [ThemedApp.tsx](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/app/src/ThemedApp.tsx) 的 `RootStyleProvider` 内部顶层渲染，只注入一次，不随主题切换而变化。
+**设计意图 vs 实际行为的差异**：
+- 设计意图：`_get_font_source_config_name` 只区分"根"和"非根"两类，所有非根段用 `-sidebar` 后缀，暗示"非根的字体源都给侧边栏用"
+- 实际行为：`setFonts` 只读取根级和 `sidebar` 级的 fontSources，light/dark 段的 fontSources 完全不读取
+- 结果：**light/dark/light.sidebar/dark.sidebar 中带 URL 的字体配置会产生字体名但不会加载字体文件**
+
+**如果要让 light/dark 分支使用带 URL 的字体**，需要将字体源声明放在根级 `[theme]` 的 `fontFaces` 中，然后在各分支只配置字体族名称。
