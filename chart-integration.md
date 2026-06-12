@@ -296,7 +296,7 @@ DeckGlJsonChart
     │     │     ├─► 无 pickable 定义 → 自动设 pickable=true
     │     │     ├─► 注入 selectedOpacity=255 / unselectedOpacity=102 (40%) 填充色
     │     │     └─► updateTriggers 绑定 selectedIndices / anyLayersHaveSelection 驱动颜色重算
-    │     ├─► sanitizeSelection() 清理孤儿索引
+    │     ├─► sanitizeSelection() 清理孤儿索引（见 4.5 节）
     │     │     ├─► filterValidIndicesForLayer() 过滤越界索引，重新拉取当前对象
     │     │     └─► 图层无 ID / 非数组数据（URL/GeoJSON）→ 保留但无法验证
     │     ├─► viewState 初始化：
@@ -313,6 +313,121 @@ DeckGlJsonChart
     │     deck.layers 为空数组，仅渲染底图瓦片，无数据图层
     │     initialViewState.latitude=0, longitude=0, zoom=1 → 非洲外海
     └─► Toolbar 提供全屏 / 清除选择等操作
+```
+
+### 4.5 PyDeck 选择状态的延续与清理机制
+
+PyDeck 选择状态的生命周期由**后端 key_as_main_identity 延续** + **前端 sanitizeSelection 清理** 两段机制共同实现。
+
+#### 后端：配置变更时的状态延续
+
+```
+st.pydeck_chart(chart, key="my_map", on_select="rerun")
+    │
+    ▼
+[lib/streamlit/elements/deck_gl_json_chart.py] pydeck_chart()
+    └─► compute_and_register_element_id(
+          "deck_gl_json_chart",
+          user_key=key,
+          key_as_main_identity={"selection_mode"},    ← 关键
+          dg=self.dg,
+          is_selection_activated=is_selection_activated,
+          selection_mode=selection_mode,
+          use_container_width=use_container_width,
+          spec=spec,
+        )
+```
+
+**`key_as_main_identity={"selection_mode"}` 的作用**：
+- **有 key 时**：只有 `selection_mode` 会参与 element ID 计算。这意味着**数据变化、spec 变化、图层增删、尺寸参数变化都不会改变 element ID**，选择状态会在这些配置变更时延续。
+- **无 key 时**：所有参数（包括 spec）都会参与 ID 计算，配置变更后 element ID 变化，选择状态被重置。
+- 代码注释明确指出："This allows selection state to persist across data/spec changes. Note: This can lead to orphaned selections if data length shrinks, but the frontend handles this by sanitizing invalid indices."
+
+#### 前端：spec 变化时的孤儿索引清理
+
+```
+[useDeckGl.tsx] 组件挂载 / spec 变化
+    │
+    ├─► useExecuteWhenChanged() 依赖 [parsedPydeckJson, isSelectionModeActivated]
+    │     每次 parsedPydeckJson 变化（即每次 rerun 收到新 spec）时执行
+    │
+    ├─► getLayerDataInfo(parsedPydeckJson.layers)  构建当前图层信息
+    │     ├─► 遍历所有图层，收集 {layerId → dataArray | undefined}
+    │     ├─► 无 id 的图层 → hasUnknownLayerId = true
+    │     └─► 非数组数据（URL 字符串 / GeoJSON 对象）→ 存 undefined，表示无法验证索引
+    │
+    └─► sanitizeSelection(currentSelection, layerDataInfo)
+          │
+          ├─► 遍历所有已选 layerId:
+          │    │
+          │    ├─► 图层已删除（layerData.has(layerId) === false）：
+          │    │     ├─► 全部图层都无 ID 且 layerData 为空 → 保留选择（无法验证）
+          │    │     └─► 否则 → 丢弃该图层的所有选择，changed=true
+          │    │
+          │    ├─► 图层存在但数据非数组（layerDataForId === undefined）：
+          │    │     └─► 保留所有选择（无法验证索引），changed=false
+          │    │
+          │    └─► 图层存在且数据是数组：
+          │          ├─► filterValidIndicesForLayer(indices, objects, layerDataForId)
+          │          │     ├─► 遍历每个已选索引 idx
+          │          │     ├─► idx < data.length → 保留，更新 object 为当前数据[idx]
+          │          │     │     （如果对象变化了 → changed=true）
+          │          │     └─► idx >= data.length → 丢弃，changed=true
+          │          └─► 剩余索引 > 0 → 写入新 selection，否则清空
+          │
+          └─► changed === true → setSelection() 写回 widget 状态，触发一次同步
+                fromUi: false，表示是程序清理而非用户操作
+```
+
+**清理规则速查表**：
+
+| 场景 | 处理方式 | changed |
+|------|---------|---------|
+| 图层已删除 + 至少一个图层有 ID | 丢弃该图层所有选择 | true |
+| 图层已删除 + 全部图层无 ID + 无数据数组 | 保留所有选择（无法验证） | false |
+| 图层存在 + 数据是 URL/GeoJSON（非数组） | 保留所有选择（无法验证索引） | false |
+| 图层存在 + 数据是数组 + 索引越界 | 丢弃越界索引 | true |
+| 图层存在 + 数据是数组 + 索引有效但对象已变 | 保留索引，更新 object | true |
+| 图层存在 + 数据是数组 + 索引有效 + 对象未变 | 保留 | false |
+
+#### 典型场景示例
+
+**场景 1：数据长度缩减**
+```
+初始数据: 100 条，已选索引 [50, 60, 70]
+config 变更: df = df.head(55) → 剩 55 条
+sanitizeSelection:
+  70 >= 55 → 丢弃
+  50, 60 中，60 >= 55 → 丢弃
+  最终: [50]，changed=true → setSelection 回写
+```
+
+**场景 2：图层被删除**
+```
+初始: 两个图层 A(id="layer1") 和 B(id="layer2")，各选 [1,2]
+config 变更: 删除图层 B
+sanitizeSelection:
+  layer1: 存在，保留 [1,2]
+  layer2: layerData.has("layer2") === false → 丢弃
+  最终: {"layer1": [1,2]}，changed=true
+```
+
+**场景 3：图层无 ID**
+```
+初始: 图层未设置 id，已选 [0, 1, 2]
+config 变更: 数据从 100 条缩到 3 条
+sanitizeSelection:
+  hasUnknownLayerId = true，layerData.size = 0
+  → 全部保留，无法验证
+  最终: [0, 1, 2]，changed=false
+```
+
+**场景 4：数据为 GeoJSON 对象**
+```
+图层 data 是 {type: "FeatureCollection", features: [...]}（非数组）
+sanitizeSelection:
+  layerDataForId = undefined（非数组）
+  → 保留所有选择，无法验证索引
 ```
 
 ---
@@ -361,7 +476,68 @@ DeckGlJsonChart
 | **后端**：缺 lat/lon 列 | `StreamlitAPIException`，列出允许列名（`lat`, `latitude`, `LAT`, `LATITUDE`）与现有列名 | `lib/streamlit/elements/map.py` `_get_lat_or_lon_col_name()` |
 | **后端**：lat/lon 列含 NaN/NaT/None | `StreamlitAPIException` 禁止空值 | `lib/streamlit/elements/map.py` `_get_lat_or_lon_col_name()` |
 | **后端**：color 列颜色格式非法 | `StreamlitAPIException: Column 'X' does not appear to contain valid colors.` | `lib/streamlit/elements/map.py` `_convert_color_arg_or_column()` |
-| **后端**：pandas 3.x 兼容性 | `_prepare_pydeck_for_json()` 把 Layer DataFrame 弱引用转为 `list[dict]`（pydeck vars() 访问 DataFrame 在 pd3 失效） | `lib/streamlit/elements/deck_gl_json_chart.py` `_prepare_pydeck_for_json()` |
+| **后端**：pandas 3.x 兼容性 | `_prepare_pydeck_for_json()` 把 Layer DataFrame 弱引用转为 `list[dict]`（pydeck vars() 访问 DataFrame 在 pd3 失效）。**注意：此修改是就地（in-place）修改 pydeck 对象** | `lib/streamlit/elements/deck_gl_json_chart.py` `_prepare_pydeck_for_json()` |
+| **后端**：width/height 参数序列化 | 通过 `create_layout_config(width, height)` 写入 `LayoutConfig` proto，而不是写入 Deck.GL JSON spec。st.map 无 width/height 参数，st.pydeck_chart 默认 `width="stretch"`, `height=500` | `lib/streamlit/elements/deck_gl_json_chart.py` `pydeck_chart()` |
+
+#### 尺寸参数序列化链路
+
+```
+用户代码: st.pydeck_chart(chart, width="stretch", height=500)
+    │
+    ▼
+[Python] pydeck_chart()
+    ├─ create_layout_config(width="stretch", height=500)
+    │    └─ 写入 ForwardMsg.delta.metadata.layout_config
+    │       (不是写入 element.json!)
+    ├─ pydeck_obj.to_json() → Deck.GL JSON spec（不含 width/height）
+    └─ _enqueue("deck_gl_json_chart", proto, layout_config=layout_config)
+         │
+         ▼
+[前端] DeckGlJsonChart
+    ├─ element.widthConfig (从 LayoutConfig 解析，不是从 element.json)
+    ├─ shouldWidthStretch(widthConfig) → true/false
+    └─ useStWidthHeight({
+         element: {},
+         shouldUseContainerWidth,
+         container: { width: propsWidth, height: fullScreenHeight },
+         heightFallback: viewState?.initialViewState?.height || defaultMapHeight
+       })
+         ├─► width = isFullScreen ? propsWidth : (shouldUseContainerWidth ? "100%" : undefined)
+         └─► height = isFullScreen ? fullScreenHeight : heightFallback
+
+注意：st.map() 函数签名中没有 width/height 参数，走默认 layout_config（width=stretch, height=500）。
+Deck.GL JSON spec 本身不会包含 width/height 字段。
+```
+
+#### pandas 3.x 兼容性处理对对象复用的影响
+
+**问题背景**：pandas 3.x 移除了 `__dict__` 属性访问方式，pydeck 的 `default_serialize` 通过 `vars(DataFrame)` 访问 DataFrame 属性会失败。
+
+**处理方式**：`_prepare_pydeck_for_json(pydeck_obj)` 在 pandas >= 3.0.0 时自动调用：
+
+```python
+def _prepare_pydeck_for_json(pydeck_obj: Deck | None) -> None:
+    # 遍历 pydeck_obj.layers 中的每个 layer:
+    for layer in layers:
+        data = getattr(layer, "data", None)
+        # pydeck 对 DataFrame 用 weakref 包装，先解引用
+        if isinstance(data, weakref.ref):
+            data = data()
+        # 如果是 DataFrame → 就地替换为 list[dict]
+        if isinstance(data, pd.DataFrame):
+            layer.data = data.to_dict(orient="records")  # ⚠️ in-place 修改!
+```
+
+**对对象复用的影响**：
+
+| 场景 | 行为 |
+|------|------|
+| **单次 run 内单次调用**（常见） | 正常工作，无副作用 |
+| **单次 run 内同一 Deck 对象多次调用** | 第二次调用时 `layer.data` 已经是 `list[dict]`，不是 DataFrame。如果用户后续代码中依赖 layer.data 是 DataFrame，会出错 |
+| **跨 rerun 调用** | Streamlit rerun 会重新执行整个脚本，Deck 对象重新创建，无影响 |
+| **用户手动缓存 Deck 对象**（如 `@st.cache_data` 返回 Deck） | 被修改过的 Deck 对象（data 是 list[dict]）会被缓存复用，后续运行时跳过 DataFrame→list 转换，但渲染结果一致 |
+
+> 函数 docstring 明确指出："This function modifies the pydeck object in place. If the same Deck object is passed to multiple st.pydeck_chart calls within a single script run, subsequent calls will see the converted list[dict] data instead of DataFrames."
 
 ### 5.5 通用尺寸边界
 
@@ -539,9 +715,11 @@ getDataArray(quiver)  // arrowUtils.ts
 | 图层被移除后仍保留旧选择 | `sanitizeSelection()` 检测 layerId 不存在则丢弃（全部无 id 时例外保留） | `useDeckGl.tsx` `sanitizeSelection()` |
 | 视图状态 viewState 未初始化 | `viewState` 初始值为 `null`（`useDeckGl.tsx` `useState(null)`），通过 `useEffect` 监听 `deck.initialViewState` 变化时才 `setViewState`。渲染侧 `viewState && <DeckGL>` 条件渲染，null 时不挂载 DeckGL 避免其内部 assertion error | `DeckGlJsonChart.tsx` |
 | HexagonLayers 首帧不渲染 bug | `useEffect` 延迟一帧 `setIsInitialized(true)`，layers 延迟注入 | `DeckGlJsonChart.tsx` |
-| WebGL 上下文不足 | 浏览器自动回收最早的 WebGL 上下文，Streamlit 仅文档提示 ≤8 张图 | `deck_gl_json_chart.py` docstring |
+| WebGL 上下文不足 | 浏览器自动回收最早的 WebGL 上下文，Streamlit 仅文档提示 ≤8 张图 | `lib/streamlit/elements/deck_gl_json_chart.py` docstring |
 | tooltip 模板变量不存在（`{col_not_exist}`） | `interpolate()` 未匹配则保留原模板字符串，不抛错 | `useDeckGl.tsx` `interpolate()` |
 | 未定义 views 字段引发控制台警告 | `delete jsonCopy?.views` 主动移除 | `useDeckGl.tsx` `deck` useMemo |
+| **尺寸参数** | width/height 不写入 Deck.GL JSON，通过 `create_layout_config()` 写入 LayoutConfig proto。st.map 无 width/height 参数，默认 `width="stretch"`, `height=500` | `lib/streamlit/elements/deck_gl_json_chart.py` `pydeck_chart()` |
+| **pandas 3.x 就地修改** | `_prepare_pydeck_for_json()` 就地修改 pydeck 对象，layer.data 从 DataFrame 转为 `list[dict]`。同一 Deck 对象在一次 run 内被多次调用时，第二次调用看到的是转换后的数据 | `lib/streamlit/elements/deck_gl_json_chart.py` `_prepare_pydeck_for_json()` |
 
 **Serde 兜底**：`lib/streamlit/elements/deck_gl_json_chart.py` `PydeckSelectionSerde`
 
@@ -554,6 +732,278 @@ def deserialize(self, ui_value: str | None) -> PydeckState:
 ```
 
 接收到空 dict `{}` 或缺失 `selection` 键时，返回 `EMPTY_STATE` 而非抛错。
+
+---
+
+### 6.7 PyDeck/Map 配置变更时的状态管理机制
+
+#### 6.7.1 选择状态的延续与清理（sanitizeSelection 触发时机）
+
+选择状态清理**不只是组件初始化时执行一次**，而是在**每次 spec 配置变更时**都会触发。
+
+完整触发链路：
+
+```
+[Python] st.pydeck_chart(..., on_select="rerun")
+    │  配置变更（图层增删、数据变化、初始视口变化、颜色变化等）
+    ▼
+[WebSocket] ForwardMsg 更新 element.json
+    │
+    ▼
+[React] ArrowVegaLiteChart useMemo 解析新 parsedPydeckJson
+    │
+    ├─► useExecuteWhenChanged(parsedPydeckJson)   监听配置变更
+    │     │
+    │     ├─► 非选择模式或无 layers → 跳过
+    │     ├─► getLayerDataInfo(parsedPydeckJson.layers)  重建图层数据索引
+    │     └─► sanitizeSelection(data.selection, layerDataInfo)
+    │           │
+    │           ├─► 清理规则（见 6.6 节 sanitizeSelection 清理规则速查表）
+    │           │    ├─► 图层删除 → 丢弃该图层选择
+    │           │    ├─► 数据缩水 → 过滤越界索引，重新拉取当前对象
+    │           │    ├─► URL/GeoJSON/无 ID 图层 → 保留（无法验证）
+    │           │    └─► 数据未变 → 不变
+    │           │
+    │           └─► changed === true → setSelection({
+    │                       fromUi: false,    // ⚠️ 关键：非用户操作，不触发 rerun
+    │                       value: { selection: sanitized }
+    │                    })
+    │                       只同步到 WidgetStateManager，不触发 Python 回调
+    │
+    └─► deck useMemo 依赖 data.selection.indices，重新构造 DeckObject
+          ├─► anyLayersHaveSelection 重新计算（避免全局 dimming）
+          └─► 图层 fillFunction / updateTriggers 重建
+```
+
+**关键细节**：
+- `setSelection({ fromUi: false })` 的 `fromUi=false` 标记表示这是**程序自动清理**，不是用户交互，**不会触发 rerun 或 on_select 回调**，仅同步前端 widget 状态
+- `isInitialized` 状态仅用于延迟图层注入（修复 HexagonLayers 首帧不渲染 bug），**与选择状态清理无关**，`isInitialized` 变化不会触发 sanitizeSelection
+- 视口配置（initialViewState）变更走**单独的 diff 更新链路**（见下一小节），不经过 sanitizeSelection
+
+**典型触发场景**：
+
+| 操作 | 是否触发 sanitize | changed |
+|------|------------------|---------|
+| 数据行数从 100 缩到 50 | 是 | true（越界索引被丢弃） |
+| 新增大图层但未改动现有图层数据 | 是 | false（现有选择全部保留） |
+| 删除一个已选图层 | 是 | true（该图层选择被丢弃） |
+| 修改图层颜色/大小但不改数据 | 是 | false（选择索引全部保留） |
+| 数据从 DataFrame 转为 list[dict]（内容完全相同） | 是 | 索引未越界 → false |
+| 用户手动平移/缩放地图（改 viewState） | 否（不改变 parsedPydeckJson） | - |
+| initialViewState 从后端变了 | 否（走单独的 diff 链路） | - |
+
+---
+
+#### 6.7.2 initialViewState 配置变更的 diff 更新机制
+
+视口配置变更（如后端重新计算了 zoom/center）走**独立的 useEffect 链路**，不会触发选择状态清理，且只做增量 diff 更新：
+
+```
+useEffect(deck.initialViewState)
+    │
+    ├─► isEqual(deck.initialViewState, initialViewStateRef.current)  深比较
+    │     └─► 无变化 → 直接返回
+    │
+    ├─► 计算 diff：遍历所有 initialViewState 键
+    │     ├─► 键值与 old 相同 → 跳过
+    │     └─► 键值不同 → 加入 diff 对象
+    │
+    ├─► setViewState(existing => ({ ...existing, ...diff }))
+    │     ⚠️ 只覆盖变化的字段，保留用户手动平移/缩放的其他状态
+    │
+    └─► initialViewStateRef.current = deck.initialViewState  更新引用
+```
+
+**关键特性**：
+- **保留用户手动交互状态**：例如后端只改了 `zoom`，用户手动平移的 `latitude/longitude` 会被保留
+- **避免无限循环**：用户手动拖动地图会触发 `onViewStateChange` 更新 `viewState`，但 `initialViewStateRef` 记录的是后端上次下发的值，用户拖动不会触发此 useEffect
+- **diff 只针对 initialViewState 自身**：latitude/longitude/zoom/pitch/bearing/height 字段独立比较
+
+**示例**：
+```
+用户状态: {latitude: 39.9, longitude: 116.4, zoom: 10}  (用户手动平移到北京)
+后端变更: initialViewState = {latitude: 0, longitude: 0, zoom: 5}
+diff 计算: 三个字段都变了 → 全部覆盖
+最终: {latitude: 0, longitude: 0, zoom: 5}  (用户手动状态被覆盖)
+
+用户状态: {latitude: 39.9, longitude: 116.4, zoom: 10}
+后端变更: initialViewState = {latitude: 0, longitude: 0, zoom: 10}  (只改经纬度)
+diff 计算: latitude/longitude 变了，zoom 没变
+最终: {latitude: 0, longitude: 0, zoom: 10}  (zoom 保留用户值? 不，因为 latitude/longitude 变了，但...
+       ⚠️ 实际逻辑是 diff 只包含变化的字段，但 setViewState 时 ...existing 会保留用户状态
+       最终：{latitude: 0, longitude: 0, zoom: 10})  ✅ zoom 保留
+```
+
+---
+
+### 6.8 地图尺寸参数的序列化与前端应用
+
+#### 6.8.1 后端序列化流程
+
+`st.pydeck_chart(pydeck_obj, width="stretch", height=500)` 的尺寸参数**不写入 Deck.GL JSON spec**，而是走独立的 LayoutConfig 通道：
+
+```
+Python 调用: st.pydeck_chart(..., width="stretch", height=500, use_container_width=True)
+    │
+    ├─► use_container_width 处理（已废弃）
+    │     ├─► show_deprecation_warning
+    │     └─► use_container_width=True → width="stretch"
+    │
+    ├─► create_layout_config(width=width, height=height)
+    │     └─► 构造 LayoutConfig proto，写入 ForwardMsg.delta.metadata.layout_config
+    │
+    └─► _get_pydeck_width(pydeck_obj)  // 尝试从 pydeck 对象读取 width
+          └─► 返回值被丢弃，最终以 LayoutConfig 为准
+```
+
+**序列化结果**：
+- `width` / `height` → 写入 `ForwardMsg.delta.metadata.layout_config.width/height`
+- Deck.GL JSON spec 中**不含** width/height 字段（pydeck 对象自身的 width 属性也会被忽略）
+- `use_container_width` 不会写入 proto，仅在 Python 端转换为 `width="stretch"` 后丢弃
+
+#### 6.8.2 前端尺寸计算（useStWidthHeight）
+
+前端通过 `useStWidthHeight` Hook 计算最终尺寸，完整优先级：
+
+```
+useStWidthHeight({
+  element: {},                              // 无 element 级别的 width/height 配置
+  container: { height, width },             // 来自 ElementFullscreenContext
+  isFullScreen,
+  shouldUseContainerWidth: shouldWidthStretch(widthConfig),
+  heightFallback: initialViewState.height || theme.sizes.defaultMapHeight
+})
+    │
+    ├─► width 计算:
+    │     if (shouldUseContainerWidth || isFullScreen) → "100%"
+    │     else → element.width || container.width || widthFallback ("auto")
+    │
+    └─► height 计算:
+          if (isFullScreen && container.height) → container.height  (全屏优先)
+          else → element.height || container.height || heightFallback
+                  heightFallback 优先级:
+                    initialViewState.height（来自 Deck.GL JSON spec）
+                    → theme.sizes.defaultMapHeight（500px）
+```
+
+**完整优先级速查**：
+
+| 参数 | 优先级（高→低） |
+|------|----------------|
+| **width** | 1. `isFullScreen=true` → "100%"<br>2. `width="stretch"` → "100%"<br>3. element.width（PyDeck 无）<br>4. container.width（父容器宽度）<br>5. widthFallback "auto" |
+| **height** | 1. `isFullScreen=true` + container.height 存在 → container.height<br>2. element.height（PyDeck 无）<br>3. container.height（父容器高度）<br>4. initialViewState.height（Deck spec 内嵌，如 EMPTY_MAP 无 height）<br>5. theme.sizes.defaultMapHeight（500px） |
+
+**典型场景**：
+```
+st.pydeck_chart(deck, height=600)  # 传入 height
+  → LayoutConfig.height = 600
+  → 前端 container.height = 600
+  → 最终 height = 600  ✅
+
+st.pydeck_chart(None)  # 空数据走 EMPTY_MAP，无 height 配置
+  → LayoutConfig 为默认（height 由 width/height 参数默认值 500）
+  → 前端 container.height = 500
+  → 最终 height = 500  ✅  不是 EMPTY_MAP 里的值（EMPTY_MAP 没有 height）
+
+st.pydeck_chart(deck, height="stretch")
+  → LayoutConfig.height = "stretch"
+  → shouldHeightStretch = true
+  → heightFallback = initialViewState.height 可能不存在
+  → 最终 height = 父容器高度（由 Flex 布局决定）
+```
+
+---
+
+### 6.9 pandas 3.x 兼容性处理对对象复用的影响
+
+#### 6.9.1 问题背景
+
+pandas 3.0 起 `DataFrame` 不再支持通过 `vars(df)` 访问 `__dict__` 属性，而 pydeck 的 `default_serialize()` 依赖 `vars()` 遍历对象属性，导致序列化失败。
+
+#### 6.9.2 修复方案：`_prepare_pydeck_for_json()`
+
+```python
+def _prepare_pydeck_for_json(pydeck_obj: Deck | None) -> None:
+    if pydeck_obj is None:
+        return
+
+    layers = getattr(pydeck_obj, "layers", None)
+    if layers is None:
+        return
+
+    for layer in layers:
+        data = getattr(layer, "data", None)
+        if data is None:
+            continue
+
+        # pydeck 将 DataFrame 包装在 weakref 中以避免循环引用
+        if isinstance(data, weakref.ref):
+            data = data()
+            if data is None:
+                continue
+
+        # 就地替换 DataFrame 为 list[dict]
+        if isinstance(data, pd.DataFrame):
+            layer.data = data.to_dict(orient="records")
+```
+
+**关键特性**：
+- **就地修改**（in-place）：直接修改 `layer.data` 属性，不返回新对象
+- **weakref 处理**：pydeck 内部用 `weakref.ref(DataFrame)` 包装数据以避免循环引用，需要先解引用
+- **只转换 DataFrame**：其他数据类型（list/GeoJSON/URL 字符串）不处理
+
+#### 6.9.3 对对象复用的影响
+
+**核心问题**：函数是**原地修改** pydeck_obj，对同一个 Deck 对象的多次调用会有副作用。
+
+**场景 1：单次运行内复用同一 Deck 对象（问题场景）**
+
+```python
+# 用户代码
+deck = pdk.Deck(layers=[pdk.Layer("ScatterplotLayer", data=df)])
+st.pydeck_chart(deck)  # 第一次调用
+# _prepare_pydeck_for_json 将 deck.layers[0].data 从 DataFrame 转为 list[dict]
+st.pydeck_chart(deck)  # 第二次调用，同一个 deck 对象
+# layer.data 已经是 list[dict]，isinstance(data, pd.DataFrame) 为 False
+# 跳过转换，但序列化结果一致（list[dict] 同样可被 json.dumps）
+```
+
+**影响**：
+- ✅ 功能正常：两次调用都能正确序列化
+- ⚠️ 副作用：第二次调用时 `layer.data` 已不是 DataFrame，如果用户后续代码需要访问原始 DataFrame（如 `deck.layers[0].data.sum()`）会失败
+- ⚠️ 性能：第一次转换有开销，后续调用无额外开销
+
+**场景 2：跨 rerun 复用 Deck 对象（不常见，但可能）**
+
+```python
+@st.cache_data
+def create_deck():
+    # 用户手动缓存 Deck 对象（不推荐，推荐缓存原始数据）
+    return pdk.Deck(layers=[pdk.Layer("ScatterplotLayer", data=df)])
+
+deck = create_deck()
+st.pydeck_chart(deck)
+```
+
+**影响**：
+- ✅ 功能正常：第一次 rerun 时 DataFrame 被转为 list[dict]，后续 rerun 看到 list[dict] 也能正常序列化
+- ⚠️ 隐式类型变化：缓存的 deck 对象被永久修改，数据类型从 DataFrame 变为 list[dict]
+- ⚠️ 缓存膨胀：如果用户在 `@st.cache_data` 中缓存 Deck 对象，缓存值会被修改（但不影响缓存本身，因为 Streamlit 缓存是 immutable 写入后只读）
+
+**场景 3：每次 rerun 重新创建 Deck 对象（Streamlit 推荐模式）**
+
+```python
+# 用户代码（标准写法）
+deck = pdk.Deck(layers=[pdk.Layer("ScatterplotLayer", data=df)])
+st.pydeck_chart(deck)
+```
+
+**影响**：
+- ✅ 无副作用：每次 rerun 都是新的 Deck 对象，转换不影响其他代码
+- ✅ 推荐模式：符合 Streamlit rerun 模型的最佳实践
+
+**docstring 已明确的警告**：
+> "This function modifies the pydeck object in place. If the same Deck object is passed to multiple st.pydeck_chart calls within a single script run, subsequent calls will see the converted list[dict] data instead of DataFrames. In Streamlit's rerun-based execution model, this is typically not an issue since Deck objects are usually recreated on each run."
 
 ---
 
