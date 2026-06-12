@@ -256,6 +256,8 @@ this.processThemeInput(themeInput)
 4. **应用主题**：优先匹配用户缓存偏好（Light/Dark），否则使用 Auto（跟随系统）
 5. **字体加载**：调用 `theme.setFonts(themeInput)` 设置 `fontFaces` 和 `fontSources`
 
+> ⚠️ **重要**：`setFonts` 接收的是完整的 `themeInput`（包含 light/dark/sidebar 所有嵌套），但它**只处理根级和 sidebar 级的字体配置**，不分别处理 `themeInput.light` 和 `themeInput.dark` 下的字体源。详见「深度解析」章节。
+
 ### 5.4 useThemeManager Hook
 
 **核心文件**：[useThemeManager.ts](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/app/src/util/useThemeManager.ts)
@@ -528,6 +530,50 @@ p, ol, ul, dl {
 - **FontSources**：生成 `<link rel="stylesheet" href="...">`（Google Fonts 等）
 - **FontFaceDeclaration**：生成 `<style>@font-face { ... }</style>`（自定义字体文件）
 
+### 7.4 侧边栏独立主题注入机制
+
+**容易混淆的点**：侧边栏使用的不是 `RootStyleProvider`，而是轻量的 `ThemeProvider`。
+
+**真实的侧边栏主题注入链路**：
+
+```
+ThemedSidebar 组件 [ThemedSidebar.tsx]
+  │
+  ├─ useContext(ThemeContext) → 获取 activeTheme
+  │
+  ├─ createSidebarTheme(activeTheme)  [utils.ts L1562]
+  │   ├─ 提取 sidebarThemeInput = activeTheme.themeInput?.sidebar
+  │   ├─ 计算背景色：sidebarThemeInput.backgroundColor || secondaryBg
+  │   ├─ 合并配置：mergeWith(主主题themeInput, sidebar配置, 强制覆盖项)
+  │   └─ createTheme("Sidebar", mergedSidebarThemeInput, undefined, inSidebar=true)
+  │       └─ 完整的 Emotion + BaseWeb 主题构建
+  │
+  └─ <ThemeProvider theme={sidebarTheme.emotion} baseuiTheme={sidebarTheme.basewebTheme}>
+       └─ <Sidebar ...> ... </Sidebar>
+     </ThemeProvider>
+```
+
+**ThemeProvider vs RootStyleProvider 对比**：
+
+| 特性 | RootStyleProvider（主应用） | ThemeProvider（侧边栏） |
+|------|---------------------------|----------------------|
+| BaseProvider | ✅ 有 | ✅ 有 |
+| CacheProvider | ✅ 有（创建独立 emotion cache） | ❌ 无（复用外层 cache） |
+| EmotionThemeProvider | ✅ 有 | ✅ 有 |
+| Global (全局样式) | ✅ 有（html/body/滚动条等） | ❌ 无（不重复注入） |
+| CSP nonce 支持 | ✅ 支持 | ❌ 不需要（复用 cache） |
+
+**关键洞察**：
+- 侧边栏主题是"嵌套主题"模式：外层主主题 + 内层侧边栏主题
+- 两个 EmotionThemeProvider 嵌套，内层覆盖外层的 theme 值
+- 共享同一个 emotion cache（`st-emotion-cache`），避免样式重复
+- 全局样式（`html { font-size }` / `body` 等）只在外层注入一次
+
+**核心文件**：
+- 入口组件：[ThemedSidebar.tsx](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/app/src/components/Sidebar/ThemedSidebar.tsx)
+- 侧边栏主题构建：[utils.ts L1562-L1612](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/lib/src/theme/utils.ts#L1562-L1612)
+- 轻量 ThemeProvider：[ThemeProvider.tsx](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/lib/src/components/core/ThemeProvider.tsx)
+
 ---
 
 ## 八、第7层：页面渲染层 — 组件消费主题
@@ -615,6 +661,11 @@ export const StyledErrorMessage = styled.small(({ theme }) => ({
 | 类型定义 | [types.ts](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/lib/src/theme/types.ts) | `EmotionTheme`, `EmotionThemeColors`, `ThemeConfig`, `DerivedColors` |
 | 样式注入 | [RootStyleProvider.tsx](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/lib/src/RootStyleProvider.tsx) | `RootStyleProvider` 组件 |
 | 全局样式 | [globalStyles.ts](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/lib/src/theme/globalStyles.ts) | `globalStyles` css 模板 |
+| 侧边栏入口 | [ThemedSidebar.tsx](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/app/src/components/Sidebar/ThemedSidebar.tsx) | `ThemedSidebar` 组件 |
+| 轻量主题 | [ThemeProvider.tsx](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/lib/src/components/core/ThemeProvider.tsx) | `ThemeProvider` 组件（侧边栏用） |
+| 字体源注入 | [FontSources.tsx](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/app/src/components/FontSources/FontSources.tsx) | `FontSources` 组件 |
+| 字体声明注入 | [FontFaceDeclaration.tsx](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/app/src/components/FontFaceDeclaration/FontFaceDeclaration.tsx) | `FontFaceDeclaration` 组件 |
+| 主题上下文 | [ThemeContext.tsx](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/lib/src/components/core/ThemeContext.tsx) | `ThemeContext` React Context |
 | 浅色基底色 | [emotionBaseTheme/themeColors.ts](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/lib/src/theme/emotionBaseTheme/themeColors.ts) | `requiredThemeColors` |
 | 深色基底色 | [emotionDarkTheme/themeColors.ts](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/lib/src/theme/emotionDarkTheme/themeColors.ts) | 深色模式 requiredThemeColors |
 | 原语（基础） | [primitives/typography.ts](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/lib/src/theme/primitives/typography.ts) | `fonts`, `fontSizes`, `fontWeights`, `lineHeights` |
@@ -707,3 +758,204 @@ Python 启动 / 热重载
         ▼
 用户看到新主题渲染的页面 ✅
 ```
+
+---
+
+## 十一、深度解析专题
+
+### 11.1 专题一：侧边栏独立主题的真实渲染入口
+
+#### 容易混淆的认知
+
+很多人以为侧边栏的主题隔离是通过嵌套第二个 `RootStyleProvider` 实现的，但事实并非如此。
+
+#### 真实入口：ThemedSidebar 组件
+
+**位置**：[ThemedSidebar.tsx](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/app/src/components/Sidebar/ThemedSidebar.tsx)
+
+```tsx
+const ThemedSidebar = ({ children, ...sidebarProps }) => {
+  const { activeTheme } = useContext(ThemeContext)
+  const sidebarTheme = createSidebarTheme(activeTheme)
+
+  return (
+    <ThemeProvider theme={sidebarTheme.emotion} baseuiTheme={sidebarTheme.basewebTheme}>
+      <Sidebar {...sidebarProps}>{children}</Sidebar>
+    </ThemeProvider>
+  )
+}
+```
+
+#### 三层主题隔离架构
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  RootStyleProvider（主应用外层）                         │
+│  ├─ BaseProvider         ← BaseWeb 全局主题              │
+│  └─ CacheProvider        ← 共享 emotion cache           │
+│     └─ EmotionThemeProvider  ← 主主题 emotion            │
+│        ├─ Global(globalStyles) ← 全局 CSS（只注入一次）  │
+│        │                                                  │
+│        └─ ... 主内容区域 ...                              │
+│                                                           │
+│        └─ ThemedSidebar  ← 侧边栏主题入口                │
+│           └─ ThemeProvider（轻量版）                      │
+│              ├─ BaseUIThemeProvider  ← 侧边栏 BaseWeb    │
+│              └─ EmotionThemeProvider ← 侧边栏 Emotion    │
+│                 └─ Sidebar 组件及其子元素                 │
+└─────────────────────────────────────────────────────────┘
+```
+
+#### ThemeProvider（侧边栏用） vs RootStyleProvider（主应用用）
+
+| 层级 | RootStyleProvider | ThemeProvider | 作用说明 |
+|------|------------------|---------------|---------|
+| BaseProvider | ✅ | ✅ (BaseUIThemeProvider) | BaseWeb 组件主题上下文 |
+| CacheProvider | ✅ | ❌ | 侧边栏复用外层 cache，避免重复 |
+| EmotionThemeProvider | ✅ | ✅ | 提供 `props.theme` 给 styled-components |
+| Global 全局样式 | ✅ | ❌ | html/body 等全局样式只注入一次 |
+| CSP nonce | ✅ | ❌ | nonce 在 cache 级别设置，一次即可 |
+
+#### 关键技术点
+
+1. **嵌套 Provider 模式**：侧边栏在主 `EmotionThemeProvider` 内部再嵌套一个 `EmotionThemeProvider`，内层的 theme 值会覆盖外层。
+
+2. **共享 Cache**：不创建新的 emotion cache，所有样式都写入同一个 `st-emotion-cache`，避免样式重复和 CSS 体积膨胀。
+
+3. **createSidebarTheme 函数** [utils.ts L1562-L1612](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/lib/src/theme/utils.ts#L1562-L1612)
+   - 从 `activeTheme.themeInput.sidebar` 提取侧边栏配置
+   - 背景色默认用 `secondaryBg`（主主题的次背景）
+   - 用 `mergeWith` 合并：主主题配置 → 侧边栏配置 → 强制覆盖项
+   - 调用 `createTheme("Sidebar", mergedInput, undefined, inSidebar=true)` 完整构建
+
+4. **inSidebar 标志的作用**：在 `createEmotionTheme` 中设置 `theme.inSidebar = true`，供部分组件根据是否在侧边栏内调整样式（如阴影、边框等）。
+
+5. **IsSidebarContext**：除了主题隔离，侧边栏还通过 `IsSidebarContext.Provider value={true}` 提供上下文，通知子组件"我在侧边栏里"。
+
+---
+
+### 11.2 专题二：浅色/深色分支下字体来源的真实注入路径
+
+#### 容易混淆的认知
+
+既然有 `[theme.light]` 和 `[theme.dark]` 配置段，很多人自然以为每个模式下的字体配置（尤其是字体源 URL）是分开的，切换浅色/深色时会切换对应的字体。但事实并非如此。
+
+#### 字体系统的两层分离
+
+Streamlit 的字体分为两个完全独立的层面：
+
+| 层面 | 说明 | 随主题切换？ |
+|------|------|-------------|
+| **字体族名称** (font-family) | `bodyFont` / `headingFont` / `codeFont` 的名称 | ✅ 随主题切换 |
+| **字体来源** (font source) | `@font-face` 声明 / `<link>` 样式表 URL | ❌ 全局加载，不随主题切换 |
+
+#### 字体来源的收集逻辑
+
+**位置**：[useThemeManager.ts L187-L212](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/app/src/util/useThemeManager.ts#L187-L212)
+
+```typescript
+const setFonts = useCallback((themeInfo: ICustomThemeConfig): void => {
+  // 1. fontFaces: @font-face 声明
+  if (themeInfo.fontFaces) {
+    setFontFaces(themeInfo.fontFaces)
+  }
+
+  // 2. fontSources: <link> 样式表 URL
+  const allFontSources = [
+    ...(themeInfo.fontSources || []),           // 根级 [theme] 下的
+    ...(themeInfo.sidebar?.fontSources || []),   // [theme.sidebar] 下的
+  ]
+  // ... 收集为 Record<configName, sourceUrl>
+  setFontSources(newFontSources)
+}, [])
+```
+
+⚠️ **关键发现**：`setFonts` 只读取了：
+- `themeInfo.fontFaces` → 根级
+- `themeInfo.fontSources` → 根级
+- `themeInfo.sidebar.fontSources` → 侧边栏级
+
+**它没有读取 `themeInfo.light.fontSources`、`themeInfo.dark.fontSources`、`themeInfo.light.fontFaces`、`themeInfo.dark.fontFaces`！**
+
+这意味着：**`[theme.light]` 和 `[theme.dark]` 配置段中的 `fontFaces` 和 `fontSources` 配置是无效的，不会被加载。**
+
+#### 完整的字体传递链路
+
+```
+config.toml 配置
+  │
+  ├─ [theme]
+  │   ├─ font = "Inter:https://fonts.googleapis.com/..."
+  │   │   → 解析为: body_font = "Inter"
+  │   │             font_sources += { config_name: "font", source_url: "https://..." }
+  │   └─ fontFaces = [{ family: "MyFont", url: "/fonts/MyFont.woff2", ... }]
+  │       → 解析为: font_faces 列表
+  │
+  ├─ [theme.light]
+  │   └─ font = "Roboto:..."
+  │       → 仅影响 font-family 名称（继承合并时生效）
+  │       → ❌ fontSources 不会被 setFonts 读取！
+  │
+  └─ [theme.sidebar]
+      └─ font = "Mono:..."
+          → 影响侧边栏 font-family
+          → ✅ fontSources 会被 setFonts 读取（通过 themeInfo.sidebar.fontSources）
+```
+
+#### 为什么字体源不随主题切换？
+
+设计上的考量：
+1. **字体文件体积大**：切换主题时重新加载字体会造成 FOIT（Flash Of Invisible Text）或 FOUT（Flash Of Unstyled Text），用户体验差。
+2. **通常同名字体深浅模式共用**：浅色和深色模式一般用同一字体，只是颜色不同。
+3. **全局 CSS 的限制**：`@font-face` 和 `<link>` 是全局的，不支持"只在某个主题下生效"的作用域。
+
+#### 那浅色/深色字体族名不同怎么办？
+
+字体族名称（font-family）是随主题切换的，因为它是通过 `handleSectionInheritance` 合并到每个主题的 `emotion.genericFonts` 中的：
+
+```
+theme.light.bodyFont → handleSectionInheritance → lightThemeInput
+                                             → createTheme → emotion.genericFonts.bodyFont
+                                             → 最终写入 CSS font-family 属性
+```
+
+所以：**字体族名称可以每个主题不同，但字体文件/样式表 URL 是全局共享的。**
+
+#### 实际配置建议
+
+如果你确实需要浅色和深色模式用不同的字体（非常规场景）：
+
+```toml
+# ✅ 正确做法：把两个字体源都放在根级，名字分别配置
+[theme]
+fontFaces = [
+  { family = "LightFont", url = "/fonts/LightFont.woff2", weight_range = "400" },
+  { family = "DarkFont", url = "/fonts/DarkFont.woff2", weight_range = "400" },
+]
+
+[theme.light]
+font = "LightFont"   # 浅色用 LightFont
+
+[theme.dark]
+font = "DarkFont"    # 深色用 DarkFont
+```
+
+```toml
+# ❌ 错误做法：fontFaces 放在 light/dark 段下（不会被加载）
+[theme.light]
+font = "LightFont"
+fontFaces = [{ family = "LightFont", url = "/fonts/LightFont.woff2" }]
+
+[theme.dark]
+font = "DarkFont"
+fontFaces = [{ family = "DarkFont", url = "/fonts/DarkFont.woff2" }]
+```
+
+#### 字体注入的两个组件对比
+
+| 组件 | 实现方式 | 数据源 | 注入位置 |
+|------|---------|--------|---------|
+| [FontSources.tsx](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/app/src/components/FontSources/FontSources.tsx) | react-helmet-async 的 `<Helmet>` 生成 `<link>` 标签 | `fontSources` Record | `<head>` 中 |
+| [FontFaceDeclaration.tsx](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/app/src/components/FontFaceDeclaration/FontFaceDeclaration.tsx) | Emotion 的 `<Global>` 注入 `@font-face` CSS | `fontFaces` 数组 | Emotion 样式表中 |
+
+两者都在 [ThemedApp.tsx](file:///d:/fz/0601/solo-dogfeeding/code/224-streamlit/frontend/app/src/ThemedApp.tsx) 的 `RootStyleProvider` 内部顶层渲染，只注入一次，不随主题切换而变化。
