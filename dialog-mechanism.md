@@ -145,16 +145,61 @@ EVENT 容器的设计保证了：
 - 节点清理、瞬时元素清除、多页面元素过滤等操作按容器独立执行
 - 主页面的元素增减不影响 EVENT 容器内部节点的 delta_path
 
-### 4.3 React Context 标记：IsDialogContext
+### 4.3 React Context 标记：IsDialogContext（仅控制标题锚点）
 
-前端通过 React Context 向弹层内所有子组件传递「当前处于弹层中」的布尔标记。该标记影响以下组件行为：
+前端通过一个专用的 React Context 向弹层内所有子组件传递「当前处于弹层中」的布尔标记。该 Context 的覆盖范围为弹层组件及其全部后代，用于**单一且明确的用途**：禁用 Markdown 标题的锚点链接。
 
-- **Markdown 标题**：弹层内的标题不生成锚点链接（弹层内无法跳转锚点）
-- **全屏模式禁用**：弹层及其子容器自动向下传播 disableFullscreenMode，图表、图片等组件不显示全屏按钮
+具体行为：
+- 弹层（及侧边栏）内渲染的 `<h1>`–`<h6>` 标题，其 hover 时不显示锚点链接图标
+- 标题仍然正常渲染，也仍然会自动生成 `id` 属性（用于 `window.location.hash` 跳转），只是不向用户暴露锚点按钮
+- 理由：弹层为临时浮层，锚点 hash 跳转没有语义意义（hash 指向的锚点若在弹层内，刷新页面时弹层未打开，锚点不存在）
 
-Context 标记是一种「软隔离」机制——不限制组件渲染，但调整组件的行为模式以适配弹层环境。
+> **重要区分**：IsDialogContext **不负责**控制图表/图片的全屏禁用功能，两者是完全独立的机制，详见 4.4 节。
 
-### 4.4 弹层身份防重：防止旧内容残留
+### 4.4 disableFullscreenMode：属性透传机制（独立于 Context）
+
+弹层内的图表、图片等元素的全屏禁用，是通过**属性透传（prop drilling）**实现的，与 React Context 没有任何关系。
+
+#### 触发条件
+
+在 Block 组件渲染每个子节点前，根据当前节点类型计算一个布尔标志：
+
+```
+disableFullscreenMode =
+  传入父级的 disableFullscreenMode
+  或 当前 block 是 dialog 类型
+  或 当前 block 是 popover 类型
+```
+
+即：只要任一祖先节点是弹层或弹出框，或父级已设置该标志，则向下传递为 true。
+
+#### 透传路径
+
+标志通过 Block 组件递归时的 props 逐级传递，不经过任何 Context：
+
+- 根 Block → 子 Block → 元素组件（PlotlyChart、ImageList 等）
+- 每一层 Block 重新计算该标志，确保 dialog/popover 内的所有后代都能收到 true
+
+#### 消费端行为
+
+接收该标志的元素组件在渲染工具栏时判断：
+- 图表组件：若标志为 true，不在 modeBar 中追加全屏按钮
+- 图片列表组件：若标志为 true，不渲染全屏查看入口
+
+#### 两种机制的对比
+
+| 维度 | IsDialogContext（4.3） | disableFullscreenMode（4.4） |
+|---|---|---|
+| 传递方式 | React Context 跨层级提供 | Props 逐层透传 |
+| 触发源 | Dialog 组件包裹 Provider | 祖先 Block 类型（dialog/popover）或父级标志 |
+| 覆盖范围 | 精确为「弹层内部」（不含 popover） | 含弹层 + popover 所有后代 |
+| 消费组件 | Heading / StreamlitMarkdown | PlotlyChart、ImageList 等可视化组件 |
+| 作用 | 隐藏标题锚点图标 | 移除图表/图片的全屏入口 |
+| 设计语义 | 临时浮层中锚点无意义 | 模态覆盖层上再叠加全屏会破坏用户空间认知 |
+
+两者是**相互独立、各有分工**的软隔离机制，一个面向内容语义（锚点），一个面向空间交互（全屏）。
+
+### 4.5 弹层身份防重：防止旧内容残留
 
 前端在替换弹层类型的 Block 节点时，执行身份比对逻辑：
 
@@ -257,7 +302,39 @@ Context 标记是一种「软隔离」机制——不限制组件渲染，但调
 | rerun | 完整脚本重跑 | 将弹层本身注册为触发型 Widget，关闭 = Widget 激活 |
 | 回调函数 | 完整脚本重跑 + 回调优先 | 回调在主脚本执行前运行，属 Widget 的 on_change 机制 |
 
-**关键协作关系**：`on_dismiss` 之所以触发**完整脚本**而非弹层 Fragment 重跑，是因为「弹层作为触发型 Widget」注册在 EVENT 容器顶层，不在弹层内部的 Fragment 层级中。这是一个有意的设计：关闭弹层应视为一次全局性交互。
+**关键协作关系：为何是完整脚本，而不是弹层 Fragment？**
+
+这一点由 Widget 注册时的上下文决定，而非关闭动作本身决定。Widget 在注册时会将当前线程的 `fragment_id`（即「我属于哪个 Fragment」）写入元数据。弹层的创建流程是：
+
+```
+装饰器执行（主脚本运行阶段，不在任何 Fragment 内）
+  ├─ 创建弹层 Block
+  ├─ 注册触发型 Widget → 此时 fragment_id = 空（顶层）
+  └─ 包裹内容函数为 Fragment → 弹层内部 Widget 属于该 Fragment
+```
+
+因此：
+- 弹层**本身**作为 Widget（on_dismiss 回调的承载者）注册在**顶层 Fragment**（即完整脚本）
+- 弹层**内部**的 Widget 注册在弹层 Fragment（内容函数创建的 Fragment）
+
+当用户关闭弹层并触发 Widget 值变更时，脚本运行器根据 Widget 的 `fragment_id` 判断重跑范围——顶层 Widget → 完整脚本重跑。这不是一个配置选项，而是**注册上下文的自然结果**。
+
+**回调函数与 rerun 的执行顺序**
+
+若 `on_dismiss` 为回调函数，关闭动作的时间线严格为：
+
+1. 前端写入 trigger_value=true，消息到达后端
+2. 后端在执行脚本前，遍历所有值发生变更的 Widget
+3. 对弹层 Widget 调用 `on_change_handler`（即用户传入的回调函数）
+4. 回调函数执行完毕 → 脚本运行器根据该 Widget 的 fragment_id（顶层）决定调度完整脚本重跑
+5. 完整脚本重跑开始
+
+注意：
+- 回调在**当前脚本运行结束前**执行，而非在下一次脚本运行开始时
+- 回调内部若调用 `st.rerun()`，不会嵌套运行，而是与步骤 4 调度的重跑合并为同一次运行
+- 回调的异常与脚本本身的异常同等处理：中断当前流程、向前端发送异常界面
+
+> 工程惯例：配置 `on_dismiss="rerun"` 或回调时，通常需要在 Session State 中维护「弹层已关闭」标记，防止重跑后条件为真导致弹层立即弹出。
 
 #### 两条典型关闭路径
 
@@ -266,13 +343,25 @@ Context 标记是一种「软隔离」机制——不限制组件渲染，但调
 | 程序关闭（弹层内 st.rerun） | 弹层内按钮 → Fragment 重跑 → 抛出 RerunException → 冒泡到脚本运行器 → 完整脚本重跑 → 条件不满足 → 弹层消失 |
 | 用户关闭（on_dismiss="rerun"） | 点击遮罩/X/ESC → 前端 setTriggerValue → 后端识别顶层 Widget → 完整脚本重跑 → 若条件仍满足则弹层复现 |
 
-> 工程惯例：配置 `on_dismiss="rerun"` 或回调时，通常需要在 Session State 中维护「弹层已关闭」标记，防止重跑后条件为真导致弹层立即弹出。
-
 ---
 
-### 7.2 多次重跑中的状态保留
+### 7.2 多次重跑中的状态保留（含 stale 清理机制）
 
-**核心结论**：弹层重跑分两种场景，状态保留规则完全不同。
+**核心结论**：弹层重跑分两种场景，状态保留规则完全不同。理解 Fragment 重跑时的 stale 清理条件是判断状态是否被清除的关键。
+
+#### Fragment 重跑时的 stale 清理规则
+
+Fragment 重跑与完整脚本重跑的清理策略有本质区别：
+
+**完整脚本重跑**：暴力清理——所有节点按 `scriptRunId` 比对，不属于当前运行 ID 的节点全部删除。无论 Widget 属于哪个 Fragment，只要不在当前脚本运行的活跃集合中，其状态和 DOM 节点都会被清掉。
+
+**Fragment 重跑**：精确清理——只对「本次 Fragment 重跑所涉及的容器路径」下的节点执行 stale 判定，其他路径的节点一概不动。判定规则分三层：
+
+1. **父节点被修改 → 兄弟节点需验证**：若某个 Block（容器）被本次 Fragment 重跑修改（其 fragmentId 在 fragmentIdsThisRun 中且 scriptRunId 匹配当前运行），则该 Block 下所有子节点的父上下文标记为「已修改」。处于「已修改」父上下文下的子节点若 scriptRunId 不属于当前运行 → 判定为 stale，删除。
+2. **子节点属于其他 Fragment 或顶层 → 不动**：若子节点本身的 fragmentId 不属于本次重跑集合，或子节点本来就不归属任何 Fragment → 即便 scriptRunId 旧，也不会被删除。这保证了弹层 Fragment 重跑不会删除主页面或其他 Fragment 的元素。
+3. **Widget 状态同步清理**：每次脚本（含 Fragment）运行结束后，前端 Widget 状态管理器收集当前脚本运行中「活跃的 Widget ID 集合」，调用 removeInactive 删除不在集合中的 Widget 状态。对弹层 Fragment 而言，这意味着：本次重跑不再渲染的 Widget（例如条件渲染导致某个 widget 代码分支被跳过），其前端状态会被清除。
+
+**关键一致性保证**：渲染树节点清理（DOM 节点）与 Widget 状态清理（前端 WidgetState）是**同一轮**脚本运行完成后的两个独立步骤，但两者基于同一套活跃 ID 集合，确保 DOM 节点与其背后的 Widget 状态被同步清理或保留，不会出现「DOM 已删除但 Widget 状态残留」或「Widget 状态已清理但 DOM 节点仍在」的不一致情况。
 
 #### 场景一：同一次打开内的 Fragment 重跑
 
