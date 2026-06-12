@@ -698,7 +698,7 @@ handleMessage = (msgProto: ForwardMsg): void => {
 
 ---
 
-### 4.6 Delta 应用：AppRoot.applyDelta()
+### 4.6 Delta 应用：AppRoot.applyDelta() — 三大分支与 Visitor 模式协作
 
 `handleDeltaMsg` 调用 `AppRoot.applyDelta()` 将 Delta 应用到渲染树：
 
@@ -720,87 +720,532 @@ handleDeltaMsg = (
 }
 ```
 
-[AppRoot.ts](./frontend/lib/src/render-tree/AppRoot.ts#L238-L360) 的 `applyDelta()` 是核心渲染树更新方法：
+`applyDelta` 是整个更新流程的调度器，它不直接修改树结构，而是：
+1. 根据 `delta.type` 分派到三个处理分支
+2. 每个分支完成节点准备（payload 复用判定、children 继承等）后
+3. 统一调用 `SetNodeByDeltaPathVisitor` 执行不可变写入
 
-```typescript
-public applyDelta(
-  scriptRunId: string,
-  delta: Delta,
-  metadata: ForwardMsgMetadata,
-  elementHash?: string
-): AppRoot {
-  // 步骤1: 通过 delta_path 定位目标节点
-  const deltaPath = metadata.deltaPath.length > 0
-    ? metadata.deltaPath
-    : delta.deltaPath
-  const targetNode = new GetNodeByDeltaPathVisitor(deltaPath).visit(this.root)
+#### 4.6.1 Delta 类型与三大分支概览
 
-  // 步骤2: 执行 Delta 操作（addBlock / addRows / addColumns / setElement 等）
-  let newElement: Element | undefined
-  switch (delta.operation) {
-    case Delta.Operation.SET_INSERT_ELEMENT:
-      // 对于 Arrow DataFrame 数据，这是主要路径
-      newElement = (delta as Delta).newElement
-      break
-    // ... 其他操作类型
+[Delta.proto](./proto/streamlit/proto/Delta.proto#L24-L39) 定义了三种 Delta 类型：
+
+```protobuf
+message Delta {
+  oneof type {
+    Element new_element = 3;      // 新增元素（st.dataframe, st.table 等）
+    Block add_block = 6;          // 新增块节点（容器布局）
+    Transient new_transient = 9;  // 新增临时节点（spinner, toast 等）
   }
-
-  // 步骤3: 元素 payload 复用检测（核心性能优化！）
-  if (canReuseElementPayload(existingNode, elementHash, newElement)) {
-    // 相同 hash 的元素，直接复用现有 node 的 element payload
-    newNode = new ElementNode(
-      existingNode.element,  // 复用原有 element（包含 Arrow bytes！）
-      metadata,
-      scriptRunId,
-      mainScriptHash,
-      existingNode.elementHash
-    )
-  } else {
-    // 新元素，正常创建
-    newNode = new ElementNode(
-      newElement,
-      metadata,
-      scriptRunId,
-      mainScriptHash,
-      elementHash
-    )
-  }
-
-  // 步骤4: 将新节点写入渲染树
-  const newRoot = new SetNodeByDeltaPathVisitor(deltaPath, newNode).visit(this.root)
-  return new AppRoot(this.mainScriptHash, newRoot, this.appLogo)
 }
 ```
 
-#### 元素 payload 复用：canReuseElementPayload()
+对应 [AppRoot.ts](./frontend/lib/src/render-tree/AppRoot.ts#L238-L301) 的 `applyDelta()` 有三大分支，**处理差异对照表**：
 
-这是 Arrow 数据的第二道防线（第一道是 ForwardMsgCache）：
+| 特性 | newElement 分支 | addBlock 分支 | newTransient 分支 |
+|------|-----------------|---------------|-------------------|
+| **触发场景** | st.dataframe / st.text 等元素 | st.container / st.sidebar 等容器 | st.spinner / toast 等临时内容 |
+| **创建的节点类型** | `ElementNode` | `BlockNode` | `TransientNode` (初始 `anchor=undefined`) |
+| **需要定位 existingNode？** | 是（用于 payload 复用判断） | 是（用于 children 继承判断） | **否**（不需要任何现有节点信息） |
+| **GetNodeByDeltaPathVisitor？** | 有 | 有 | 无 |
+| **canReuseElementPayload？** | **有（唯一有此判断的分支）** | 无 | 无 |
+| **children 继承？** | 无（叶子节点） | 有（同类型 Block 继承） | 无（由 transientNodes 列表承载） |
+| **创建后写入方式** | `SetNodeByDeltaPathVisitor.setNodeAtPath()` | 同左 | 同左（由 Visitor 内部捕获 anchor） |
+
+---
+
+#### 4.6.2 分支 1：newElement — 唯一有 payload 复用的路径
 
 ```typescript
-// AppRoot.ts L53-L66
+// AppRoot.ts L248-L271
+case "newElement": {
+  const nextElement = delta.newElement as Element
+
+  // ── 阶段 1：定位现有节点（仅用于复用判断，不参与写入）──
+  const existingNode = GetNodeByDeltaPathVisitor.getNodeAtPath(
+    this.root,
+    deltaPath
+  )
+
+  // ── 阶段 2：payload 复用判定（精确位置：applyDelta 内部，addElement 之前）──
+  const canReuse = canReuseElementPayload(
+    existingNode,
+    elementHash,
+    nextElement
+  )
+
+  // ── 阶段 3：创建 ElementNode 并写入 ──
+  return this.addElement(
+    deltaPath,
+    scriptRunId,
+    canReuse ? existingNode.element : nextElement,  // ← 关键决策点
+    metadata,
+    activeScriptHash,
+    delta.fragmentId,
+    elementHash
+  )
+}
+```
+
+##### 元素 payload 复用：canReuseElementPayload()
+
+**精确代码位置**：[AppRoot.ts](./frontend/lib/src/render-tree/AppRoot.ts#L53-L66)
+
+```typescript
 function canReuseElementPayload(
   existingNode: AppNode | undefined,
   elementHash: string | undefined,
   nextElement: Element
 ): existingNode is ElementNode {
   return (
-    Boolean(elementHash) &&
-    nextElement.type !== undefined &&
-    existingNode instanceof ElementNode &&
-    existingNode.elementHash === elementHash &&
-    existingNode.element.type === nextElement.type &&
-    !nextElement.hasOneShotEffect
+    Boolean(elementHash) &&                    // 条件1: 有 elementHash（后端设置）
+    nextElement.type !== undefined &&          // 条件2: 新元素有类型字段
+    existingNode instanceof ElementNode &&      // 条件3: 现有节点必须是 ElementNode
+    existingNode.elementHash === elementHash && // 条件4: hash 完全匹配（内容一致）
+    existingNode.element.type === nextElement.type && // 条件5: 元素类型相同（防跨类型误用）
+    !nextElement.hasOneShotEffect              // 条件6: 非一次性效果（如弹窗类需重建）
   )
 }
 ```
 
-**复用生效场景**：
-- 两次 rerun 中同一个位置（相同 delta_path）的 DataFrame
-- elementHash 相同（表示 Arrow 数据内容未变）
-- 元素类型相同
-- 没有 `hasOneShotEffect` 标记
+**复用的传导链路**：
+```
+canReuse = true
+    │
+    ▼  传入 addElement()
+element = existingNode.element  （旧 element 对象引用，含 Arrow bytes）
+    │
+    ▼  new ElementNode(element, ..., elementHash)
+ElementNode.element === 旧 ElementNode.element
+    │
+    ▼  React 组件
+useMemo(() => new Quiver(element.arrowData), [elementHash, element.arrowData])
+    │  依赖项 elementHash 相同 → 跳过执行
+    ▼
+不重新解析 Arrow IPC bytes ✅
+```
 
-**效果**：即使 ForwardMsgCache 未命中（例如 hash 算法或缓存策略差异），这道防线仍能避免 React 重新创建包含 Arrow bytes 的 Element 对象。结合下游组件的 `useMemo`，最终避免重新解析几 MB 的 Arrow IPC bytes。
+> **注意**：即使 ForwardMsgCache 未命中（例如跨不同 rerun 的不同 ForwardMsg hash），只要内容一致（`elementHash` 相同），此复用机制仍生效。
+
+##### addElement() 实际工作
+
+[AppRoot.ts](./frontend/lib/src/render-tree/AppRoot.ts#L414-L441) — 极为简洁，仅做两件事：
+1. 构造 `ElementNode`（`element` 参数可能是复用的旧对象，也可能是新对象）
+2. 调用 `SetNodeByDeltaPathVisitor.setNodeAtPath()` 完成不可变写入
+
+```typescript
+private addElement(
+  deltaPath: number[],
+  scriptRunId: string,
+  element: Element,          // ← 复用 or 新建，由调用方决定
+  metadata: ForwardMsgMetadata,
+  activeScriptHash: string,
+  fragmentId?: string,
+  elementHash?: string
+): AppRoot {
+  const elementNode = new ElementNode(
+    element, metadata, scriptRunId, activeScriptHash, fragmentId, elementHash
+  )
+  return new AppRoot(
+    this.mainScriptHash,
+    SetNodeByDeltaPathVisitor.setNodeAtPath(
+      this.root, deltaPath, elementNode, scriptRunId
+    ) as BlockNode,
+    this.appLogo
+  )
+}
+```
+
+---
+
+#### 4.6.3 分支 2：addBlock — 有 children 继承的路径
+
+```typescript
+// AppRoot.ts L273-L283
+case "addBlock": {
+  const deltaMsgReceivedAt = Date.now()
+  return this.addBlock(
+    deltaPath, delta.addBlock as BlockProto,
+    scriptRunId, activeScriptHash, delta.fragmentId, deltaMsgReceivedAt
+  )
+}
+```
+
+##### addBlock() 四步处理流程
+
+[AppRoot.ts](./frontend/lib/src/render-tree/AppRoot.ts#L443-L503)
+
+```typescript
+private addBlock(...): AppRoot {
+  // ═══ 步骤 1：定位现有节点（GetNodeByDeltaPathVisitor）═══
+  const existingNodeAtPath = GetNodeByDeltaPathVisitor.getNodeAtPath(
+    this.root, deltaPath
+  )
+  // 关键：TransientNode 透明穿透——子节点继承操作的是 anchor
+  const existingNode = existingNodeAtPath instanceof TransientNode
+    ? (existingNodeAtPath.anchor ?? existingNodeAtPath)
+    : existingNodeAtPath
+
+  // ═══ 步骤 2：同类型 Block 继承 children ═══
+  let children: AppNode[] = []
+  if (
+    existingNode instanceof BlockNode &&
+    existingNode.deltaBlock.type === block.type
+  ) {
+    // Dialog 例外：身份不同则不继承（防不同 dialog 的内容串台）
+    const isDialogWithDifferentIdentity =
+      block.dialog && existingNode.deltaBlock.dialog &&
+      block.id !== existingNode.deltaBlock.id
+
+    if (!isDialogWithDifferentIdentity) {
+      children = existingNode.children  // 引用相等，下游 React 不重渲染
+    }
+  }
+
+  // ═══ 步骤 3：创建新 BlockNode ═══
+  const blockNode = new BlockNode(
+    activeScriptHash, children, block,
+    scriptRunId, fragmentId, deltaMsgReceivedAt
+  )
+
+  // ═══ 步骤 4：不可变写入 ═══
+  return new AppRoot(
+    this.mainScriptHash,
+    SetNodeByDeltaPathVisitor.setNodeAtPath(
+      this.root, deltaPath, blockNode, scriptRunId
+    ) as BlockNode,
+    this.appLogo
+  )
+}
+```
+
+**children 继承的意义**：当 `st.container` 在 rerun 中被重新创建时，其内部的 `st.dataframe` 等子节点保持引用相等，从而避免子组件重渲染、避免 Arrow 数据重新解析。
+
+---
+
+#### 4.6.4 分支 3：newTransient — 无需现有节点，anchor 在 Visitor 中捕获
+
+```typescript
+// AppRoot.ts L285-L295
+case "newTransient": {
+  const transient = delta.newTransient as TransientProto
+  return this.addTransient(
+    deltaPath, scriptRunId, transient, metadata,
+    activeScriptHash, delta.fragmentId
+  )
+}
+```
+
+##### addTransient() 极简流程
+
+[AppRoot.ts](./frontend/lib/src/render-tree/AppRoot.ts#L505-L540)
+
+```typescript
+addTransient(...): AppRoot {
+  const transientNode = new TransientNode(
+    scriptRunId,
+    undefined,  // ═══ 关键：初始 anchor = undefined ═══
+    transient.elements.map(e => new ElementNode(
+      e as Element, metadata, scriptRunId, activeScriptHash, fragmentId
+    )),
+    deltaMsgReceivedAt
+  )
+
+  return new AppRoot(
+    this.mainScriptHash,
+    SetNodeByDeltaPathVisitor.setNodeAtPath(
+      this.root, deltaPath, transientNode, scriptRunId
+    ) as BlockNode,
+    this.appLogo
+  )
+}
+```
+
+**为什么不在这里设置 anchor？**
+因为 `addTransient()` 不知道目标位置上原来有什么节点。anchor 的捕获必须在 `SetNodeByDeltaPathVisitor` 沿路径找到目标位置后，**在将要替换目标节点的那一刻**执行。详见 4.6.7 节。
+
+---
+
+#### 4.6.5 节点访问器（Visitor 模式）基础
+
+整个渲染树操作基于 **Visitor 设计模式**，核心接口：
+
+- [AppNode.interface.ts](./frontend/lib/src/render-tree/AppNode.interface.ts#L98-L99) — `accept<T>(visitor: AppNodeVisitor<T>): T`
+- [AppNodeVisitor.interface.ts](./frontend/lib/src/render-tree/visitors/AppNodeVisitor.interface.ts#L21-L24) — 三个 visit 方法
+
+**双分派原理**：
+```
+调用方                          节点 N                        访问器 V
+   │                              │                             │
+   │   N.accept(V)                │                             │
+   │ ───────────────────────────> │                             │
+   │                              │                             │
+   │                              │   V.visitXXX(N, ...)        │
+   │                              │ ───────────────────────────>│
+   │                              │                             │
+   │                              │                             │ 处理逻辑
+   │                              │         返回结果            │
+   │         返回结果             │ <─────────────────────────── │
+   │ <─────────────────────────── │                             │
+```
+
+三种节点的 `accept` 实现（完全对称，各调各的 visit）：
+
+| 节点类型 | `accept` 实现 | 代码位置 |
+|---------|-------------|---------|
+| `BlockNode` | `return visitor.visitBlockNode(this)` | [BlockNode.ts L108-L109](./frontend/lib/src/render-tree/BlockNode.ts#L108-L109) |
+| `ElementNode` | `return visitor.visitElementNode(this)` | [ElementNode.ts L69-L70](./frontend/lib/src/render-tree/ElementNode.ts#L69-L70) |
+| `TransientNode` | `return visitor.visitTransientNode(this)` | [TransientNode.ts L74-L75](./frontend/lib/src/render-tree/TransientNode.ts#L74-L75) |
+
+---
+
+#### 4.6.6 读访问器：GetNodeByDeltaPathVisitor
+
+[GetNodeByDeltaPathVisitor.ts](./frontend/lib/src/render-tree/visitors/GetNodeByDeltaPathVisitor.ts) — 根据 `deltaPath` 定位节点。递归消耗 `deltaPath` 的头部索引，`TransientNode` 不消耗索引（透明穿透）。
+
+三种 `visit` 方法的行为差异：
+
+| 方法 | 路径为空时 | 路径非空时 | 消耗路径索引？ |
+|------|-----------|-----------|--------------|
+| `visitElementNode()` | 返回 `undefined`（叶子，无可查找内容） | 抛异常（不应发生） | — |
+| `visitBlockNode()` | 返回 `undefined`（Block 自身不是查找目标，children 才是） | 取 `children[currentIndex]`：若 `remainingPath` 空则返回 child，否则递归 | ✅ 消耗 1 个 |
+| `visitTransientNode()` | 返回 `node.anchor`（把 anchor 当作该位置的实际节点） | `node.anchor?.accept(this)`（穿透到 anchor 继续处理） | ❌ 不消耗 |
+
+**`visitTransientNode` 的特殊性**：它是 TransientNode 透明性的核心保证——任何通过此 Visitor 查找的操作，都看不到 TransientNode 包装层，只看到内部的 anchor。这正是 `addBlock()` 中可以直接对查找结果做 `instanceof BlockNode` 判断的原因。
+
+---
+
+#### 4.6.7 写访问器：SetNodeByDeltaPathVisitor — 核心交互逻辑
+
+[SetNodeByDeltaPathVisitor.ts](./frontend/lib/src/render-tree/visitors/SetNodeByDeltaPathVisitor.ts) — 最复杂的访问器，承担三项职责：
+1. **不可变更新**：沿路径创建新 BlockNode
+2. **Anchor 捕获**：当 TransientNode（`anchor=undefined`）替换目标节点时，捕获原节点作为 anchor
+3. **插入 vs 替换判定**：处理"透明节点与非透明节点替换"的边界情况
+
+三种 `visit` 方法逐条分析：
+
+##### visitElementNode()：叶子节点替换
+
+```typescript
+// SetNodeByDeltaPathVisitor.ts L42-L59
+visitElementNode(node: ElementNode): AppNode {
+  if (this.deltaPath.length > 0) throw new Error("...")  // 不应有剩余路径
+
+  // ═══ Anchor 捕获场景：用 TransientNode 替换 ElementNode ═══
+  if (this.nodeToSet instanceof TransientNode && !this.nodeToSet.anchor) {
+    return new TransientNode(
+      this.nodeToSet.scriptRunId,
+      node,        // ← 原 ElementNode 变成 anchor
+      this.nodeToSet.transientNodes,
+      this.nodeToSet.deltaMsgReceivedAt
+    )
+  }
+
+  return this.nodeToSet  // 普通替换：直接用新节点覆盖
+}
+```
+
+##### visitBlockNode()：递归处理 + 插入/替换判定
+
+```typescript
+// SetNodeByDeltaPathVisitor.ts L85-L168
+visitBlockNode(node: BlockNode): AppNode {
+  // ── 路径为空：到达目标位置 ──
+  if (this.deltaPath.length === 0) {
+    // Anchor 捕获场景（同 visitElementNode）
+    if (this.nodeToSet instanceof TransientNode && !this.nodeToSet.anchor) {
+      return new TransientNode(
+        this.nodeToSet.scriptRunId,
+        node,         // ← 原 BlockNode 变成 anchor
+        this.nodeToSet.transientNodes,
+        ...
+      )
+    }
+    return this.nodeToSet
+  }
+
+  // ── 路径非空：继续向下递归 ──
+  const [currentIndex, ...remainingPath] = this.deltaPath
+
+  if (currentIndex < 0 || currentIndex > node.children.length) throw ...
+
+  const childVisitor = new SetNodeByDeltaPathVisitor(
+    remainingPath, this.nodeToSet, this.scriptRunId
+  )
+
+  let newChildren: AppNode[] = []
+
+  // 情形 A：索引越界 → 末尾追加新节点
+  if (!node.children[currentIndex]) {
+    if (remainingPath.length > 0) throw ...
+    newChildren = node.children.slice()
+    newChildren[currentIndex] = this.nodeToSet
+
+  // 情形 B：索引合法 → 遍历 children 处理目标位置
+  } else {
+    let index = 0
+    while (index < node.children.length) {
+      const child = node.children[index]
+
+      if (index !== currentIndex) {
+        newChildren.push(child)     // 非目标：直接引用，保持不变
+        index++
+        continue
+      }
+
+      // 对目标 child 递归调用（可能得到 TransientNode 或其他节点）
+      const nextChild = child.accept(childVisitor)
+
+      // ══════════════════════════════════════════════════
+      // ══ 插入 vs 替换 的核心判定 ══
+      // ══════════════════════════════════════════════════
+      // 满足以下三个条件 → 执行【插入】（而非替换）：
+      //   1. 原 child 不是 TransientNode（是真实内容节点）
+      //   2. 处理结果 nextChild 是 TransientNode（被包装了）
+      //   3. nextChild.anchor !== child（说明是"新包装"而非"在原 Transient 上修改"）
+      // 效果：新 Transient 在前，原节点在后（anchor 独立存在于 children 中）
+      if (
+        !(child instanceof TransientNode) &&
+        nextChild instanceof TransientNode &&
+        nextChild.anchor !== child
+      ) {
+        newChildren.push(nextChild)   // Transient 先插入（浮在上层）
+        newChildren.push(child)       // 原节点也保留（作为底层内容）
+      } else {
+        newChildren.push(nextChild)   // 正常替换
+      }
+      index++
+    }
+  }
+
+  // 创建新 BlockNode（不可变更新的保证）
+  return new BlockNode(
+    node.activeScriptHash, newChildren, node.deltaBlock,
+    this.scriptRunId, node.fragmentId, node.deltaMsgReceivedAt
+  )
+}
+```
+
+**为什么需要"插入"分支？**
+当 spinner 等临时内容被放置到某个已有元素（如 DataFrame）的位置时，如果只做替换：
+- `spinner` → 替换原 `dataframe` 节点 → 原节点丢失 → spinner 消失后无法恢复
+
+通过插入：
+- `spinner(Transient)` + `dataframe(anchor)` 两个节点并存 → 渲染时 spinner 在上、dataframe 在下 → `clearTransientNodes()` 后只删除 Transient，dataframe 完整保留
+
+##### visitTransientNode()：透明穿透 + replaceTransientNodeWithSelf
+
+```typescript
+// SetNodeByDeltaPathVisitor.ts L61-L83
+visitTransientNode(node: TransientNode): AppNode {
+  // 路径为空：到达目标位置，且该位置原本就是 TransientNode
+  if (this.deltaPath.length === 0) {
+    // 交给 replaceTransientNodeWithSelf 协议处理
+    return this.nodeToSet.replaceTransientNodeWithSelf(node)
+  }
+
+  // 路径非空：穿透 anchor（TransientNode 不占用路径索引）
+  if (node.anchor) {
+    const newAnchor = node.anchor.accept(this)  // 递归修改 anchor
+    return new TransientNode(                    // 重新包装 TransientNode
+      node.scriptRunId, newAnchor,
+      node.transientNodes, node.deltaMsgReceivedAt
+    )
+  }
+
+  throw new Error("TransientNode has no anchor to set node at")
+}
+```
+
+**路径非空时的处理**：TransientNode 在 `deltaPath` 层级上是"不存在"的，修改其内部 anchor 的路径不经过 TransientNode 本身消耗索引。修改完成后重新套回 TransientNode 外壳。
+
+---
+
+#### 4.6.8 replaceTransientNodeWithSelf 协议：三节点各自的合并策略
+
+当 `nodeToSet` 要替换一个已有的 `TransientNode` 时，不直接覆盖，而是调用 `nodeToSet.replaceTransientNodeWithSelf(oldTransientNode)`，让新节点自己决定合并策略。
+
+三种实现对照：
+
+| nodeToSet 类型 | 实现位置 | 合并策略 |
+|---------------|---------|---------|
+| **ElementNode** | [ElementNode.ts L83-L117](./frontend/lib/src/render-tree/ElementNode.ts#L83-L117) | 1. scriptRunId 不同 → 整体替换<br>2. 无 transientNodes → 返回自身<br>3. ClearStaleNodeVisitor 清理 stale 临时节点<br>4. 清理后为空 → 返回自身<br>5. 否则：新 TransientNode(anchor=self, transientNodes=过滤后列表) |
+| **BlockNode** | [BlockNode.ts L64-L97](./frontend/lib/src/render-tree/BlockNode.ts#L64-L97) | 逻辑同上，只是 anchor 类型为 BlockNode |
+| **TransientNode** | [TransientNode.ts L84-L102](./frontend/lib/src/render-tree/TransientNode.ts#L84-L102) | 比较 `deltaMsgReceivedAt` 时间戳：<br>• 新节点较新 → 优先用新节点的 transientNodes，anchor 优先取 `this.anchor ?? old.anchor`<br>• 旧节点较新 → 返回旧节点 |
+
+**设计目的**：同一个位置在同一次 script run 内可能收到多个 transient 更新（如 progress 条多次更新）。通过时间戳 + stale 清理的合并策略，避免每一次小更新都丢失原有的临时内容或 anchor。
+
+---
+
+#### 4.6.9 不可变更新的传播路径
+
+`SetNodeByDeltaPathVisitor` 保证每次修改都会创建路径上所有的新 BlockNode。以修改 `root → BlockA → ElementY` 为例：
+
+```
+修改前（引用关系）：           修改后（新创建节点标记为 '）：
+
+    Root                        Root'  ← 新
+     │                           │
+     ├─ BlockA                   ├─ BlockA'  ← 新（children 数组新）
+     │    ├─ ElementX            │    ├─ ElementX  ← 同引用（未变）
+     │    └─ ElementY (目标)     │    └─ ElementY'  ← 新（Arrow bytes 可能复用）
+     └─ BlockB                   └─ BlockB  ← 同引用（未变）
+```
+
+- `Root'`, `BlockA'`, `ElementY'` 是新创建的 → React 浅比较检测到变化 → 重渲染
+- `BlockB`, `ElementX` 保持同一引用 → React 跳过重渲染
+- **Arrow payload 复用场景**：若 `ElementY'.element === ElementY.element`（引用相等），则下游组件 `useMemo(() => new Quiver(...), [element.arrowData])` 依赖项未变 → 跳过解析
+
+---
+
+#### 4.6.10 Delta 应用完整流程（以 newElement 路径为例）
+
+```
+delta.type = "newElement"
+       │
+       ▼  AppRoot.ts L248-L271
+ applyDelta() - newElement 分支
+       │
+       ▼  GetNodeByDeltaPathVisitor.getNodeAtPath(root, deltaPath)
+       │    ├─ 递归 BlockNode.children：消耗路径索引
+       │    └─ TransientNode：透明穿透，不消耗索引
+       │   → 返回 existingNode（可能是 ElementNode / undefined）
+       │
+       ▼  canReuseElementPayload(existingNode, elementHash, nextElement)
+       │    ├─ elementHash 存在？
+       │    ├─ existingNode 是 ElementNode？
+       │    ├─ hash 完全匹配？
+       │    ├─ 元素类型相同？
+       │    └─ !hasOneShotEffect？
+       │
+       ▼  决策：
+       ├─ 全满足 → elementToUse = existingNode.element  (复用旧 Arrow bytes!)
+       └─ 否则   → elementToUse = nextElement           (使用新 element)
+       │
+       ▼  addElement(deltaPath, scriptRunId, elementToUse, ...)
+       │    └─ new ElementNode(elementToUse, metadata, ..., elementHash)
+       │
+       ▼  SetNodeByDeltaPathVisitor.setNodeAtPath(root, deltaPath, elementNode)
+       │    ┌────────────────────────────────────────────────────┐
+       │    │ 递归下降：                                          │
+       │    │  • visitBlockNode：创建 childVisitor 处理目标 child   │
+       │    │    ├─ 若在 Block 层命中（路径空）→ 替换/捕获 anchor │
+       │    │    └─ 否则 while 循环 children                       │
+       │    │         ├─ 非目标 index → 直接 push（保持引用）       │
+       │    │         └─ 目标 index → child.accept(childVisitor)  │
+       │    │                      ├─ visitElementNode → 替换     │
+       │    │                      └─ 插入/替换判定（可选）        │
+       │    │  • 每退出一层 Block → 创建新 BlockNode（不可变）       │
+       │    └────────────────────────────────────────────────────┘
+       │   → 返回新 root BlockNode
+       │
+       ▼  new AppRoot(mainScriptHash, newRoot, appLogo)  ← 整体不可变
+       │
+       ▼  React setState → 调度重渲染
+       │
+       ▼  DataFrame.tsx
+ useMemo(() => new Quiver(element.arrowData), [elementHash, element.arrowData])
+       └─ elementHash 不变 或 element.arrowData 引用不变 → 跳过重新解析 ✅
+```
 
 ---
 
@@ -843,16 +1288,30 @@ WebSocket 二进制帧 (ArrayBuffer)
              elements: prev.elements.applyDelta(scriptRunId, deltaMsg, metadata, elementHash)
           }))
        │
-       ▼  AppRoot.ts L238-L360
-  applyDelta()
-       ├─ GetNodeByDeltaPathVisitor → 定位目标节点
-       ├─ canReuseElementPayload() → 检查是否可复用 Arrow payload
-       │    ├─ elementHash 匹配？
-       │    ├─ 元素类型匹配？
-       │    └─ 非 one-shot？
-       ├─ 复用 or 创建新 ElementNode
-       ├─ SetNodeByDeltaPathVisitor → 写入渲染树
-       └─ 返回新 AppRoot（不可变更新）
+       ▼  AppRoot.ts L238-L301
+  applyDelta() - switch (delta.type)
+       ├─ "newElement" 分支：
+       │    ├─ GetNodeByDeltaPathVisitor.getNodeAtPath()
+       │    ├─ canReuseElementPayload() 检查
+       │    │    ├─ elementHash 匹配？
+       │    │    ├─ 元素类型匹配？
+       │    │    └─ 非 one-shot？
+       │    └─ addElement()
+       │         └─ new ElementNode(复用 or 新 element)
+       │              └─ SetNodeByDeltaPathVisitor.setNodeAtPath()
+       │
+       ├─ "addBlock" 分支：
+       │    ├─ GetNodeByDeltaPathVisitor.getNodeAtPath()
+       │    ├─ 同类型 Block 继承子节点
+       │    └─ addBlock()
+       │         └─ new BlockNode(继承的 children)
+       │              └─ SetNodeByDeltaPathVisitor.setNodeAtPath()
+       │
+       └─ "newTransient" 分支：
+            └─ addTransient()
+                 └─ new TransientNode(anchor=undefined)
+                      └─ SetNodeByDeltaPathVisitor.setNodeAtPath()
+                           (自动设置 anchor 为原节点)
        │
        ▼
   React setState → 重新渲染
@@ -1074,3 +1533,11 @@ reconstructMixedData(jsonData, arrowBlobs):
 7. **双重 memoization 防线**：ForwardMsgCache（传输层）+ canReuseElementPayload（渲染层）+ 组件 useMemo（渲染层）共同确保 Arrow 数据在 rerun 时不被重复传输、重复创建、重复解析。
 
 8. **基于 scriptRunCount 的 Age 缓存过期**：不同于标准 LRU，用脚本运行次数作为时间维度，更符合 Streamlit rerun 的使用模式。
+
+9. **Visitor 模式实现不可变树**：GetNodeByDeltaPathVisitor 和 SetNodeByDeltaPathVisitor 通过双重分派实现类型安全的树操作，配合完整不可变性确保 React 渲染性能。
+
+10. **TransientNode 透明穿透**：临时节点在 delta_path 查找和修改时不消耗路径索引，确保 delta_path 只描述真实内容结构，不受临时元素（如 spinner）干扰。
+
+11. **TransientNode 的 anchor 自动捕获**：当无 anchor 的 TransientNode 替换普通节点时，自动将原节点设为 anchor，确保临时内容消失后原始内容可完整恢复。
+
+12. **Block 子节点继承**：同类型 Block 替换时继承所有子节点，保留 Widget State 和 React State，这是对话框、列布局等容器 rerun 时状态不丢失的关键。
