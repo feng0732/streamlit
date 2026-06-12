@@ -196,28 +196,46 @@ filterParamsForPageChange(embedParams: string): string {
 
 | 参数类型 | 是否保留 | 判断依据 |
 |---------|---------|---------|
-| `embed` / `embed_options` | ✅ 保留 | `preserveEmbedQueryParams()` 专门提取 |
+| `embed` / `embed_options` | ✅ 保留 | `preserveEmbedQueryParams()` 专门提取，即使不在 `paramKeyToWidgetId` 中也保留 |
 | 绑定到 widget 的参数 | ✅ 保留 | `paramKeyToWidgetId` Map 中存在 |
 | 自由参数（`st.query_params["foo"]`） | ❌ 清除 | 不在 `paramKeyToWidgetId` 中 |
 
+> **embed 参数的特殊处理** [utils.ts#L119-L136](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/frontend/lib/src/util/utils.ts#L119-L136)：
+> - `preserveEmbedQueryParams()` 直接从 `window.location.search` 读取，**不依赖** `paramKeyToWidgetId`
+> - 即使没有任何绑定 widget，embed 参数也会被保留
+> - 非嵌入模式（`isEmbed() == false`）时返回空字符串，不会保留 embed
+>
 > 注意：前端的 `paramKeyToWidgetId` 只包含 **当前页面** 已渲染的绑定 widget。
 
 ### 5.2 第二层：后端过滤
 
 **触发时机**：`previous_page_script_hash != page_script_hash` 时，在脚本执行 **之前** 调用 [script_runner.py#L578-L611](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/lib/streamlit/runtime/scriptrunner/script_runner.py#L578-L611)
 
-**执行顺序**：
+**执行顺序** [script_runner.py#L578-L611](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/lib/streamlit/runtime/scriptrunner/script_runner.py#L578-L611)：
 ```
 ① populate_from_query_string(query_string, valid_script_hashes)
-  → 按 script_hash 过滤 binding 和参数
+  → 先 clear_with_no_forward_msg() 清空所有（包括 embed）
+  → 遍历 query_string，set_with_no_forward_msg 设置每个参数
+  → embed 被重新设置（因为前端已保留在 query_string 中）
+  → 其他页面的 binding 被清除
 ② set_initial_query_params_from_current()
   → 用过滤后的 _query_params 设置 _initial_query_params
+  → 包含 embed 参数（不检查，直接复制）
 ③ on_script_finished(widget_ids)
   → 常规 stale widget 清理
+  → bound_preserved 机制保留绑定参数的值到 _old_state[user_key]
 ④ ctx.reset(...)
   → 重置上下文
 ⑤ 脚本执行
+  → 新页面的 widget 重新注册，从 _initial_query_params 播种
 ```
+
+> **执行顺序中的 embed 追踪**：
+> - 步骤①开始：`_query_params` 被清空 → embed 暂时丢失
+> - 步骤①结束：遍历设置后 embed 回到 `_query_params`
+> - 步骤②结束：embed 被复制到 `_initial_query_params`
+> - 步骤⑤：widget 播种时不会读取 embed（因为不能绑定）
+> - 最终：embed 始终在 `_query_params` 中，并通过 `_send_query_param_msg` 回传到前端 URL
 
 **过滤逻辑** [query_params.py#L723-L777](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/lib/streamlit/runtime/state/query_params.py#L723-L777)：
 
@@ -246,6 +264,35 @@ def populate_from_query_string(self, query_string, valid_script_hashes):
 - **主页面（Home.py）**的绑定 → 保留
 - **其他页面**的绑定 → 清除
 
+**embed 参数在后端过滤中的特殊处理**：
+
+`populate_from_query_string` 的完整流程中，embed 参数的处理如下 [query_params.py#L723-L777](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/lib/streamlit/runtime/state/query_params.py#L723-L777)：
+
+```
+① self.clear_with_no_forward_msg()
+  → 没有传 preserve_embed=True
+  → 清空 _query_params 中的所有参数，包括 embed
+  ↓
+② 遍历 parsed_query_params 中的每个 key
+  → 对于 "embed" / "embed_options"：
+    - binding = None（因为不能绑定 embed 参数到 widget）
+    - valid_script_hashes 检查跳过（binding is None）
+    - 调用 self.set_with_no_forward_msg(key, val)
+    - set_with_no_forward_msg **不检查** embed，直接设置
+    → ✅ embed 被重新设置回 _query_params
+  ↓
+③ 完成后 _query_params = {
+    "embed": "true",
+    "embed_options": ["xxx"],
+    ... 其他保留的参数 ...
+  }
+```
+
+> **关键澄清**：之前的理解"embed 不进入 `_query_params` 字典"是错误的。实际上 embed 参数**会存入** `_query_params` 字典，只是：
+> - 通过公共 API（`__getitem__`, `__iter__`, `__len__`）访问时**不可见**
+> - 通过内部方法（`set_with_no_forward_msg`, `has_param`, `_send_query_param_msg`）操作时**正常可见**
+> - 前端 `handlePageInfoChanged` 收到的 queryString 中**包含** embed 参数
+
 **后端过滤结果**：
 
 | 参数类型 | 是否保留 | 判断依据 |
@@ -254,7 +301,7 @@ def populate_from_query_string(self, query_string, valid_script_hashes):
 | 主页面的绑定参数 | ✅ 保留 | `binding.script_hash == main_script_hash` |
 | 其他页面的绑定参数 | ❌ 清除 | binding 存在但 script_hash 不在白名单 |
 | URL 中的自由参数 | ✅ 保留（如果没被前端清掉） | 没有 binding 的参数直接保留 |
-| embed 参数 | ✅ 保留 | 受保护，不进入 `_query_params` 字典但始终在 URL 中 |
+| embed 参数 | ✅ 保留 | 前端已保留在 query_string 中，后端遍历设置时正常存入 |
 
 ### 5.3 两层过滤的净效果
 
@@ -275,6 +322,9 @@ def populate_from_query_string(self, query_string, valid_script_hashes):
 | 后端过滤 | 无（同页面，script_hash 不变） | 有（`populate_from_query_string` 按 script_hash） |
 | 绑定参数保留 | 全部（URL 原样传给后端） | 只保留当前页 + 主页面的 |
 | 自由参数保留 | 全部（URL 原样传） | 全部清除（前端过滤） |
+| **embed 参数保留** | ✅ 全部保留（URL 原样传） | ✅ 始终保留（前端 `preserveEmbedQueryParams` 专门提取，后端遍历设置时不检查） |
+| **embed 在 _query_params** | ✅ 存入 | ✅ 存入（先清空，然后从 query_string 重新设置） |
+| **embed 对外可见性** | ❌ 不可见（公共 API 过滤） | ❌ 不可见（公共 API 过滤） |
 | SessionState | 新 session，全部丢失 | 旧 session，绑定值通过 URL 传递 |
 | Widget 值来源 | 重新从 URL 播种 | 从 URL 播种（新页面的 widget） |
 
@@ -406,15 +456,153 @@ if deserialized_value == default_value:
 
 **例外**：`clearable=true` 且默认值非空的 widget，空值 `?foo=` 会保留。
 
-### 7.3 受保护参数
+### 7.3 深度分析：受保护参数（embed / embed_options）
 
-`embed` 和 `embed_options`（大小写不敏感）受到特殊保护：
-- 迭代/访问 `st.query_params` 时不可见
-- 不能通过 `st.query_params` 设置或删除
-- 跨页面导航时始终保留
-- 通过 `isEmbed()` / `getEmbedOptions()` 等专用函数读取
+#### 7.3.1 受保护参数的定义
 
-**关键代码**：[query_params.py#L35-L45](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/lib/streamlit/runtime/state/query_params.py#L35-L45)
+`embed` 和 `embed_options`（大小写不敏感）是 Streamlit 内部使用的受保护参数，用于嵌入模式控制。
+
+**定义** [query_params.py#L35-L45](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/lib/streamlit/runtime/state/query_params.py#L35-L45)：
+```python
+EMBED_QUERY_PARAMS_KEYS: Final[list[str]] = ["embed", "embed_options"]
+PROTECTED_QUERY_PARAMS: Final[frozenset[str]] = frozenset(
+    ["embed", "embed_options"]
+)
+```
+
+---
+
+#### 7.3.2 在参数存储中的处理
+
+**`_query_params` 字典的访问**：
+
+| 方法 | 是否过滤 embed | 代码位置 |
+|------|---------------|---------|
+| `__iter__` | ✅ 过滤 | [query_params.py#L296-L301](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/lib/streamlit/runtime/state/query_params.py#L296-L301) |
+| `__len__` | ✅ 过滤 | [query_params.py#L397-L404](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/lib/streamlit/runtime/state/query_params.py#L397-L404) |
+| `__getitem__` | ✅ 抛 KeyError | [query_params.py#L308-L309](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/lib/streamlit/runtime/state/query_params.py#L308-L309) |
+| `get_all` | ✅ 返回空列表 | [query_params.py#L392-L393](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/lib/streamlit/runtime/state/query_params.py#L392-L393) |
+| `to_dict` | ✅ 过滤 | [query_params.py#L433-L439](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/lib/streamlit/runtime/state/query_params.py#L433-L439) |
+| `has_param` | ❌ **不过滤** | [query_params.py#L601-L603](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/lib/streamlit/runtime/state/query_params.py#L601-L603) |
+| `__str__` | ❌ **不过滤** | [query_params.py#L406-L407](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/lib/streamlit/runtime/state/query_params.py#L406-L407) |
+
+> **重要澄清**：`has_param(key)` 不检查 embed，所以 `query_params.has_param("embed")` 会返回真实的存在状态。`__str__` 也会显示 embed 参数（用于调试）。
+
+**`_initial_query_params` 字典的访问**：
+- `set_initial_query_params`：直接 `parse_qs`，**不检查** embed → embed 会存入 [query_params.py#L640-L649](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/lib/streamlit/runtime/state/query_params.py#L640-L649)
+- `set_initial_query_params_from_current`：从 `_query_params` 复制，**不检查** embed → embed 会存入 [query_params.py#L651-L663](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/lib/streamlit/runtime/state/query_params.py#L651-L663)
+- `get_initial_value`：直接读取，**不检查** embed → 理论上可以读，但 widget 不能绑定 embed，实际不会调用 [query_params.py#L665-L685](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/lib/streamlit/runtime/state/query_params.py#L665-L685)
+
+**内部存储 vs 外部可见**：
+```
+内部存储 (_query_params)
+  ├── "embed": "true"              ✅ 实际存在
+  ├── "embed_options": ["option1"] ✅ 实际存在
+  └── "page": "75"                 ✅ 存在且可见
+
+外部访问 (st.query_params)
+  ├── "embed"                      ❌ 不可见（抛 KeyError）
+  ├── "embed_options"              ❌ 不可见（抛 KeyError）
+  └── "page": "75"                 ✅ 可见
+```
+
+---
+
+#### 7.3.3 API 操作限制
+
+**禁止修改的操作**（抛 `StreamlitAPIException`）：
+
+| 操作 | 检查位置 | 代码位置 |
+|------|---------|---------|
+| `__setitem__` | `_set_item_in_dict` → 检查 EMBED_QUERY_PARAMS_KEYS | [query_params.py#L844-L847](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/lib/streamlit/runtime/state/query_params.py#L844-L847) |
+| `update` | 调用 `_set_item_internal` → 同上 | [query_params.py#L385-L388](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/lib/streamlit/runtime/state/query_params.py#L385-L388) |
+| `from_dict` | 先 `clear(preserve_embed=True)`，然后 `update` → update 会检查 | [query_params.py#L445-L453](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/lib/streamlit/runtime/state/query_params.py#L445-L453) |
+| `__delitem__` | 先检查 EMBED_QUERY_PARAMS_KEYS → 抛 KeyError | [query_params.py#L336-L337](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/lib/streamlit/runtime/state/query_params.py#L336-L337) |
+
+**允许的操作**（保留 embed）：
+
+| 操作 | 处理方式 | 代码位置 |
+|------|---------|---------|
+| `clear()` | `clear_with_no_forward_msg(preserve_embed=True)` → 保留 embed | [query_params.py#L420-L431](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/lib/streamlit/runtime/state/query_params.py#L420-L431) |
+| `set_with_no_forward_msg` | 直接设置，**不检查** embed → 内部方法可操作 | [query_params.py#L455-L456](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/lib/streamlit/runtime/state/query_params.py#L455-L456) |
+| `remove_param` | 直接删除，**不检查** embed → 内部方法可操作 | [query_params.py#L605-L609](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/lib/streamlit/runtime/state/query_params.py#L605-L609) |
+| `_send_query_param_msg` | `urlencode(self._query_params)` → **包含** embed | [query_params.py#L409-L419](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/lib/streamlit/runtime/state/query_params.py#L409-L419) |
+
+> **关键区别**：`_set_item_in_dict`（公共 API 调用路径）检查 embed，但 `set_with_no_forward_msg`（内部方法）不检查。这是故意的设计——公共 API 禁止用户操作 embed，但内部机制需要能够设置和保留 embed。
+
+---
+
+#### 7.3.4 绑定限制
+
+`bind_widget` 方法会检查 `PROTECTED_QUERY_PARAMS`，阻止将 embed 参数绑定到 widget [query_params.py#L465-L499](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/lib/streamlit/runtime/state/query_params.py#L465-L499)：
+
+```python
+def bind_widget(self, param_key, ...):
+    if param_key.lower() in PROTECTED_QUERY_PARAMS:
+        raise StreamlitAPIException(
+            f"Cannot bind to reserved query parameter '{param_key}'. "
+            f"'embed' and 'embed_options' are used internally..."
+        )
+```
+
+这意味着：
+- ❌ `st.slider(..., bind="query-params", key="embed")` → 抛异常
+- ❌ `st.slider(..., bind="query-params", key="EMBED")` → 抛异常（大小写不敏感）
+- ✅ `st.slider(..., bind="query-params", key="page")` → 正常
+
+---
+
+#### 7.3.5 跨页面过滤中的处理
+
+**前端过滤**：
+- `preserveEmbedQueryParams()`：专门从 URL 提取 embed 参数，**不包含其他任何参数** [utils.ts#L119-L136](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/frontend/lib/src/util/utils.ts#L119-L136)
+- `filterParamsForPageChange(embedParams)`：embedParams 作为单独参数传入，与绑定 widget 的参数拼接 [WidgetStateManager.ts#L1205-L1238](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/frontend/lib/src/WidgetStateManager.ts#L1205-L1238)
+- `getQueryString()`：embed 参数放在最前面，格式为 `embed=true&embed_options=xxx&other_params` [utils.ts#L142-L155](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/frontend/lib/src/util/utils.ts#L142-L155)
+
+**后端过滤**（`populate_from_query_string`）[query_params.py#L723-L777](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/lib/streamlit/runtime/state/query_params.py#L723-L777)：
+
+```
+① clear_with_no_forward_msg()  → 无 preserve_embed 参数 → 清空所有，包括 embed
+  ↓
+② 遍历 parsed_query_params 中的每个 key
+  → 对每个 key 调用 set_with_no_forward_msg(key, val)
+  → set_with_no_forward_msg 不检查 embed → embed 被重新设置
+  ↓
+③ 完成后 _query_params 中包含 embed（因为前端已保留）
+```
+
+> **关键细节**：`clear_with_no_forward_msg()` 没有传 `preserve_embed=True`，但由于前端已经把 embed 包含在 query_string 中，遍历设置时会重新加回来。这是正确的设计——后端不做额外判断，直接使用前端过滤后的结果。
+
+**`_send_query_param_msg` 序列化**：
+- `parse.urlencode(self._query_params, doseq=True)` → **包含** embed 参数
+- 前端 `handlePageInfoChanged` 直接使用这个 queryString 更新 URL → **包含** embed
+- 所以 embed 参数会正常显示在浏览器地址栏
+
+---
+
+#### 7.3.6 限制总结
+
+| 限制类型 | 操作 | 是否受限 | 说明 |
+|---------|------|---------|------|
+| **仅对外不可见**（内部仍然存储） | `__iter__`, `__len__`, `__getitem__`, `get_all`, `to_dict` | ✅ 受限 | 通过公共 API 看不到 embed 参数 |
+| **仅对外不可见** | `has_param`, `__str__` | ❌ 不受限 | 内部方法和调试可以看到真实状态 |
+| **API 操作限制** | `__setitem__`, `update`, `from_dict`, `__delitem__` | ✅ 受限 | 公共 API 禁止修改 embed |
+| **API 操作限制** | `clear()`, `set_with_no_forward_msg`, `remove_param`, `_send_query_param_msg` | ❌ 不受限 | 内部方法和 `clear()` 可以操作 embed |
+| **绑定限制** | `bind_widget` | ✅ 受限 | 不能将 embed 绑定到 widget |
+| **跨页面保留** | 前端 `preserveEmbedQueryParams` | ❌ 不受限 | 始终保留 |
+| **跨页面保留** | 后端 `populate_from_query_string` | ❌ 不受限 | 前端已保留，后端直接用 |
+
+---
+
+#### 7.3.7 前端专用读取函数
+
+embed 参数通过专用函数读取，而不是通过 `st.query_params`：
+
+| 函数 | 用途 | 代码位置 |
+|------|------|---------|
+| `isEmbed()` | 检查是否为嵌入模式 | [utils.ts#L157-L168](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/frontend/lib/src/util/utils.ts#L157-L168) |
+| `getEmbedOptions()` | 获取嵌入选项列表 | [utils.ts#L170-L182](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/frontend/lib/src/util/utils.ts#L170-L182) |
+| `preserveEmbedQueryParams()` | 提取 embed 参数用于导航 | [utils.ts#L119-L136](file:///d:/fz/0601/solo-dogfeeding/code/232-streamlit/frontend/lib/src/util/utils.ts#L119-L136) |
 
 ### 7.4 条件性更新边界
 
@@ -465,5 +653,7 @@ if deserialized_value == default_value:
 1. **前端先响应**：UI 交互先 `replaceState` 改 URL，再发请求
 2. **后端防循环**：三道防线确保用户交互不会触发二次回写
 3. **URL 是可选项**：等于默认值时折叠，只保留有意义的状态
-4. **值比 URL 更持久**：Stale widget 的值通过 `bound_preserved` 保留在 `_old_state`，URL 参数和 binding 被清除，重新出现时恢复
-5. **跨页面两层过滤**：前端清自由参数，后端按 script_hash 清其他页面的绑定
+4. **值比 URL 更持久**：Stale widget 的值通过 `bound_preserved` 保留在 `_old_state[user_key]`，URL 参数和 binding 被清除，重新出现时恢复
+5. **跨页面两层过滤**：前端清自由参数、保留 embed，后端按 script_hash 清其他页面的绑定、重设 embed
+6. **受保护参数双重标准**：`embed` / `embed_options` 在内部存储中正常存在，但通过公共 API 访问时不可见且不可修改，内部方法可以自由操作
+7. **公共 API 与内部方法分离**：`_set_item_in_dict`（公共路径）检查 embed，但 `set_with_no_forward_msg`（内部方法）不检查，确保用户不能操作 embed 但系统机制可以
