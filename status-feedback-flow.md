@@ -511,22 +511,25 @@ Streamlit 存在两套状态反馈系统，它们通过不同的消息类型驱�
 
 ### 7.3 关键消息的相互依赖
 
-**1. `new_session` 消息：全局状态切换的起点**
+**1. `new_session` 消息：渲染树的新运行锚点**
 
 [app_session.py#L783-L858](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/lib/streamlit/runtime/app_session.py#L783-L858)
 
-`new_session` 消息的作用不仅仅是启动新会话：
+`new_session` 消息的作用是标记新一次脚本运行的开始，为渲染树建立新的锚点：
 - 携带 **`script_run_id`**：这是后续所有 Delta 消息的"归属标签"，用于判断节点是否过期
-- 携带 **`session_status.script_is_running`**：驱动 StatusWidget 进入 RUNNING 状态
 - 携带 **`fragment_ids_this_run`**：标记本次是全量运行还是 fragment 运行
+- 携带 **`initialize.session_status`**：仅在首次初始化/重连时通过 `handleInitialization()` 间接设置 `scriptRunState`；普通运行时不改变 `scriptRunState`
+
+**`new_session` 不负责切换 StatusWidget 状态**。在普通运行中，`handleNewSession()` 只更新 `scriptRunId` 和清除瞬态节点，完全不触碰 `scriptRunState`。顶部状态栏的 RUNNING / NOT_RUNNING 切换由 `session_status_changed` 消息驱动。
 
 前端收到 `new_session` 后 [App.tsx#L1349-L1441](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/app/src/App.tsx#L1349-L1441)：
 ```typescript
-// 同页面、同应用的正常重跑
+// 同页面、同应用的正常重跑（普通运行）
 this.setState(prevState => ({
     // 先清除瞬态节点（如 spinners）
     elements: prevState.elements.clearTransientNodes(fragmentIdsThisRun),
-    scriptRunId,  // 更新 scriptRunId
+    scriptRunId,  // 更新 scriptRunId —— 这是 new_session 的核心职责
+    // 注意：没有 scriptRunState 更新！
 }))
 ```
 
@@ -539,32 +542,132 @@ this.addBlock(deltaPath, block, scriptRunId, ...)
 // → 新创建的 BlockNode.scriptRunId = 当前 scriptRunId
 ```
 
-**3. `script_finished` 消息：清理的触发点**
+**3. `script_finished` 消息：节点清理的触发点**
 
-只有收到 `FINISHED_SUCCESSFULLY` 或 `FINISHED_FRAGMENT_RUN_SUCCESSFULLY` 状态时才执行清理，`FINISHED_EARLY_FOR_RERUN` 不清理（见下一节）。
+`script_finished` **不改变 `scriptRunState`**。它的唯一职责是：
+- 对 `FINISHED_SUCCESSFULLY` / `FINISHED_FRAGMENT_RUN_SUCCESSFULLY`：执行 `clearStaleNodes()` + `removeInactiveWidgetState()` + `incrementMessageCacheRunCount()`
+- 对 `FINISHED_EARLY_FOR_RERUN`：仅通知 `scriptFinishedHandlers`，不清理
+- 对 `FINISHED_WITH_COMPILE_ERROR`：不执行任何操作
+
+顶部状态栏切回 NOT_RUNNING 由紧随 `script_finished` 之后到达的 `session_status_changed(scriptIsRunning=false)` 完成，而非 `script_finished` 本身。
 
 ### 7.4 StatusWidget 状态机
 
-[StatusWidget.tsx](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/app/src/components/StatusWidget/StatusWidget.tsx) 中的状态转换逻辑：
+[StatusWidget.tsx](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/app/src/components/StatusWidget/StatusWidget.tsx) 中的状态转换逻辑。核心原则：**`scriptRunState` 切换唯一由 `session_status_changed` 消息驱动**，`new_session` 和 `script_finished` 从不直接修改 `scriptRunState`。
+
+#### 各消息职责边界
+
+| 消息 | 对 `scriptRunState` 的影响 | 核心职责 |
+|------|--------------------------|---------|
+| **`session_status_changed(scriptIsRunning=true)`** | ✅ 切到 `RUNNING` | 唯一驱动进入运行状态的消息 |
+| **`session_status_changed(scriptIsRunning=false)`** | ✅ 切到 `NOT_RUNNING` | 唯一驱动回到未运行状态的消息 |
+| **`new_session`** | ❌ 不直接修改（普通运行）<br>✅ 首次/重连：通过 `handleInitialization` 间接调用 `handleSessionStatusChanged` | 分发 `script_run_id`、配置、页面信息，清除瞬态节点 |
+| **`script_finished`** | ❌ 从不修改 | 触发节点清理、Widget 清理、缓存清理 |
+
+---
+
+#### 普通运行场景的完整状态机
 
 ```
-用户点击 Rerun
-    → scriptRunState = RERUN_REQUESTED  (乐观更新，立即显示)
-    → 发送 BackMsg(rerun_script) 到后端
-           ↓
-后端发送 new_session(scriptIsRunning=true)
-    → handleSessionStatusChanged()
-    → scriptRunState = RUNNING
-           ↓
-    运行 500ms 后 (RUNNING_MAN_DISPLAY_DELAY_TIME_MS)
-    → showRunningMan = true
-    → 显示 "Running Man" 动画 + Stop 按钮
-           ↓
-后端发送 script_finished(FINISHED_SUCCESSFULLY)
-    → (间接通过 handleNewSession 或 handleSessionStatusChanged)
-    → scriptRunState = NOT_RUNNING
-    → showRunningMan = false
+初始状态: NOT_RUNNING
+
+[1] 用户点击按钮 → 前端发送 BackMsg 到后端
+       ↓
+[2] 后端 SCRIPT_STARTED 事件
+       ├─→ 发送 new_session (script_run_id=A)
+       │     └─→ 前端 handleNewSession(): 更新 scriptRunId，清除瞬态节点
+       │         ❗ scriptRunState 仍为 NOT_RUNNING（普通运行不走 handleInitialization）
+       │
+       └─→ 函数末尾检测状态变化
+             └─→ 发送 session_status_changed(scriptIsRunning=true)
+                   └─→ 前端 handleSessionStatusChanged()
+                         ├─→ 条件：scriptIsRunning=true && state≠STOP_REQUESTED
+                         └─→ scriptRunState = RUNNING  ← 切到运行中
+       ↓
+[3] 运行 500ms 后 (RUNNING_MAN_DISPLAY_DELAY_TIME_MS)
+       └─→ showRunningMan = true
+       └─→ 显示 "Running Man" 动画 + Stop 按钮
+       ↓
+[4] 脚本执行完成 → 后端 SCRIPT_STOPPED_WITH_SUCCESS 事件
+       ├─→ 发送 script_finished(FINISHED_SUCCESSFULLY)
+       │     └─→ 前端 handleScriptFinished()
+       │           ├─→ clearStaleNodes() 清理节点
+       │           ├─→ removeInactiveWidgetState() 清理 Widget
+       │           └─→ ❗ scriptRunState 仍为 RUNNING（从不修改 scriptRunState）
+       │
+       └─→ 函数末尾检测状态变化
+             └─→ 发送 session_status_changed(scriptIsRunning=false)
+                   └─→ 前端 handleSessionStatusChanged()
+                         ├─→ 条件：!scriptIsRunning && state≠RERUN_REQUESTED && state≠COMPILATION_ERROR
+                         └─→ scriptRunState = NOT_RUNNING  ← 切回未运行
 ```
+
+---
+
+#### 重跑过渡场景的完整状态机
+
+```
+当前状态: NOT_RUNNING（脚本已完成）
+
+[1] 用户点击 Rerun 按钮
+       └─→ 前端 rerunScript() 被调用
+             ├─→ this.setState({ scriptRunState: RERUN_REQUESTED })  ← 前端乐观更新
+             └─→ 发送 BackMsg(rerun_script) 到后端
+       ↓
+[2] 后端中断旧脚本 → SCRIPT_STOPPED_FOR_RERUN 事件
+       └─→ 发送 script_finished(FINISHED_EARLY_FOR_RERUN)
+             └─→ 前端 handleScriptFinished()
+                   ├─→ ❌ 跳过 clearStaleNodes（防闪烁）
+                   └─→ ❗ scriptRunState 仍为 RERUN_REQUESTED
+       ↓
+[3] 后端启动新脚本 → SCRIPT_STARTED 事件
+       ├─→ 发送 new_session (script_run_id=B)
+       │     └─→ 前端 handleNewSession(): 更新 scriptRunId，清除瞬态节点
+       │         ❗ scriptRunState 仍为 RERUN_REQUESTED
+       │
+       └─→ 函数末尾检测状态变化
+             └─→ 发送 session_status_changed(scriptIsRunning=true)
+                   └─→ 前端 handleSessionStatusChanged()
+                         ├─→ 条件：scriptIsRunning=true && state≠STOP_REQUESTED
+                         ├─→ RERUN_REQUESTED ≠ STOP_REQUESTED → 条件满足
+                         └─→ scriptRunState = RUNNING  ← 切到运行中
+       ↓
+[4] 运行 500ms 后 → showRunningMan = true
+       ↓
+[5] 新脚本完成 → SCRIPT_STOPPED_WITH_SUCCESS 事件
+       ├─→ 发送 script_finished(FINISHED_SUCCESSFULLY)
+       │     └─→ 前端 handleScriptFinished(): 清理节点
+       │           ❗ scriptRunState 仍为 RUNNING
+       │
+       └─→ 发送 session_status_changed(scriptIsRunning=false)
+             └─→ 前端 handleSessionStatusChanged()
+                   ├─→ 条件：!scriptIsRunning && state≠RERUN_REQUESTED && state≠COMPILATION_ERROR
+                   ├─→ RUNNING ≠ RERUN_REQUESTED → 条件满足
+                   └─→ scriptRunState = NOT_RUNNING  ← 切回未运行
+```
+
+---
+
+#### 状态切换条件详解 [App.tsx#L1225-L1250](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/app/src/App.tsx#L1225-L1250)
+
+**切到 RUNNING 的条件：**
+```typescript
+if (scriptIsRunning && prevState !== STOP_REQUESTED) {
+    scriptRunState = RUNNING
+}
+```
+- 如果用户已经点击了 Stop（状态为 `STOP_REQUESTED`），则忽略运行中的通知
+
+**切到 NOT_RUNNING 的条件：**
+```typescript
+if (!scriptIsRunning && 
+    prevState !== RERUN_REQUESTED && 
+    prevState !== COMPILATION_ERROR) {
+    scriptRunState = NOT_RUNNING
+}
+```
+- 如果用户已经点击了 Rerun（状态为 `RERUN_REQUESTED`），则忽略"脚本已停止"的通知（因为新脚本马上要开始）
+- 如果脚本有编译错误（状态为 `COMPILATION_ERROR`），则保留错误状态不覆盖
 
 关键的防闪烁设计：脚本开始运行后不会立即显示 Running Man，而是等待 500ms。如果脚本在 500ms 内完成，用户就不会看到短暂的"闪烁"效果。
 
