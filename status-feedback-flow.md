@@ -570,13 +570,295 @@ this.addBlock(deltaPath, block, scriptRunId, ...)
 
 ---
 
-## 8. 脚本重新运行时旧节点不立即清除的原因
+## 8. 三种生命周期消息的功能与发送时机
 
-### 8.1 核心设计原则：防止闪烁
+Streamlit 使用三种核心生命周期消息驱动全局状态流转。它们的功能、发送时机和接收后的行为各不相同，共同构成状态反馈的骨架。
+
+### 8.1 消息类型功能对照表
+
+| 消息类型 | 后端生成方法 | 核心功能 | 携带关键字段 |
+|----------|------------|---------|------------|
+| **`new_session`** | `_create_new_session_message()` | 标记新一次脚本运行的开始，分发运行配置 | `script_run_id`、`scriptIsRunning`、`fragment_ids_this_run`、`config`、`theme`、`initialize.session_status`、`pages` |
+| **`session_status_changed`** | `_create_session_status_changed_message()` | 通知运行状态或 Run-On-Save 设置变更 | `script_is_running`、`run_on_save` |
+| **`script_finished`** | `_create_script_finished_message()` | 标记脚本运行结束，触发清理 | `status`（5 种枚举值） |
+
+### 8.2 `new_session` 消息详解
+
+**发送时机** [app_session.py#L680-L686](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/lib/streamlit/runtime/app_session.py#L680-L686)：
+
+```python
+# 触发 ScriptRunnerEvent.SCRIPT_STARTED 时
+self._clear_queue(fragment_ids_this_run)  # 先清空旧队列（保留生命周期消息）
+msg = self._create_new_session_message(
+    page_script_hash, fragment_ids_this_run, pages
+)
+self._enqueue_forward_msg(msg)
+```
+
+在以下事件后必定发送：
+- 新用户首次连接（页面打开）
+- 用户点击 Rerun / Always Rerun
+- 用户修改 Widget（如按下按钮）
+- Fragment 触发重跑
+- 连接断开后重连时（由前端 `sendUpdateWidgetsMessage` 触发）
+
+**前端接收处理** [App.tsx#L1349-L1441](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/app/src/App.tsx#L1349-L1441)：
+
+```
+handleNewSession(newSessionProto)
+    ├─→ 首次连接或断线重连 → handleInitialization()
+    │      └─→ sessionInfo.setCurrent() + handleSessionStatusChanged()
+    ├─→ 非 Fragment 运行
+    │      ├─→ cleanupAutoReruns()
+    │      ├─→ processThemeInput()
+    │      ├─→ setState 更新 config、toolbarMode 等
+    │      └─→ appNavigation.handleNewSession()
+    ├─→ Fragment 运行
+    │      └─→ setState 更新 fragmentIdsThisRun + latestRunTime
+    └─→ 关键分支判断
+           ├─ 同 appHash 且同 pageScriptHash（正常重跑）
+           │     └─→ setState: clearTransientNodes() + 更新 scriptRunId
+           └─ appHash 或 pageScriptHash 变化（跨页面/跨应用）
+                 └─→ clearAppState(): 完全清空渲染树 + 清理 Widget 状态
+```
+
+**关键细节**：
+- `script_run_id` 是每次运行唯一的 UUID，后续所有 Delta 消息都继承这个 ID
+- 每次收到 `new_session`，前端会置 `hasReceivedNewSession = true`（防止旧运行的 finished 消息误触发缓存清理）
+
+### 8.3 `session_status_changed` 消息详解
+
+**发送时机** [app_session.py#L762-L775](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/lib/streamlit/runtime/app_session.py#L762-L775)：
+
+```python
+# 在 _on_scriptrunner_event 末尾，状态切换时发送
+app_was_running = prev_state == AppSessionState.APP_IS_RUNNING
+app_is_running = self._state == AppSessionState.APP_IS_RUNNING
+if app_is_running != app_was_running:
+    self._enqueue_forward_msg(self._create_session_status_changed_message())
+
+# 另外，用户修改 Run-On-Save 设置时也发送
+def _handle_set_run_on_save_request(self, new_value):
+    self._run_on_save = new_value
+    self._enqueue_forward_msg(self._create_session_status_changed_message())
+```
+
+发送场景：
+1. `APP_NOT_RUNNING → APP_IS_RUNNING`（脚本开始运行）
+2. `APP_IS_RUNNING → APP_NOT_RUNNING`（脚本结束运行）
+3. 用户通过界面修改 `run_on_save` 设置
+
+**前端接收处理** [App.tsx#L1219-L1265](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/app/src/App.tsx#L1219-L1265)：
+
+```
+handleSessionStatusChanged(statusChangeProto)
+    ├─→ scriptIsRunning=true
+    │      ├─ 当前非 STOP_REQUESTED → scriptRunState = RUNNING
+    │      └─ 若当前显示编译错误对话框 → 关闭它
+    ├─→ scriptIsRunning=false
+    │      └─ 当前非 RERUN_REQUESTED 且非 COMPILATION_ERROR
+    │            → scriptRunState = NOT_RUNNING
+    ├─→ 更新 userSettings.runOnSave
+    └─→ scriptIsRunning=true 时重置 scriptChangedOnDisk=false
+```
+
+**与 `new_session` 的关系**：`new_session.initialize.session_status` 中也会携带同样的运行状态，并在 `handleInitialization()` 中调用 `handleSessionStatusChanged()`。所以**首次连接时是 `new_session` 间接触发状态更新，而不是单独的 `session_status_changed` 消息**。
+
+### 8.4 `script_finished` 消息详解
+
+**发送时机与状态枚举** [app_session.py#L688-L736](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/lib/streamlit/runtime/app_session.py#L688-L736)：
+
+| ScriptRunnerEvent | ScriptFinishedStatus | 前端是否清理节点 |
+|-------------------|---------------------|----------------|
+| `SCRIPT_STOPPED_WITH_SUCCESS` | `FINISHED_SUCCESSFULLY` | ✅ 是 |
+| `FRAGMENT_STOPPED_WITH_SUCCESS` | `FINISHED_FRAGMENT_RUN_SUCCESSFULLY` | ✅ 是（精细清理） |
+| `SCRIPT_STOPPED_WITH_COMPILE_ERROR` | `FINISHED_WITH_COMPILE_ERROR` | ❌ 否 |
+| `SCRIPT_STOPPED_FOR_RERUN` | `FINISHED_EARLY_FOR_RERUN` | ❌ 否（防闪烁） |
+
+**前端接收处理** [App.tsx#L1593-L1657](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/app/src/App.tsx#L1593-L1657)：
+
+```
+handleScriptFinished(status)
+    ├─→ 对 SUCCESSFULLY / EARLY_FOR_RERUN / FRAGMENT_SUCCESS
+    │     └─→ 微任务队列（下一轮事件循环）执行所有 scriptFinishedHandlers
+    │
+    ├─→ 仅对 SUCCESSFULLY / FRAGMENT_SUCCESS
+    │     └─→ setState: clearStaleNodes()
+    │           callback: removeInactiveWidgetState()
+    │
+    └─→ 仅对非 EARLY_FOR_RERUN 且 hasReceivedNewSession=true
+          └─→ incrementMessageCacheRunCount()
+                （按 maxCachedMessageAge 过期旧消息缓存）
+```
+
+**关键边界条件**：
+- `FINISHED_WITH_COMPILE_ERROR` 完全不执行任何 handler，也不清理
+- `FINISHED_EARLY_FOR_RERUN` 只触发 handler 通知，但**不清理节点、不清理消息缓存**
+- `hasReceivedNewSession` 守卫防止旧运行的 finished 消息（因网络延迟先于新运行的 new_session 到达）错误地清理当前新运行的缓存
+
+---
+
+## 9. 四种典型场景的边界条件分析
+
+### 9.1 场景一：首次初始化
+
+**后端流程**：
+1. 前端建立 WebSocket，发送 `Hello` BackMsg
+2. Runtime 创建 AppSession，创建 ScriptRunner
+3. ScriptRunner 发射 `SCRIPT_STARTED` 事件
+4. 发送 `new_session` 消息（`scriptIsRunning=true`，携带完整配置）
+5. 进入用户脚本，执行 ST.status() 等 → 发送 Delta 消息
+6. 脚本完成 → `FINISHED_SUCCESSFULLY` → 发送 `script_finished` + `session_status_changed`（`scriptIsRunning=false`）
+
+**前端边界条件**：
+- `sessionInfo.isSet == false` 时进入 `handleInitialization()`，设置 sessionInfo（包含 streamlitVersion、environmentInfo、sessionId、userInfo 等）
+- `appHash` 初始为空，`pageScriptHash` 初始为默认值 → 走 `clearAppState()` 分支（而非轻量的 clearTransientNodes）
+- 首次连接不检测 Streamlit 版本变化（未设置 previous version 时跳过）
+
+**关键代码**：`INITIAL_SCRIPT_RUN_ID = "<null>"` 是初始占位值，直到首次收到 `new_session` 才被替换。
+
+### 9.2 场景二：断连后重连
+
+**连接状态机** [ConnectionState.ts](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/connection/src/ConnectionState.ts)：
+
+```
+INITIAL → CONNECTING → PINGING_SERVER → CONNECTED
+                        ↓
+                    DISCONNECTED_FOREVER（超过最大重试次数）
+```
+
+**前端重连处理** [App.tsx#L862-L941](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/app/src/App.tsx#L862-L941)：
+
+```
+handleConnectionStateChanged(CONNECTED)
+    ├─→ 重置 connectionErrorDismissed=false
+    ├─→ 判断是否需要请求重跑（满足任一条件就重跑）：
+    │     1. sessionInfo.last 不存在（首次建立连接）
+    │     2. lastRunWasInterrupted：scriptRunState===RUNNING（断连时脚本在跑）
+    │     3. wasRerunRequested：scriptRunState===RERUN_REQUESTED
+    │     4. fragmentIdsThisRun.length > 0（上次跑了 fragment）
+    │     5. autoReruns.length > 0（有定时自动重跑）
+    │
+    ├─→ 需要重跑：
+    │     └─→ widgetMgr.sendUpdateWidgetsMessage(undefined)
+    │           （携带所有 Widget 当前值，触发脚本带状态重跑）
+    │
+    ├─→ 不需要重跑但显示了连接错误对话框：
+    │     └─→ setState({ dialog: null }) 关闭对话框
+    │
+    ├─→ 向 Host 发送 WEBSOCKET_CONNECTED 事件
+    └─→ flushSync 同步更新 connectionState（确保每个连接状态变更都被 render 观察到）
+```
+
+**状态容器（st.status）的重连边界**：
+- 断连期间，已渲染的 DOM 保持不变（页面内状态容器视觉上仍存在）
+- StatusWidget 切换为显示连接状态（Pinging / Disconnected），而非脚本运行状态
+- 重连成功后，若脚本被重新执行，会发送新的 `new_session` → Delta 流 → `script_finished`，按正常流程覆盖旧节点
+- 若断连时脚本正在运行 `st.status` 的长任务，重连后会重新从头执行，旧状态容器会被新 Delta 覆盖
+
+### 9.3 场景三：正常运行（无中断）
+
+**消息顺序的严格保证**：
+```
+[1] new_session (script_run_id=A, scriptIsRunning=true)
+[2] delta (type=add_block, 创建 st.status 容器)
+[3] delta (type=new_element, status.write 内容 1)
+[4] delta (type=add_block, status.update(label="..."))
+[5] delta (type=new_element, status.write 内容 2)
+[6] session_status_changed (scriptIsRunning=false)  ← 发送在 script_finished 之前
+[7] script_finished (FINISHED_SUCCESSFULLY)
+```
+
+**边界条件**：
+- `session_status_changed` 与 `script_finished` 在同一处理函数中被同步 enqueue，顺序由 Python 代码保证
+- 前端按接收顺序处理。收到消息 [6] 时 scriptRunState 变为 NOT_RUNNING，但**此时还没有清理旧节点**（要到消息 [7] 才触发 clearStaleNodes）
+- 在 [6] 和 [7] 之间，用户看到：顶部状态栏显示"Not Running"，页面内状态容器已显示最终 complete 状态，但节点尚未清理（视觉上无差异）
+
+**状态容器的正常完成边界**：
+- 若 `with st.status()` 块中出现未捕获异常，`__exit__` 将状态置为 `error`，此时 `script_finished` 可能仍是 `FINISHED_SUCCESSFULLY`（如果异常在 Streamlit 捕获范围内，脚本整体仍算成功）
+- 顶部状态栏显示 NOT_RUNNING，页面内 status 容器显示 error 图标，两者反映不同层面的状态
+
+### 9.4 场景四：脚本重跑清理
+
+**后端重跑触发路径**：
+```
+用户点击 Rerun
+    → 前端发送 BackMsg(rerun_script) + scriptRunState 乐观设为 RERUN_REQUESTED
+    → AppSession._handle_rerun_script_request()
+    → ScriptRunner.request_stop(ScriptStopException)
+    → ScriptRunner 发送 SCRIPT_STOPPED_FOR_RERUN
+    → 发送 script_finished(FINISHED_EARLY_FOR_RERUN)
+    → 立即创建新 ScriptRunner
+    → 新 ScriptRunner 发送 SCRIPT_STARTED
+    → 发送 new_session(script_run_id=NEW)
+```
+
+**前端重跑清理边界** [App.tsx#L2000-L2010](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/app/src/App.tsx#L2000-L2010)：
+
+请求重跑时前端先重置 `hasReceivedNewSession = false`：
+
+```
+rerunScript()
+    → this.hasReceivedNewSession = false  ← 关键：清空守卫
+    → sendBackMsg(BackMsg(rerun_script, ...))
+```
+
+这是为了防止**旧运行的 script_finished（FINISHED_EARLY_FOR_RERUN 或 SUCCESSFULLY）** 在 `new_session` 到达之前误触发缓存清理。
+
+**状态容器在重跑中的生命周期边界**：
+
+| 时间点 | 顶部 StatusWidget | 页面内 status 容器 | 触发事件 |
+|--------|-----------------|-------------------|---------|
+| T0（重跑前） | NOT_RUNNING | BlockNode(run-1, state=complete) | — |
+| T1（用户点击 Rerun） | RERUN_REQUESTED（乐观） | 不变（仍是 run-1） | `this.setState({scriptRunState: RERUN_REQUESTED})` |
+| T2（旧脚本中断） | RERUN_REQUESTED | 不变（EARLY_FOR_RERUN 跳过清理） | `handleScriptFinished(EARLY_FOR_RERUN)` → 无清理 |
+| T3（收到 new_session run-2） | RUNNING | 不变（仍显示旧 run-1 内容） | `handleNewSession()`：设 scriptRunId=run-2，清除瞬态 |
+| T4（新脚本执行 st.status） | RUNNING | 被新 Delta 替换为 run-2 | `handleDeltaMsg()`：SetNodeByDeltaPathVisitor |
+| T5（新脚本完成） | NOT_RUNNING | run-2 节点保留 | `handleScriptFinished(SUCCESSFULLY)`：清理非 run-2 节点 |
+
+**核心边界：T2 → T3 之间页面不闪烁**
+- 旧脚本以 `FINISHED_EARLY_FOR_RERUN` 结束 → 前端**跳过 clearStaleNodes**
+- `new_session(run-2)` 到达时只执行 `clearTransientNodes()`（清除 spinner 等瞬态元素），不清除 BlockNode
+- 旧的 status 容器（run-1）在 T2 到 T4 之间仍然显示，直到新脚本在同 delta_path 上创建新的 status 容器（run-2）把它覆盖
+- 如果新脚本不再创建该 status 容器（代码改了），则该旧节点会一直保留到 T5，被 `clearStaleNodes(run-2)` 作为过期节点清除
+
+### 9.5 跨场景的共享边界条件
+
+**条件 1：hasReceivedNewSession 守卫**
+- 初始值：`false`
+- 收到 `new_session`：`true`
+- 调用 `rerunScript()` 或 `fragmentRunRequest()`：`false`
+- 作用：确保缓存清理只在"当前运行的结束消息"到达时执行，而不是"上一次运行的迟到消息"
+
+**条件 2：scriptRunId 的标签作用**
+- 初始值：`INITIAL_SCRIPT_RUN_ID = "<null>"`
+- `new_session` 到达后被替换为新的 UUID
+- 所有 Delta 消息生成的节点都打上当前 scriptRunId 标签
+- `clearStaleNodes()` 仅删除 scriptRunId 不匹配的节点
+
+**条件 3：connectionState 与 scriptRunState 的联合判定**
+- StatusWidget 显示 Running Man 的条件：`connectionState === CONNECTED && scriptRunState in [RUNNING, RERUN_REQUESTED]`
+- 若连接断开（PINGING_SERVER / DISCONNECTED_FOREVER），无论脚本是否在运行，StatusWidget 都显示连接状态，而不显示脚本运行状态
+- Widget 输入被禁用条件：`connectionState !== CONNECTED`
+
+**条件 4：FINISHED_* 状态清理策略表**
+
+| status 值 | 通知 handler | clearStaleNodes | removeInactiveWidget | incrementMessageCache |
+|-----------|------------|-----------------|---------------------|----------------------|
+| `FINISHED_SUCCESSFULLY` | ✅ | ✅ | ✅ | ✅（需 hasReceivedNewSession） |
+| `FINISHED_FRAGMENT_RUN_SUCCESSFULLY` | ✅ | ✅（精细） | ✅ | ✅（需 hasReceivedNewSession） |
+| `FINISHED_EARLY_FOR_RERUN` | ✅ | ❌ | ❌ | ❌ |
+| `FINISHED_WITH_COMPILE_ERROR` | ❌ | ❌ | ❌ | ❌ |
+
+---
+
+## 10. 脚本重新运行时旧节点不立即清除的原因
+
+### 10.1 核心设计原则：防止闪烁
 
 Streamlit 的页面渲染遵循一个重要原则：**旧元素一直显示，直到新元素覆盖它**。这就是为什么脚本重跑时旧的 `st.status` 容器不会立即消失。
 
-### 8.2 具体实现机制
+### 10.2 具体实现机制
 
 **机制一：FINISHED_EARLY_FOR_RERUN 跳过清理**
 
@@ -640,7 +922,7 @@ visitBlockNode(node: BlockNode): AppNode | undefined {
 
 在 `clearStaleNodes()` 被调用之前，旧 scriptRunId 的节点虽然不匹配，但仍然保留在渲染树中。
 
-### 8.3 时序图解：重跑时的元素生命周期
+### 10.3 时序图解：重跑时的元素生命周期
 
 ```
 T0: 初始状态
@@ -685,7 +967,7 @@ T6: 新脚本完成，发送 FINISHED_SUCCESSFULLY
     → removeInactiveWidgetState() 清理 widget
 ```
 
-### 8.4 为什么这是好的设计？
+### 10.4 为什么这是好的设计？
 
 | 场景 | 如果立即清除 | 实际（延迟清除） |
 |------|------------|----------------|
@@ -696,9 +978,9 @@ T6: 新脚本完成，发送 FINISHED_SUCCESSFULLY
 
 ---
 
-## 9. 脚本成功结束时的完整清理流程
+## 11. 脚本成功结束时的完整清理流程
 
-### 9.1 清理时机
+### 11.1 清理时机
 
 清理发生在 `handleScriptFinished()` 收到 `FINISHED_SUCCESSFULLY` 状态时：
 
@@ -720,7 +1002,7 @@ if (status === FINISHED_SUCCESSFULLY ||
 }
 ```
 
-### 9.2 清理步骤详解
+### 11.2 清理步骤详解
 
 #### 步骤 1：clearStaleNodes() - 清除过期渲染节点
 
@@ -794,7 +1076,7 @@ if (status !== FINISHED_EARLY_FOR_RERUN && this.hasReceivedNewSession) {
 
 作用：移除超过缓存寿命的 ForwardMsg 引用，释放浏览器内存。
 
-### 9.3 完整清理时序
+### 11.3 完整清理时序
 
 ```
 FINISHED_SUCCESSFULLY 消息到达
@@ -825,9 +1107,9 @@ FINISHED_SUCCESSFULLY 消息到达
 
 ---
 
-## 10. 异步反馈原理总结
+## 12. 异步反馈原理总结
 
-### 10.1 核心机制
+### 12.1 核心机制
 
 Streamlit 的状态提示组件实现异步反馈依赖以下几个关键机制的协同工作：
 
@@ -860,7 +1142,7 @@ Streamlit 的状态提示组件实现异步反馈依赖以下几个关键机制�
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 10.2 各层职责
+### 12.2 各层职责
 
 | 层级 | 组件 | 职责 |
 |------|------|------|
@@ -872,7 +1154,7 @@ Streamlit 的状态提示组件实现异步反馈依赖以下几个关键机制�
 | 前端连接层 | `ConnectionManager` | WebSocket 连接管理 |
 | 前端渲染层 | `AppRoot` / `Block` / `Expander` | 渲染树管理、增量更新 |
 
-### 10.3 为什么不需要刷新整个页面
+### 12.3 为什么不需要刷新整个页面
 
 状态提示组件的更新是**增量式**的，这是 Streamlit 高效性的重要体现：
 
@@ -884,7 +1166,7 @@ Streamlit 的状态提示组件实现异步反馈依赖以下几个关键机制�
 
 ---
 
-## 11. 相关文件索引
+## 13. 相关文件索引
 
 ### 后端核心文件
 - [mutable_status_container.py](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/lib/streamlit/elements/lib/mutable_status_container.py) - StatusContainer 实现
@@ -903,6 +1185,7 @@ Streamlit 的状态提示组件实现异步反馈依赖以下几个关键机制�
 - [StatusWidget.tsx](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/app/src/components/StatusWidget/StatusWidget.tsx) - 顶部状态栏
 - [ScriptRunState.ts](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/lib/src/ScriptRunState.ts) - 脚本运行状态枚举
 - [ScriptRunContext.tsx](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/lib/src/components/core/ScriptRunContext.tsx) - 脚本运行状态上下文
+- [ConnectionState.ts](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/connection/src/ConnectionState.ts) - 连接状态枚举（INITIAL/CONNECTED/DISCONNECTED_FOREVER 等）
 - [ClearStaleNodeVisitor.ts](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/lib/src/render-tree/visitors/ClearStaleNodeVisitor.ts) - 过期节点清理访问者
 - [ClearTransientNodesVisitor.ts](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/lib/src/render-tree/visitors/ClearTransientNodesVisitor.ts) - 瞬态节点清理
 - [SetNodeByDeltaPathVisitor.ts](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/lib/src/render-tree/visitors/SetNodeByDeltaPathVisitor.ts) - 按路径设置节点
