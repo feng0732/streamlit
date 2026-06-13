@@ -260,20 +260,35 @@ function formatIntlNumberWithLocales(value, options = {}) {
 | `"yen"` | Intl `currency:"JPY"` | 0 位小数强制 | `1234.567` → `"¥1,235"` <br>`12.3456789` → `"¥12"` | `"¥1,235"` <br>`"¥12"` |
 | `"accounting"` | numbro（千分位 + 括号负数，无本地化） | mantissa=2 | `-1234` → `"(1,234.00)"` | 同左 |
 | `"bytes"` | Intl `notation:"compact"` + `style:"unit" unit:"byte"` + `BB→GB` 替换 | `maximumFractionDigits: 1`（Streamlit 显式指定） | `12.3456789` → `"12.3B"` <br>`1234` → `"1.2KB"` <br>`1234567` → `"1.2MB"` | `12.3456789` → `"12.3B"` <br>`1234` → `"1.2KB"` <br>`1234567` → `"123.5万 B"`（中文 locale 下按"万"进位） |
-| `"compact"` | **Intl `notation:"compact"`** | **默认 `maximumSignificantDigits = 2`**（2 位有效数字） | `12.3456789` → `"12"` <br>`1.23456789` → `"1.2"` <br>`1234.56789` → `"1.2K"` <br>`12345.6789` → `"12K"` <br>`123456.789` → `"123K"` <br>`1234567.89` → `"1.2M"` <br>`999.999` → `"1K"`（四舍五入越界） | `12.3456789` → `"12"` <br>`1.23456789` → `"1.2"` <br>`1234.56789` → `"1235"`（千级无缩写，4 位有效数字） <br>`12345.6789` → `"1.2万"` <br>`1234567.89` → `"123万"` |
+| `"compact"` | **Intl `notation:"compact"`** | **CLDR locale 档位决定精度**：<br>• 档位区（≥ locale compact 阈值）→ `maxSig=2` 2 位有效数字<br>• 非档位区（< 阈值）→ `maxFracDigits=0` 四舍五入到整数 | `12.3456789` → `"12"` <br>`1.23456789` → `"1.2"` <br>`1234.56789` → `"1.2K"` <br>`12345.6789` → `"12K"` <br>`123456.789` → `"123K"` <br>`1234567.89` → `"1.2M"` <br>`999.999` → `"1K"`（四舍五入越界到 K 档） | `12.3456789` → `"12"` <br>`1.23456789` → `"1.2"` <br>`1234.56789` → `"1235"`（**非档位区：maxFracDigits=0 四舍五入到整数**，不是 4 位有效数字）<br>`12345.6789` → `"1.2万"`（档位区：2 位有效数字 + 万）<br>`1234567.89` → `"123万"`（档位区） |
 | `"scientific"` | **Intl `notation:"scientific"`** | 默认 `maximumFractionDigits = 3`（尾数 3 位小数） | `12.3456789` → `"1.235E1"` <br>`1234567.89` → `"1.235E6"` | `"1.235E1"` <br>`"1.235E6"` |
 | `"engineering"` | **Intl `notation:"engineering"`** | 默认 `maximumFractionDigits = 3`（尾数 3 位小数，指数为 3 的倍数） | `12.3456789` → `"12.346E0"` <br>`1234.56789` → `"1.235E3"` <br>`1234567.89` → `"1.235E6"` | `"12.346E0"` <br>`"1.235E3"` <br>`"1.235E6"` |
 | printf 格式（`"%.2f"`, `"%,d"`, `"%,.2f"`） | **sprintf.js**（支持 `,` / `_` 千分位标志，无本地化） | 按 printf 规格 | `1234.567, "%.2f"` → `"1234.57"` <br>`1234, "%,d"` → `"1,234"` | 同左（纯英文逗号千分位） |
 
 **关键精度规则详解**：
 
-- **`compact`（2 位有效数字）**：Intl.NumberFormat 在 `notation:"compact"` 时，`resolvedOptions()` 显示 `minimumSignificantDigits=1`, `maximumSignificantDigits=2`。这意味着所有数字都被 **四舍五入到 2 位有效数字**：
-  - `12.3456789` → 2 位有效数字 → `"12"`（不是 `"12.3456789"`，也不是 `"12.35"`）
-  - `1.23456789` → 2 位有效数字 → `"1.2"`
-  - `1234.56789` → 2 位有效数字 + K 后缀 → `"1.2K"`
-  - `999.999` → 2 位有效数字 + 四舍五入越界到 K 档 → `"1K"`
-  - `1234567.89` → 2 位有效数字 + M 后缀 → `"1.2M"`
-  - Streamlit 在调用 `formatIntlNumberWithLocales` 时 **没有传入 `maxPrecision`**（[formatNumber.ts:173-176](file:///d:/fz/0601/solo-dogfeeding/code/235-streamlit/frontend/lib/src/util/formatNumber.ts#L173-L176)），完全使用浏览器 Intl 的默认有效数字策略
+- **`compact`（CLDR locale 档位驱动的动态精度）**：这是最容易被误解的机制。虽然 `resolvedOptions()` 返回 `{ minimumSignificantDigits: 1, maximumSignificantDigits: 2 }`，但这只是"名义默认值"。**实际精度策略由数字是否落入 locale 的 compact 档位区动态决定**：
+
+  | locale | CLDR compact 档位阈值 | 档位区行为（≥ 阈值） | 非档位区行为（< 阈值） |
+  |--------|----------------------|-------------------|---------------------|
+  | `en-US` | 千进制：10³(K), 10⁶(M), 10⁹(B), 10¹²(T) | `maxSig=2`（2 位有效数字）+ 缩写后缀 | `maxFracDigits=0`（四舍五入到整数，不缩写） |
+  | `zh-CN` | 万进制：10⁴(万), 10⁸(亿) | `maxSig=2`（2 位有效数字）+ 中文缩写 | `maxFracDigits=0`（四舍五入到整数，不缩写） |
+  | `de-DE` | 千进制但阈值同 zh-CN（10⁴ 才缩写 Tsd./Mio.） | `maxSig=2` + 德语单位 | `maxFracDigits=0`（德语小数点为逗号） |
+
+  **核心案例拆解 — 为什么 zh-CN 下 1234.56789 显示为 "1235"？**
+  1. 数字 1234.56789 < 中文 compact 阈值 10000 → 落入 **非档位区**
+  2. 非档位区规则：**不缩写**，`maxFractionDigits=0`（四舍五入到整数）
+  3. `1234.56789` 四舍五入到整数 → `"1235"`（不是 "1200"，也不是 "1234.6"）
+  4. 对比：`1234.56789` 在 `en-US` 下 ≥ 1000（K 档位阈值）→ 档位区 → 2 位有效数字 + K → `"1.2K"`
+
+  **更多边界案例**：
+  - `zh-CN`: `9999.999` → 四舍五入到整数是 10000，刚好等于万档阈值 → 进位显示 `"1万"`
+  - `zh-CN`: `12345.6789` → ≥ 10000 → 档位区 → 2 位有效数字 + 万 → `"1.2万"`
+  - `en-US`: `999.999` → 四舍五入到整数是 1000，等于 K 档阈值 → 进位显示 `"1K"`
+  - `en-US`: `1234.56789` → ≥ 1000 → 档位区 → 2 位有效数字 + K → `"1.2K"`
+  - 所有 locale 下 `12.3456789` 都远低于各自最低档位阈值 → 非档位区 → 2 位有效数字（两位数时 maxSig=2 刚好等于位数，且无小数）→ `"12"`
+
+  Streamlit 在调用 `formatIntlNumberWithLocales` 时 **没有传入任何精度参数**（[formatNumber.ts:173-176](file:///d:/fz/0601/solo-dogfeeding/code/235-streamlit/frontend/lib/src/util/formatNumber.ts#L173-L176)），完全使用浏览器 Intl + CLDR locale 数据的默认档位行为。
 
 - **`bytes`（1 位小数）**：Streamlit 显式指定了 `maximumFractionDigits: 1`（[formatNumber.ts:186-198](file:///d:/fz/0601/solo-dogfeeding/code/235-streamlit/frontend/lib/src/util/formatNumber.ts#L186-L198)），所以 `12.3456789` 显示为 `"12.3B"`（保留 1 位小数而非 2 位有效数字）。这是 bytes 与 compact 在精度策略上的根本差异。
 
@@ -318,19 +333,25 @@ const formattedDelta =
 
 | Python 调用 | 后端 body 字符串 | 前端显示 (无 format) | 前端显示 (`format="compact"`, `en-US`) | 前端显示 (`format="compact"`, `zh-CN`) |
 |------------|----------------|---------------------|--------------------------------------|--------------------------------------|
-| `st.metric("A", 1234567)` | `"1234567"` | `"1234567"` | `"1.2M"`（2 位有效数字 + M） | `"123万"`（中文万进制，2 位有效数字） |
-| `st.metric("A", 12.3456789)` | `"12.3456789"` | `"12.3456789"` | `"12"`（2 位有效数字 → `"12"`) | `"12"`（同上） |
+| `st.metric("A", 1234567)` | `"1234567"` | `"1234567"` | `"1.2M"`（档位区：≥10³，2 位有效数字 + M） | `"123万"`（档位区：≥10⁴，2 位有效数字 + 万） |
+| `st.metric("A", 12345.6789)` | `"12345.6789"` | `"12345.6789"` | `"12K"`（档位区：≥10³，2 位有效数字 + K） | `"1.2万"`（档位区：≥10⁴，2 位有效数字 + 万） |
+| `st.metric("A", 1234.56789)` | `"1234.56789"` | `"1234.56789"` | `"1.2K"`（档位区：≥10³，2 位有效数字 + K） | `"1235"`（**非档位区：< 10⁴，不缩写，四舍五入到整数**） |
+| `st.metric("A", 9999.999)` | `"9999.999"` | `"9999.999"` | `"10K"`（四舍五入越界到 K 档） | `"1万"`（四舍五入后恰好等于万档阈值 → 进位） |
+| `st.metric("A", 12.3456789)` | `"12.3456789"` | `"12.3456789"` | `"12"`（非档位区：< 10³，maxSig=2 → 2 位有效数字） | `"12"`（非档位区：< 10⁴，maxSig=2 → 2 位有效数字） |
 | `st.metric("A", 1.23456789)` | `"1.23456789"` | `"1.23456789"` | `"1.2"`（2 位有效数字） | `"1.2"` |
-| `st.metric("A", 999.999)` | `"999.999"` | `"999.999"` | `"1K"`（四舍五入越界到 K 档） | `"1000"`（中文千级无缩写） |
+| `st.metric("A", 999.999)` | `"999.999"` | `"999.999"` | `"1K"`（四舍五入后恰好等于 K 档阈值 → 进位） | `"1000"`（非档位区：< 10⁴，不缩写，四舍五入到整数） |
 | `st.metric("A", None)` | `"—"` | `"—"` | `"—"` | `"—"` |
 | `st.metric("A", "70 °F")` | `"70 °F"` | `"70 °F"` | `"70 °F"`（非数字，format 忽略） | `"70 °F"`（非数字，format 忽略） |
 
 > **重要区分一**：`format` 参数的默认值 `None` ≠ `formatNumber(..., undefined)`。`formatNumber` 在 `format=undefined` 时会使用 numbro 做自动精度格式化（如 `1234.56789` → `"1234.5679"`，保留 4 位有效小数），但 **Metric 组件** 在 `format` 未传入时根本不会调用 `formatNumber`，直接走原始字符串分支（显示 `"1234.56789"`）。这是有意为之的设计：保证向后兼容，不改变老版本用户既有的显示效果。
 >
-> **重要区分二**：`format="compact"` 走的是 **Intl.NumberFormat `notation:"compact"`**，与 numbro 的 "averageFormat" 缩写逻辑完全不同。其缩写规则（K/M/B vs. 万/亿）由浏览器 locale 决定，且精度策略为 **2 位有效数字**（`maximumSignificantDigits = 2`），这是浏览器 Intl 的默认值，Python 端无法覆盖。
+> **重要区分二**：`format="compact"` 走的是 **Intl.NumberFormat `notation:"compact"`**，与 numbro 的 "averageFormat" 缩写逻辑完全不同。其行为由两层 locale 数据共同决定：① **CLDR 档位阈值**（en-US 是千进制 10³/10⁶/10⁹，zh-CN 是万进制 10⁴/10⁸）决定是否缩写；② **档位区精度策略**（maxSig=2 2 位有效数字）vs **非档位区精度策略**（maxFracDigits=0 四舍五入到整数）。这两层都由浏览器 Intl + CLDR locale 数据决定，Python 端无法覆盖。
 >
 > **为什么 `12.3456789` 显示为 `"12"`？**
-> `Intl.NumberFormat` 在 `notation:"compact"` 下，`resolvedOptions()` 揭示的默认配置为 `{ minimumSignificantDigits: 1, maximumSignificantDigits: 2 }`。Streamlit 在 [formatNumber.ts:173-176](file:///d:/fz/0601/solo-dogfeeding/code/235-streamlit/frontend/lib/src/util/formatNumber.ts#L173-L176) 调用时 **没有传入任何精度参数**，完全使用浏览器默认。于是 `12.3456789` 被四舍五入到 2 位有效数字 → `"12"`；`1.23456789` → `"1.2"`；`1234.56789` → `"1.2K"`。
+> 所有 locale 下 12.3456789 都远低于各自最低档位阈值（en-US ≥ 1000、zh-CN ≥ 10000）→ 落入非档位区。非档位区对个位数/两位数按 `maxSig=2` 的有效数字处理（因为两位数本身刚好 2 位有效数字，且无小数位）→ `"12"`。Streamlit 在 [formatNumber.ts:173-176](file:///d:/fz/0601/solo-dogfeeding/code/235-streamlit/frontend/lib/src/util/formatNumber.ts#L173-L176) 调用时 **没有传入任何精度参数**，完全使用浏览器默认。
+>
+> **为什么 zh-CN 下 `1234.56789` 显示为 `"1235"` 而不是 `"1.2K"`？**
+> ① zh-CN 的 compact 最低档位阈值是 **10⁴ (万)**，1234.56789 < 10000 → 非档位区 → **不缩写**；② 非档位区精度规则为 `maxFractionDigits=0`（四舍五入到整数）；③ 1234.56789 四舍五入到整数 → `"1235"`。对比 en-US：1234.56789 ≥ 10³ (K 阈值) → 档位区 → 2 位有效数字 + K → `"1.2K"`。两者差异完全来自 locale 档位阈值不同。
 
 最终展示时，`formattedMetricValue` / `formattedDelta` 会被传入 `<StreamlitMarkdown>` 组件渲染（参考 [Metric.tsx:367-373](file:///d:/fz/0601/solo-dogfeeding/code/235-streamlit/frontend/lib/src/components/elements/Metric/Metric.tsx#L367-L373) 和 [Metric.tsx:396-402](file:///d:/fz/0601/solo-dogfeeding/code/235-streamlit/frontend/lib/src/components/elements/Metric/Metric.tsx#L396-L402)），支持有限的 Markdown 语法（粗体、斜体、内联代码、链接等），但禁止原始 HTML。
 
@@ -664,8 +685,13 @@ Metric 组件渲染
    - 后端只保证数字→可被解析的字符串，**不做本地化**
    - 前端本地化/单位化格式化统一走浏览器 `Intl.NumberFormat`（通过 `navigator.languages` 取浏览器语言，失败回退默认 locale），核心辅助函数为 `formatIntlNumberWithLocales()`
    - **`compact` / `scientific` / `engineering` / `bytes`** 全部通过 Intl 的 `notation` 选项实现，缩写规则由 locale 决定（`en-US` 为 K/M/B，`zh-CN` 为万/亿）
-   - **精度策略差异至关重要**：
-     - `compact` 使用 **浏览器默认 `maximumSignificantDigits = 2`**（2 位有效数字），Streamlit 未传任何精度参数 → `12.3456789` 显示为 `"12"`，而非 `"12.35"` 或 `"12.3456789"`
+   - **`compact` 精度策略是最复杂的 locale 依赖项**：
+     - 不是简单的 "2 位有效数字"，而是 **CLDR locale 档位驱动的动态精度**
+     - 档位阈值由 locale 的 CLDR 数据决定：`en-US` 为千进制 (10³/10⁶/10⁹)，`zh-CN` 为万进制 (10⁴/10⁸)
+     - **档位区（≥ 阈值）**：`maxSig=2` 2 位有效数字 + 缩写后缀（如 `1234.56789` en-US → `"1.2K"`，zh-CN `12345.6789` → `"1.2万"`）
+     - **非档位区（< 阈值）**：`maxFracDigits=0` 四舍五入到整数，不缩写（如 `1234.56789` zh-CN → `"1235"`，因为 < 10⁴）
+     - Streamlit 调用时 **不传入任何精度参数**，完全使用浏览器 Intl + CLDR 的默认行为
+   - **其它 format 精度对比**：
      - `bytes` Streamlit 显式指定 `maximumFractionDigits: 1`（1 位小数）→ `12.3456789` 显示为 `"12.3B"`
      - `scientific` / `engineering` 使用默认 `maximumFractionDigits: 3` → `12.3456789` 显示为 `"1.235E1"` / `"12.346E0"`
      - 货币类（dollar/euro 2 位，yen 0 位）Streamlit 显式锁定精度，跨 locale 一致
