@@ -303,7 +303,7 @@ Streamlit 支持**静态部署**（Static App）模式：将应用的全部状�
 
 ```typescript
 export async function establishStaticConnection(
-    staticAppId: string,                      // 从 URL 参数 ?staticAppId=xxx 获取
+    staticAppId: string,
     onConnectionStateChange: OnConnectionStateChange,
     onMessage: OnMessage,
     onConnectionError: (message: ErrorDetails) => void,
@@ -311,16 +311,29 @@ export async function establishStaticConnection(
 ): Promise<void> {
     onConnectionStateChange(ConnectionState.STATIC_CONNECTING)
 
-    // Step 1: 获取静态配置 URL（S3 bucket 地址）
+    // Step 1: await — 等待静态配置 URL 返回
     const staticConfigUrl = await getStaticConfig()
-    endpoints.setStaticConfigUrl(staticConfigUrl)  // 保存到 endpoints，供后续 URL 构建使用
+    endpoints.setStaticConfigUrl(staticConfigUrl)
 
-    // Step 2: 从 S3 加载序列化的 protobuf 消息并渲染
-    dispatchAppForwardMessages(staticAppId, staticConfigUrl, onMessage, onConnectionError)
+    // Step 2: 没有 await！fire-and-forget
+    // eslint-disable-next-line @typescript-eslint/no-floating-promises
+    dispatchAppForwardMessages(
+        staticAppId,
+        staticConfigUrl,
+        onMessage,
+        onConnectionError
+    )
 
+    // Step 3: 立即切换为 STATIC_CONNECTED，不等待 protobuf 加载完成
     onConnectionStateChange(ConnectionState.STATIC_CONNECTED)
 }
 ```
+
+**关键发现**：`dispatchAppForwardMessages()` 是一个返回 `Promise<void>` 的异步函数，但在调用时**没有 `await`**。eslint 注释 `@typescript-eslint/no-floating-promises` 也确认了这是有意为之的 fire-and-forget 调用。这意味着：
+
+- `STATIC_CONNECTED` 状态在 `dispatchAppForwardMessages` 调用发起后**立即**切换
+- protobuf 消息的加载和解码在后台异步进行
+- 消息分发完成时，状态已经是 `STATIC_CONNECTED`
 
 ### 4.3 静态配置 URL 的获取与缓存
 
@@ -464,7 +477,7 @@ export const StreamlitConfig = {
 
 | 维度 | 开发态 (developmentMode=True) | 生产态 (developmentMode=False) |
 |---|---|---|
-| 核心前端资产来源 | Vite Dev Server 提供（端口 5173） | 后端 Python 通过 `Mount` 挂载 `static/` 目录 |
+| 核心前端资产来源 | Vite Dev Server 提供（默认端口 3000） | 后端 Python 通过 `Mount` 挂载 `static/` 目录 |
 | 路由存在性 | `create_streamlit_static_assets_routes()` 不添加 | `create_streamlit_static_assets_routes()` 被调用，挂载到 `/` |
 | CORS 策略 | 允许所有跨域请求（`*`），因为 Vite 和后端端口不同 | 根据 `server.enableCORS` 和 `server.corsAllowedOrigins` 严格控制 |
 | Host Config | 自动添加 `http://localhost` 到 `allowedOrigins` | 仅使用配置的 `client.allowedOrigins` |
@@ -520,7 +533,7 @@ def allow_all_cross_origin_requests() -> bool:
     )
 ```
 
-开发模式下，Vite Dev Server（默认 5173 端口）和 Python 后端（默认 8501 端口）是两个不同的源，浏览器会对跨域请求执行预检，因此需要放开 CORS 限制。
+开发模式下，Vite Dev Server（默认 3000 端口）和 Python 后端（默认 8501 端口）是两个不同的源，浏览器会对跨域请求执行预检，因此需要放开 CORS 限制。
 
 #### 5.2.3 Host Config 差异
 
@@ -538,39 +551,59 @@ async def _host_config_endpoint(request: Request) -> JSONResponse:
 
 ### 5.3 前端 Vite 代理配置（开发态特有）
 
-开发模式下，Vite Dev Server 配置了代理规则，将非前端资源的请求转发到 Python 后端（默认 `localhost:8501`）：
+开发模式下，Vite Dev Server 配置了代理规则，将非前端资源的请求转发到 Python 后端（默认 `http://localhost:8501`）：
 
 ```javascript
 // [vite.config.ts#L156-L191]
-const proxy: ProxyOptions = {
-    target: `http://localhost:${backEndPort}`,
-    ws: true,  // WebSocket 也代理
-    changeOrigin: true,
-    xfwd: true,
-}
+// DEV_SERVER_BACKEND_URL 默认 "http://localhost:8501"
+// DEV_SERVER_PORT 默认 3000（通过 VITE_PORT 或 PORT 环境变量覆盖）
 
 server: {
+    open: true,
+    port: DEV_SERVER_PORT,  // 默认 3000
+    host: true,
     proxy: {
-        // 1. 内部 API 全部代理
-        "^.*/_stcore/.*": proxy,
-        // 2. 媒体文件代理（排除 Vite 自己的 static/media）
-        "^(?!.*/static/media).*/media/.*": proxy,
+        // 1. 内部 API 全部代理（含 WebSocket）
+        "^.*/_stcore/.*": {
+            target: DEV_SERVER_BACKEND_URL,
+            changeOrigin: true,
+            ws: true,  // WebSocket 也代理
+        },
+        // 2. 媒体文件代理（用负向前瞻排除 Vite 的 /static/media/ 字体目录）
+        "^(?!.*/static/media).*/media/.*": {
+            target: DEV_SERVER_BACKEND_URL,
+            changeOrigin: true,
+        },
         // 3. 自定义组件代理
-        "^.*/component/.*": proxy,
+        "^.*/component/.*": {
+            target: DEV_SERVER_BACKEND_URL,
+            changeOrigin: true,
+        },
         // 4. App 静态文件代理
-        "^.*/app/static/.*": proxy,
+        "^.*/app/static/.*": {
+            target: DEV_SERVER_BACKEND_URL,
+            changeOrigin: true,
+        },
         // 5. 认证路由代理
-        "^.*/auth/.*": proxy,
+        "^.*/auth/.*": {
+            target: DEV_SERVER_BACKEND_URL,
+            changeOrigin: true,
+        },
+        // 6. OAuth 回调代理
+        "^.*/oauth2callback": {
+            target: DEV_SERVER_BACKEND_URL,
+            changeOrigin: true,
+        },
     },
 }
 ```
 
-代理规则使用正则表达式，巧妙地将 Vite 自己的 `static/media` 路径排除，避免冲突。
+代理规则使用正则表达式，巧妙地将 Vite 自己的 `/static/media/` 路径排除（负向前瞻 `(?!.*/static/media)`），避免字体等 Vite 管理的资源被误转发到后端。
 
 ### 5.4 入口切换逻辑
 
 前端入口通过 `ConnectionManager` 在运行时动态判断连接类型，不直接区分 dev/prod。但由于：
-- 开发态：`window.location` 指向 Vite 端口（5173），代理透明转发
+- 开发态：`window.location` 指向 Vite 端口（默认 3000），代理透明转发
 - 生产态：`window.location` 指向后端服务端口，直接请求后端
 
 因此前端代码不需要做显式的 dev/prod 判断，完全由后端的配置和 Vite 的代理机制透明处理。
@@ -707,18 +740,20 @@ public onHeartbeatSent(ackTimeoutMilliseconds: number): void {
 
 ### 6.4 静态连接时序
 
-静态连接的状态转移简单直接，无重连逻辑：
+静态连接的状态转移需要注意一个关键细节：`dispatchAppForwardMessages()` 是 fire-and-forget 调用。
 
 ```
 INITIAL
    │ connect() 检测到 staticAppId
    ▼
 STATIC_CONNECTING
-   │ getStaticConfig() 获取 S3 地址
-   │ dispatchAppForwardMessages() 加载 protobuf
-   │ STATIC_CONNECTED 事件
+   │ await getStaticConfig()     ← 等待 S3 配置地址返回
+   │ setStaticConfigUrl()        ← 设置到 endpoints
+   │ dispatchAppForwardMessages()← 发起但**不等待**（fire-and-forget）
+   │                                 protobuf 在后台异步加载
    ▼
-STATIC_CONNECTED
+STATIC_CONNECTED                 ← dispatch 调用后立即切换
+                                    此时 protobuf 消息可能尚未解码完成
 ```
 
 时序代码在 [establishStaticConnection()](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/StaticConnection.tsx#L125-L150)：
@@ -727,16 +762,20 @@ STATIC_CONNECTED
 export async function establishStaticConnection(...): Promise<void> {
     onConnectionStateChange(ConnectionState.STATIC_CONNECTING)
 
-    // Step 1: 获取静态配置（S3 地址）
+    // Step 1: await — 确实等待配置获取
     const staticConfigUrl = await getStaticConfig()
     endpoints.setStaticConfigUrl(staticConfigUrl)
 
-    // Step 2: 加载并分发 protobuf 消息
+    // Step 2: 没有 await — fire-and-forget
+    // eslint-disable-next-line @typescript-eslint/no-floating-promises
     dispatchAppForwardMessages(staticAppId, staticConfigUrl, onMessage, onConnectionError)
 
+    // Step 3: 立即切换，不等待 Step 2 完成
     onConnectionStateChange(ConnectionState.STATIC_CONNECTED)
 }
 ```
+
+这种设计的原因是：`onMessage` 回调会触发 React 状态更新和组件渲染，这些操作本身就是在事件循环中异步排队的。将状态先切为 `STATIC_CONNECTED`，可以让 UI 层在收到第一条消息时就已经处于"已连接"状态，避免渲染时序问题。
 
 ### 6.5 状态转移的安全边界
 
@@ -768,18 +807,25 @@ switch (this.state) {
 开发模式下，`global.developmentMode=True`，核心前端资产由 Vite 提供，后端不提供。完整的分流链路：
 
 ```
-浏览器访问 http://localhost:5173
+浏览器访问 http://localhost:3000 (Vite Dev Server)
     │
-    ├─ /static/js/index.xxx.js (Vite 直接提供，带 HMR)
-    ├─ /node_modules/... (Vite 直接提供)
+    ├─ /index.html               → Vite 直接提供（HTML 入口）
+    ├─ /src/...                   → Vite 直接提供（带 HMR 热更新）
+    ├─ /@id/... / /node_modules/  → Vite 直接提供（依赖预构建）
+    ├─ /static/media/...          → Vite 直接提供（字体等构建产物）
     │
-    └─ /_stcore/health  ──┐
-       /media/xxx.png     │ Vite 代理转发
-       /component/...     │ 到 Python 后端
-       /app/static/...    │ http://localhost:8501
-       /_stcore/upload    │
-       /_stcore/stream    │ (WebSocket 也代理)
-                        ──┘
+    └─ 以下路径由 Vite 代理转发到 http://localhost:8501（Python 后端）：
+        /_stcore/health            → 后端健康检查
+        /_stcore/host-config       → 后端主机配置
+        /_stcore/stream            → WebSocket 连接（ws: true 代理）
+        /_stcore/upload_file/...   → 文件上传（PUT/DELETE）
+        /_stcore/metrics           → 指标采集
+        /_stcore/bidi-components/  → 双向组件
+        /media/xxx.png             → 媒体文件（排除 /static/media/）
+        /component/...             → 自定义组件
+        /app/static/...            → App 用户静态文件
+        /auth/...                  → 认证路由
+        /oauth2callback            → OAuth 回调
 ```
 
 ### 7.2 生产模式的代码分流路径
@@ -985,25 +1031,94 @@ async def _set_upload_headers(request: Request, response: Response) -> None:
 
 ### 8.7 前端配合的安全措施
 
-前端发送上传请求时也会注入 XSRF Header：
+前端上传使用 **axios**（非 `fetch`），通过 `csrfRequest()` 封装方法统一处理 XSRF 和凭证：
 
 ```typescript
-// [DefaultStreamlitEndpoints.ts#L382-L402]
-public async uploadFile(...): Promise<Response> {
-    const xsrfToken = this.getXsrfToken()  // 从 Cookie 读取
-    const headers: Record<string, string> = {}
-    if (xsrfToken) {
-        headers["X-Xsrftoken"] = xsrfToken  // 注入 Header
-    }
+// [DefaultStreamlitEndpoints.ts#L269-L310]
+public async uploadFileUploaderFile(
+    fileUploadUrl: string,
+    file: File,
+    _sessionId: string,
+    onUploadProgress?: (progressEvent: AxiosProgressEvent) => void,
+    signal?: AbortSignal
+): Promise<void> {
+    const form = new FormData()
+    form.append(name, file, fileName)
 
-    return await fetch(url, {
+    const headers: Record<string, string> = this.getAdditionalHeaders()
+    const uploadUrl = this.buildFileUploadURL(fileUploadUrl)
+
+    // 通过 csrfRequest 发送，自动注入 XSRF 头
+    await this.csrfRequest<number>(uploadUrl, {
+        signal,
         method: "PUT",
+        data: form,
+        responseType: "text",
         headers,
-        body: formData,
-        credentials: "same-origin",  // 发送 Cookie
+        onUploadProgress,
+    })
+}
+
+// [DefaultStreamlitEndpoints.ts#L327-L355]
+public async deleteFileAtURL(
+    fileUrl: string,
+    sessionId: string
+): Promise<void> {
+    const headers: Record<string, string> = this.getAdditionalHeaders()
+    const deleteUrl = this.buildFileUploadURL(fileUrl)
+
+    // DELETE 同样通过 csrfRequest
+    await this.csrfRequest<number>(deleteUrl, {
+        method: "DELETE",
+        data: { sessionId },
+        headers,
     })
 }
 ```
+
+**`csrfRequest()` 是核心封装**（[DefaultStreamlitEndpoints.ts#L382-L402](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/DefaultStreamlitEndpoints.ts#L382-L402)）：
+
+```typescript
+private async csrfRequest<T = unknown, R = AxiosResponse<T>>(
+    url: string,
+    params: AxiosRequestConfig
+): Promise<R> {
+    params.url = url
+
+    if (this.csrfEnabled) {
+        // 1. 从 Cookie 读取 _streamlit_xsrf 的值
+        const xsrfCookie = getCookie("_streamlit_xsrf")  // 使用 document.cookie 正则匹配
+        if (notNullOrUndefined(xsrfCookie)) {
+            // 2. 注入 X-Xsrftoken Header
+            params.headers = {
+                "X-Xsrftoken": xsrfCookie,
+                ...params.headers,
+            }
+            // 3. 启用跨域凭证发送（axios 语法，等价于 fetch 的 credentials: "include"）
+            params.withCredentials = true
+        }
+    }
+
+    // 4. 动态 import axios，避免在首屏 bundle 中引入
+    const { default: axios } = await import("axios")
+    return axios.request<T, R>(params)
+}
+```
+
+关键细节：
+- **HTTP 客户端**：使用 **axios**（非 `fetch`），通过动态 `import("axios")` 按需加载
+- **XSRF Cookie 名**：`_streamlit_xsrf`（与后端 `XSRF_COOKIE_NAME` 一致）
+- **Header 名**：`X-Xsrftoken`（与后端 `request.headers.get("X-Xsrftoken")` 一致）
+- **凭证模式**：`withCredentials: true`（axios 语法，等价于 `fetch` 的 `credentials: "include"`，**不是** `"same-origin"`）
+- **`csrfEnabled` 标志**：在 [App.tsx](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/app/src/App.tsx#L432-L434) 中硬编码为 `true`：
+  ```typescript
+  this.endpoints = new DefaultStreamlitEndpoints({
+      csrfEnabled: true,  // 始终启用
+      // ...
+  })
+  ```
+- **`getCookie()` 实现**：通过 `document.cookie` 正则匹配读取（[browser/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/utils/src/browser/index.ts#L20-L23)）
+- **额外 Headers**：如果 `fileUploadClientConfig` 存在（外部上传服务场景），会合并额外的 headers
 
 ### 8.8 安全边界总结
 
@@ -1026,7 +1141,7 @@ public async uploadFile(...): Promise<Response> {
 | 媒体文件 | `Route` 精确匹配 `/media/{file_id}` | CORS + `Content-Disposition` 处理 | *(未设置)* |
 | 自定义组件 v1/v2 | `Route` 匹配 `/component/{name}/{path:path}` | `build_safe_abspath` 做路径规范化 + 根目录校验 | HTML: `no-cache`；其他: `public` |
 | App 用户静态文件 | `Route` 匹配 `/app/static/{path:path}` | `build_safe_abspath` + 文件大小限制 200MB + `X-Content-Type-Options: nosniff` | *(未设置)* |
-| 文件上传 | `Route` 匹配 `/_stcore/upload_file/{session_id}/{file_id}` | 快速路径跳过 `is_unsafe_path_pattern` + 五层安全边界（UNC+XSRF+会话+大小+CORS） | *(未设置)* |
+| 文件上传 | `Route` 匹配 `/_stcore/upload_file/{session_id}/{file_id}` | 快速路径跳过 `is_unsafe_path_pattern` + 五层安全边界（UNC+XSRF+会话+大小+CORS），前端通过 axios `csrfRequest()` 自动注入 `X-Xsrftoken` 头并设置 `withCredentials: true` | *(未设置)* |
 
 ### 9.2 关键安全边界的代码定位
 
