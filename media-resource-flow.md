@@ -177,19 +177,19 @@ marshall_video() 字幕处理分支 [media.py L611-L640]
         │
         ▼
 process_subtitle_data() [subtitle_utils.py L148-L175]
-  ┌─ [格式归一化层] 决定 kind，统一为 VTT bytes
+  ┌─ [格式归一化层] 统一为 VTT bytes
   │   • str/Path → _handle_string_or_path_data()
   │   • BytesIO → _handle_stream_data()
   │   • bytes → _handle_bytes_data()
   │   • SRT 检测 (_is_srt) → _srt_to_vtt() 自动转换
   │   • 最终统一为 WebVTT 格式的 bytes
   │
-  └─ [Manager 协调层] 注册到媒体管理器
-      • kind = MEDIA（由 Manager 决定，字幕按普通媒体处理）
-      • media_file_mgr.add(subtitle_bytes, "text/vtt", subtitle_coord, filename)
-        ├─ [Storage] load_and_get_id() → 存内容 + 算 file_id
-        ├─ [Manager] 记录 _file_metadata 和 session 引用
-        └─ [Storage] get_url(file_id) → 返回 /media/{file_id}.vtt
+  └─ [Manager 协调层] 注册到媒体管理器（字幕先到 Manager，不直接进 Storage）
+      • 调用 media_file_mgr.add(subtitle_bytes, "text/vtt", subtitle_coord, filename)
+      ├─ [Manager] is_for_static_download 默认为 False → kind = MEDIA
+      ├─ [Storage] load_and_get_id() → 存内容 + 算 file_id
+      ├─ [Manager] 记录 _file_metadata 和 session 引用
+      └─ [Storage] get_url(file_id) → 返回 /media/{file_id}.vtt
         │
         ▼
 返回字幕 URL → 赋值给 proto.subtitles[i].url → WebSocket 发送到前端
@@ -215,7 +215,9 @@ process_subtitle_data() [subtitle_utils.py L148-L175]
 
 3. **mimetype 固定**：无论输入是 SRT 还是 VTT，最终注册时 `mimetype = "text/vtt"`，保证浏览器端 `<track>` 标签能正确解析。
 
-4. **多层复用**：字幕注册的核心路径（`media_file_mgr.add()` → Storage）与图片、音频、视频完全一致，只是在调用 `add()` 之前多了一步格式归一化。
+4. **资源流向一致**：字幕数据先经 `media_file_mgr.add()` 进入 Manager 层，再由 Manager 委托 Storage 存储内容，与图片/音频/视频完全走同一链路。
+
+5. **多层复用**：字幕注册的核心路径（`media_file_mgr.add()` → Storage）与图片、音频、视频完全一致，只是在调用 `add()` 之前多了一步格式归一化。
 
 ---
 
@@ -549,7 +551,7 @@ return <StyledAudio
      ))}
    </StyledVideo>
    ```
-   - 字幕的 URL 同样走 `buildMediaURL()`，因为字幕文件也注册到 Storage 中
+   - 字幕的 URL 同样走 `buildMediaURL()`，因为字幕数据先经 Manager 注册，再由 Storage 存储
    - 因为 `<track>` 没有 onerror 事件，字幕加载失败通过 `fetch()` 主动探测
 
 ---
@@ -575,7 +577,7 @@ return <StyledAudio
 
 1. **内容寻址去重**：file_id = hash(content + mimetype + filename)，由 Storage 层计算，相同内容的媒体文件在服务端只存一份，跨 session 共享。
 2. **二进制与控制信令分离**：protobuf 只传 URL 和元数据，大体积二进制走独立 HTTP 通道，避免 WebSocket 消息过大。
-3. **Manager 协调、Storage 执行**：`MediaFileManager.add()` 是写入路径的唯一入口，但 file_id 生成、内容存储、URL 构造全部委托给 Storage，Manager 只负责生命周期管理（session 引用追踪、孤儿清理、线程安全）。
+3. **Manager 协调、Storage 执行**：`MediaFileManager.add()` 是所有媒体（图片、音频、视频、字幕）写入路径的唯一入口，file_id 生成、内容存储、URL 构造全部委托给 Storage，Manager 只负责生命周期管理（session 引用追踪、孤儿清理、线程安全）。字幕数据同样先进入 Manager，再由 Manager 委托 Storage 落内容。
 4. **Session 引用计数清理**：`_files_by_session_and_coord` 追踪每个 session 在用哪些 file；脚本重跑或 session 断开后，`remove_orphaned_files()` 基于 Manager 自身的 `_file_metadata` 计算孤儿集合，再通知 Storage 删除。
 5. **部分哈希优化**：>1 MiB 文件只取头尾中段各 64 KiB 计算指纹，权衡碰撞概率与性能。
 6. **HTTP Range 支持**：视频无需完整下载即可拖动进度条播放，响应 `206 Partial Content`。
