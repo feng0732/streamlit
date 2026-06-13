@@ -662,7 +662,7 @@ handleSessionStatusChanged(statusChangeProto)
     └─→ scriptIsRunning=true 时重置 scriptChangedOnDisk=false
 ```
 
-**与 `new_session` 的关系**：`new_session.initialize.session_status` 中也会携带同样的运行状态，并在 `handleInitialization()` 中调用 `handleSessionStatusChanged()`。所以**首次连接时是 `new_session` 间接触发状态更新，而不是单独的 `session_status_changed` 消息**。
+**与 `new_session` 的关系**：`new_session.initialize.session_status` 中也会携带同样的运行状态，并在 `handleInitialization()` 中调用 `handleSessionStatusChanged()`。同时，独立的 `session_status_changed` 消息也会在 `SCRIPT_STARTED` 事件处理末尾发送（排在 `new_session` 之后）。所以**首次连接时，`new_session` 通过 `handleInitialization` 先触发状态更新，独立的 `session_status_changed` 消息随后到达并执行幂等操作**。
 
 ### 8.4 `script_finished` 消息详解
 
@@ -758,25 +758,47 @@ handleConnectionStateChanged(CONNECTED)
 
 ### 9.3 场景三：正常运行（无中断）
 
-**消息顺序的严格保证**：
+**消息顺序的严格保证** [app_session.py#L688-L766](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/lib/streamlit/runtime/app_session.py#L688-L766)：
 ```
 [1] new_session (script_run_id=A, scriptIsRunning=true)
 [2] delta (type=add_block, 创建 st.status 容器)
 [3] delta (type=new_element, status.write 内容 1)
 [4] delta (type=add_block, status.update(label="..."))
 [5] delta (type=new_element, status.write 内容 2)
-[6] session_status_changed (scriptIsRunning=false)  ← 发送在 script_finished 之前
-[7] script_finished (FINISHED_SUCCESSFULLY)
+[6] script_finished (FINISHED_SUCCESSFULLY)                ← 先发 script_finished
+[7] session_status_changed (scriptIsRunning=false)          ← 后发 session_status_changed
 ```
 
+**后端发送顺序详解**：
+
+在 `_on_scriptrunner_event` 函数中处理 `SCRIPT_STOPPED_WITH_SUCCESS` 事件时：
+
+```python
+prev_state = self._state  # = APP_IS_RUNNING
+
+# 处理停止事件
+self._state = AppSessionState.APP_NOT_RUNNING               # 1. 状态变更
+self._enqueue_forward_msg(self._create_script_finished_message(status))  # 2. 先发 script_finished
+
+# ... 其他处理（更新 watched modules 等）
+
+# 函数末尾检测状态变化
+app_was_running = prev_state == AppSessionState.APP_IS_RUNNING  # = True
+app_is_running = self._state == AppSessionState.APP_IS_RUNNING  # = False
+if app_is_running != app_was_running:
+    self._enqueue_forward_msg(self._create_session_status_changed_message())  # 3. 后发 session_status_changed
+```
+
+关键：`session_status_changed` 的发送逻辑在**函数末尾**，在所有事件类型处理完成之后统一执行。所以 `script_finished` 先入队，`session_status_changed` 后入队。
+
 **边界条件**：
-- `session_status_changed` 与 `script_finished` 在同一处理函数中被同步 enqueue，顺序由 Python 代码保证
-- 前端按接收顺序处理。收到消息 [6] 时 scriptRunState 变为 NOT_RUNNING，但**此时还没有清理旧节点**（要到消息 [7] 才触发 clearStaleNodes）
-- 在 [6] 和 [7] 之间，用户看到：顶部状态栏显示"Not Running"，页面内状态容器已显示最终 complete 状态，但节点尚未清理（视觉上无差异）
+- 前端按接收顺序处理。收到消息 [6] 时先执行 `clearStaleNodes()` 清理旧节点，但**此时 scriptRunState 还是 RUNNING**（要到消息 [7] 才更新为 NOT_RUNNING）
+- 在 [6] 和 [7] 之间，用户看到：页面已清理旧节点，顶部状态栏仍显示"Running"
+- 这是一个短暂的中间窗口，通常在毫秒级别，用户几乎感知不到
 
 **状态容器的正常完成边界**：
 - 若 `with st.status()` 块中出现未捕获异常，`__exit__` 将状态置为 `error`，此时 `script_finished` 可能仍是 `FINISHED_SUCCESSFULLY`（如果异常在 Streamlit 捕获范围内，脚本整体仍算成功）
-- 顶部状态栏显示 NOT_RUNNING，页面内 status 容器显示 error 图标，两者反映不同层面的状态
+- 顶部状态栏变为 NOT_RUNNING，页面内 status 容器显示 error 图标，两者反映不同层面的状态
 
 ### 9.4 场景四：脚本重跑清理
 
@@ -822,7 +844,163 @@ rerunScript()
 - 旧的 status 容器（run-1）在 T2 到 T4 之间仍然显示，直到新脚本在同 delta_path 上创建新的 status 容器（run-2）把它覆盖
 - 如果新脚本不再创建该 status 容器（代码改了），则该旧节点会一直保留到 T5，被 `clearStaleNodes(run-2)` 作为过期节点清除
 
-### 9.5 跨场景的共享边界条件
+### 9.5 三种场景的顶部状态栏更新来源对比
+
+顶部状态栏（StatusWidget）的核心状态是 `scriptRunState`（RUNNING / NOT_RUNNING / RERUN_REQUESTED 等）和 `connectionState`（CONNECTED / PINGING_SERVER 等）。不同场景下，驱动 `scriptRunState` 更新的消息来源**完全不同**。
+
+**核心判断条件** [App.tsx#L1365-L1368](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/app/src/App.tsx#L1365-L1368)：
+```typescript
+if (!this.sessionInfo.isSet || !this.sessionInfo.current.isConnected) {
+  this.handleInitialization(newSessionProto)
+}
+```
+
+只有当 `sessionInfo.isSet == false`（首次初始化）或 `isConnected == false`（重连后）时，才会调用 `handleInitialization()`，进而通过 `new_session` 中的 `initialize.session_status` 间接更新 `scriptRunState`。普通运行场景不满足此条件。
+
+---
+
+#### 场景 1：首次初始化
+
+**阶段一：WebSocket 连接阶段**
+```
+connectionState 变化:
+INITIAL → CONNECTING → PINGING_SERVER → CONNECTED
+       ↓            ↓                 ↓
+handleConnectionStateChanged() 每次变更都被 flushSync 强制同步
+       ↓
+StatusWidget 显示连接状态信息（"Connecting..."、"Pinging Server..."）
+```
+此时 `scriptRunState` 仍为初始值，StatusWidget 由 `connectionState` 驱动。
+
+**阶段二：收到 new_session 消息**
+```
+handleNewSession(newSession)
+    ├─→ !sessionInfo.isSet → true（首次）
+    │
+    └─→ handleInitialization(newSession)
+          ├─→ sessionInfo.setCurrent(...)  ← 标记为已初始化
+          └─→ handleSessionStatusChanged(initialize.sessionStatus)
+                └─→ scriptRunState = RUNNING 或 NOT_RUNNING
+```
+
+**来源汇总（首次初始化）：**
+| 阶段 | 驱动消息/事件 | 效果 |
+|------|-------------|------|
+| 连接中 | `connectionState` 变更 | 显示连接状态 |
+| 脚本开始 | `new_session.initialize.session_status` | 间接触发 `handleSessionStatusChanged()` → `RUNNING` |
+| 脚本结束 | 独立的 `session_status_changed(scriptIsRunning=false)` | `NOT_RUNNING` |
+
+注意：首次初始化时，**也会**收到独立的 `session_status_changed(scriptIsRunning=true)` 消息，但它排在 `new_session` 之后到达。由于前端在处理 `new_session` 时已通过 `handleInitialization()` 将 `scriptRunState` 设为 `RUNNING`，后续收到同样状态的 `session_status_changed` 是幂等操作，没有实际效果。因此脚本开始时的 RUNNING 状态**第一次**是由 `new_session.initialize.session_status` 设置的。
+
+---
+
+#### 场景 2：断连后重连
+
+**阶段一：断连检测**
+```
+connectionState → PINGING_SERVER
+    ↓
+handleConnectionStateChanged(PINGING_SERVER)
+    ├─→ sessionInfo.disconnect()  ← isConnected 设为 false
+    └─→ flushSync 同步更新 connectionState
+          ↓
+StatusWidget 显示 "Pinging Server..."（由 connectionState 驱动）
+```
+
+**阶段二：重连成功**
+```
+connectionState → CONNECTED
+    ↓
+handleConnectionStateChanged(CONNECTED)
+    ├─→ 判断是否需要重跑脚本（5 种条件）
+    │     └─→ 需要重跑：sendUpdateWidgetsMessage() 触发后端脚本运行
+    │
+    └─→ flushSync 同步更新 connectionState
+          ↓
+StatusWidget 不再显示连接状态
+```
+
+**阶段三：后端脚本开始，发送 new_session**
+```
+handleNewSession(newSession)
+    ├─→ sessionInfo.current.isConnected → false（断连时被置为 false）
+    │
+    └─→ handleInitialization(newSession)
+          ├─→ sessionInfo.setCurrent(...)  ← isConnected 设为 true
+          └─→ handleSessionStatusChanged(initialize.sessionStatus)
+                └─→ scriptRunState = RUNNING
+```
+
+**来源汇总（断连后重连）：**
+| 阶段 | 驱动消息/事件 | 效果 |
+|------|-------------|------|
+| 断连中 | `connectionState` 变更 | 显示连接状态 |
+| 重连成功 | `connectionState → CONNECTED` | 清除连接状态显示 |
+| 脚本开始 | `new_session.initialize.session_status` | 间接触发 `handleSessionStatusChanged()` → `RUNNING` |
+| 脚本结束 | 独立的 `session_status_changed(scriptIsRunning=false)` | `NOT_RUNNING` |
+
+重连场景与首次初始化非常类似，区别在于：
+- 断连时 `sessionInfo.isSet` 仍为 true，但 `isConnected` 被置为 false
+- 重连后走 `handleInitialization()` 是因为 `isConnected` 为 false，而非 `isSet` 为 false
+- 重连后可能触发脚本重跑（带 Widget 当前值），也可能不触发
+
+---
+
+#### 场景 3：普通运行（非首次、非重连）
+
+普通运行是最常见的场景：用户点击按钮、勾选复选框、点击 Rerun 按钮等。
+
+**脚本开始时**：
+```
+后端 SCRIPT_STARTED 事件:
+1. self._state = APP_IS_RUNNING
+2. 发送 new_session 消息
+3. 函数末尾检测到状态变化 → 发送独立的 session_status_changed(scriptIsRunning=true)
+
+前端处理:
+1. handleNewSession()
+   ├─→ sessionInfo.isSet = true 且 isConnected = true
+   └─→ 不走 handleInitialization()，scriptRunState 保持不变（或之前的 RERUN_REQUESTED）
+
+2. handleSessionStatusChanged(scriptIsRunning=true)
+   └─→ scriptRunState = RUNNING
+```
+
+**脚本结束时**：
+```
+后端 SCRIPT_STOPPED_WITH_SUCCESS 事件:
+1. self._state = APP_NOT_RUNNING
+2. 发送 script_finished(FINISHED_SUCCESSFULLY)
+3. 函数末尾检测到状态变化 → 发送独立的 session_status_changed(scriptIsRunning=false)
+
+前端处理:
+1. handleScriptFinished(SUCCESSFULLY)
+   └─→ clearStaleNodes() + removeInactiveWidgetState()
+
+2. handleSessionStatusChanged(scriptIsRunning=false)
+   └─→ scriptRunState = NOT_RUNNING
+```
+
+**来源汇总（普通运行）：**
+| 阶段 | 驱动消息/事件 | 效果 |
+|------|-------------|------|
+| 脚本开始 | 独立的 `session_status_changed(scriptIsRunning=true)` | 直接调用 `handleSessionStatusChanged()` → `RUNNING` |
+| 脚本结束 | `script_finished(FINISHED_SUCCESSFULLY)` | 清理节点，但不直接改变 `scriptRunState` |
+| 脚本结束后 | 独立的 `session_status_changed(scriptIsRunning=false)` | 直接调用 `handleSessionStatusChanged()` → `NOT_RUNNING` |
+
+关键区别：**普通运行时，`new_session` 不会改变 `scriptRunState`**，因为不满足 `!sessionInfo.isSet || !isConnected` 的条件。StatusWidget 完全由独立的 `session_status_changed` 消息驱动。
+
+---
+
+**三种场景对比总表：**
+
+| 场景 | 脚本开始时 scriptRunState 更新来源 | 脚本结束时 scriptRunState 更新来源 | 是否走 handleInitialization() |
+|------|---------------------------------|---------------------------------|-----------------------------|
+| 首次初始化 | `new_session.initialize.session_status` | 独立的 `session_status_changed(=false)` | ✅ 是（`!isSet`） |
+| 断连后重连 | `new_session.initialize.session_status` | 独立的 `session_status_changed(=false)` | ✅ 是（`!isConnected`） |
+| 普通运行 | 独立的 `session_status_changed(=true)` | 独立的 `session_status_changed(=false)` | ❌ 否 |
+
+### 9.6 跨场景的共享边界条件
 
 **条件 1：hasReceivedNewSession 守卫**
 - 初始值：`false`
