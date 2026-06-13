@@ -458,9 +458,376 @@ with st.status("Downloading data...", expanded=True) as status:
 
 ---
 
-## 7. 异步反馈原理总结
+## 7. 顶部状态栏与页面内状态容器的消息依赖关系
 
-### 7.1 核心机制
+### 7.1 两套独立但关联的状态系统
+
+Streamlit 存在两套状态反馈系统，它们通过不同的消息类型驱动，但共享相同的脚本生命周期事件：
+
+| 系统 | 组件 | 消息来源 | 显示内容 |
+|------|------|----------|----------|
+| **全局状态栏** | `StatusWidget` | `sessionStatusChanged` / `scriptFinished` / 用户操作 | 整体脚本运行状态、连接状态、重跑提示 |
+| **页面内状态容器** | `st.status` (Expander) | `delta` (add_block / newElement) | 单个任务的运行进度、详细信息 |
+
+### 7.2 消息类型与触发关系
+
+一次完整的脚本运行会产生以下消息序列，同时驱动两套系统：
+
+```
+后端 ScriptRunner 线程
+    │
+    ├─→ SCRIPT_STARTED 事件
+    │      ├─→ 发送 new_session 消息 (script_run_id, scriptIsRunning=true)
+    │      │      └─→ 前端 handleNewSession()
+    │      │              ├─→ 更新 scriptRunId (关键：新的运行ID)
+    │      │              ├─→ clearTransientNodes()
+    │      │              └─→ handleSessionStatusChanged(scriptIsRunning=true)
+    │      │                      └─→ scriptRunState = RUNNING
+    │      │                              └─→ StatusWidget 显示 "Running + Stop"
+    │      │
+    │      └─→ 进入用户脚本执行
+    │
+    ├─→ 用户执行 st.status("任务A")
+    │      └─→ 发送 delta(add_block) 消息
+    │              └─→ 前端 handleDeltaMsg()
+    │                      └─→ AppRoot.applyDelta()
+    │                              └─→ 创建 Expander 节点，图标=spinner
+    │
+    ├─→ 用户执行 status.update(state="complete")
+    │      └─→ 发送 delta(add_block) 消息
+    │              └─→ 前端 handleDeltaMsg()
+    │                      └─→ AppRoot.addBlock() 替换同路径节点
+    │                              └─→ Expander 图标变为 check
+    │
+    └─→ SCRIPT_STOPPED_WITH_SUCCESS 事件
+           ├─→ 发送 script_finished (FINISHED_SUCCESSFULLY) 消息
+           │      └─→ 前端 handleScriptFinished()
+           │              ├─→ clearStaleNodes() 清理旧节点
+           │              ├─→ removeInactiveWidgetState() 清理 widget
+           │              └─→ incrementMessageCacheRunCount()
+           │
+           └─→ (如果新脚本开始，则循环回到顶部)
+```
+
+### 7.3 关键消息的相互依赖
+
+**1. `new_session` 消息：全局状态切换的起点**
+
+[app_session.py#L783-L858](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/lib/streamlit/runtime/app_session.py#L783-L858)
+
+`new_session` 消息的作用不仅仅是启动新会话：
+- 携带 **`script_run_id`**：这是后续所有 Delta 消息的"归属标签"，用于判断节点是否过期
+- 携带 **`session_status.script_is_running`**：驱动 StatusWidget 进入 RUNNING 状态
+- 携带 **`fragment_ids_this_run`**：标记本次是全量运行还是 fragment 运行
+
+前端收到 `new_session` 后 [App.tsx#L1349-L1441](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/app/src/App.tsx#L1349-L1441)：
+```typescript
+// 同页面、同应用的正常重跑
+this.setState(prevState => ({
+    // 先清除瞬态节点（如 spinners）
+    elements: prevState.elements.clearTransientNodes(fragmentIdsThisRun),
+    scriptRunId,  // 更新 scriptRunId
+}))
+```
+
+**2. `delta` 消息：页面内状态更新的载体**
+
+每个 Delta 消息都会被打上当前 `scriptRunId` 的标签：
+```typescript
+// AppRoot.applyDelta() 中
+this.addBlock(deltaPath, block, scriptRunId, ...)
+// → 新创建的 BlockNode.scriptRunId = 当前 scriptRunId
+```
+
+**3. `script_finished` 消息：清理的触发点**
+
+只有收到 `FINISHED_SUCCESSFULLY` 或 `FINISHED_FRAGMENT_RUN_SUCCESSFULLY` 状态时才执行清理，`FINISHED_EARLY_FOR_RERUN` 不清理（见下一节）。
+
+### 7.4 StatusWidget 状态机
+
+[StatusWidget.tsx](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/app/src/components/StatusWidget/StatusWidget.tsx) 中的状态转换逻辑：
+
+```
+用户点击 Rerun
+    → scriptRunState = RERUN_REQUESTED  (乐观更新，立即显示)
+    → 发送 BackMsg(rerun_script) 到后端
+           ↓
+后端发送 new_session(scriptIsRunning=true)
+    → handleSessionStatusChanged()
+    → scriptRunState = RUNNING
+           ↓
+    运行 500ms 后 (RUNNING_MAN_DISPLAY_DELAY_TIME_MS)
+    → showRunningMan = true
+    → 显示 "Running Man" 动画 + Stop 按钮
+           ↓
+后端发送 script_finished(FINISHED_SUCCESSFULLY)
+    → (间接通过 handleNewSession 或 handleSessionStatusChanged)
+    → scriptRunState = NOT_RUNNING
+    → showRunningMan = false
+```
+
+关键的防闪烁设计：脚本开始运行后不会立即显示 Running Man，而是等待 500ms。如果脚本在 500ms 内完成，用户就不会看到短暂的"闪烁"效果。
+
+---
+
+## 8. 脚本重新运行时旧节点不立即清除的原因
+
+### 8.1 核心设计原则：防止闪烁
+
+Streamlit 的页面渲染遵循一个重要原则：**旧元素一直显示，直到新元素覆盖它**。这就是为什么脚本重跑时旧的 `st.status` 容器不会立即消失。
+
+### 8.2 具体实现机制
+
+**机制一：FINISHED_EARLY_FOR_RERUN 跳过清理**
+
+后端发送中断型结束消息时 [app_session.py#L730-L736](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/lib/streamlit/runtime/app_session.py#L730-L736)：
+
+```python
+elif event == ScriptRunnerEvent.SCRIPT_STOPPED_FOR_RERUN:
+    self._state = AppSessionState.APP_NOT_RUNNING
+    self._enqueue_forward_msg(
+        self._create_script_finished_message(
+            ForwardMsg.FINISHED_EARLY_FOR_RERUN  # ← 关键：不是 SUCCESSFULLY
+        )
+    )
+```
+
+前端收到此状态时 [App.tsx#L1593-L1633](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/app/src/App.tsx#L1593-L1633)：
+
+```typescript
+handleScriptFinished(status): void {
+    if (status === FINISHED_SUCCESSFULLY || 
+        status === FINISHED_FRAGMENT_RUN_SUCCESSFULLY) {
+        // 只有成功完成才清理！
+        this.setState({
+            elements: elements.clearStaleNodes(scriptRunId, fragmentIdsThisRun),
+        })
+    }
+    // FINISHED_EARLY_FOR_RERUN 跳过 clearStaleNodes
+    // 旧元素保留在页面上
+}
+```
+
+**机制二：后端队列保留生命周期消息**
+
+新脚本启动时 `_clear_queue()` 会保留旧队列中的生命周期消息 [app_session.py#L565-L567](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/lib/streamlit/runtime/app_session.py#L565-L567)：
+
+```python
+def _clear_queue(self, fragment_ids_this_run=None):
+    self._browser_queue.clear(
+        retain_lifecycle_msgs=True,  # ← 保留 new_session, script_finished 等
+        fragment_ids_this_run=fragment_ids_this_run
+    )
+```
+
+并且 `_update_script_finished_message()` 会将旧的 `FINISHED_SUCCESSFULLY` 改为 `FINISHED_EARLY_FOR_RERUN` [forward_msg_queue.py#L236-L264](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/lib/streamlit/runtime/forward_msg_queue.py#L236-L264)，防止旧的成功消息触发前端清理。
+
+**机制三：节点清理基于 scriptRunId**
+
+每个渲染树节点都有 `scriptRunId` 属性，`ClearStaleNodeVisitor` 据此判断节点是否过期 [ClearStaleNodeVisitor.ts#L61-L69](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/lib/src/render-tree/visitors/ClearStaleNodeVisitor.ts#L61-L69)：
+
+```typescript
+visitBlockNode(node: BlockNode): AppNode | undefined {
+    if (!this.isFragmentRun) {
+        // 非 fragment 模式：删除所有 scriptRunId 不匹配的节点
+        if (node.scriptRunId !== this.currentScriptRunId) {
+            return undefined  // ← 标记为过期，删除
+        }
+    }
+    // ...
+}
+```
+
+在 `clearStaleNodes()` 被调用之前，旧 scriptRunId 的节点虽然不匹配，但仍然保留在渲染树中。
+
+### 8.3 时序图解：重跑时的元素生命周期
+
+```
+T0: 初始状态
+    AppRoot.main.children = [
+        BlockNode(scriptRunId="run-1", <-- st.status("旧任务完成")
+                  children=[ElementNode("完成内容", scriptRunId="run-1")])
+    ]
+    StatusWidget: NOT_RUNNING
+
+T1: 用户点击按钮，触发重跑
+    → scriptRunState = RERUN_REQUESTED (前端乐观更新)
+    → StatusWidget 显示 "Rerun requested"
+    → 页面元素暂时无变化！旧的 status 容器仍然可见
+
+T2: 后端中断旧脚本，发送 FINISHED_EARLY_FOR_RERUN
+    → handleScriptFinished(EARLY_FOR_RERUN)
+    → 跳过 clearStaleNodes()
+    → 旧节点(scriptRunId="run-1")仍然保留！
+
+T3: 后端启动新脚本，发送 new_session(scriptRunId="run-2", scriptIsRunning=true)
+    → handleNewSession()
+    → 更新 scriptRunId = "run-2"
+    → clearTransientNodes() 清除瞬态元素
+    → handleSessionStatusChanged(scriptIsRunning=true)
+    → scriptRunState = RUNNING
+    → StatusWidget 显示 Running Man
+    → 旧 status 容器仍然可见（尚未被覆盖）
+
+T4: 新脚本从头开始执行，发送 Delta 消息
+    → Delta 1: add_block(scriptRunId="run-2") 创建新的 status 容器
+      → SetNodeByDeltaPathVisitor 在 deltaPath [0] 处替换节点
+      → 旧 BlockNode("run-1") 被新 BlockNode("run-2") 替换
+      → 用户看到新的 "Running" 状态容器
+
+T5: 新脚本发送更多 Delta 消息
+    → 按顺序覆盖旧路径上的节点
+
+T6: 新脚本完成，发送 FINISHED_SUCCESSFULLY
+    → clearStaleNodes("run-2")
+    → 删除所有 scriptRunId != "run-2" 的节点
+    → 如果旧脚本有节点没被覆盖（如新脚本更短），此时被清理
+    → removeInactiveWidgetState() 清理 widget
+```
+
+### 8.4 为什么这是好的设计？
+
+| 场景 | 如果立即清除 | 实际（延迟清除） |
+|------|------------|----------------|
+| 快速重跑 | 页面空白 → 闪烁 | 旧内容保持，新内容渐进替换 |
+| 新旧内容相同 | 删除再重建 → 闪烁 | 只有变化的部分被更新 |
+| 重跑失败 | 内容丢失 | 旧内容仍然可用 |
+| Fragment 运行 | 无关内容被清掉 | 只更新相关 fragment 区域 |
+
+---
+
+## 9. 脚本成功结束时的完整清理流程
+
+### 9.1 清理时机
+
+清理发生在 `handleScriptFinished()` 收到 `FINISHED_SUCCESSFULLY` 状态时：
+
+```typescript
+// App.tsx handleScriptFinished
+if (status === FINISHED_SUCCESSFULLY || 
+    status === FINISHED_FRAGMENT_RUN_SUCCESSFULLY) {
+    this.setState(
+        ({ scriptRunId, fragmentIdsThisRun, elements }) => ({
+            elements: elements.clearStaleNodes(
+                scriptRunId,
+                fragmentIdsThisRun
+            ),
+        }),
+        () => {
+            this.removeInactiveWidgetState()  // setState 回调中执行
+        }
+    )
+}
+```
+
+### 9.2 清理步骤详解
+
+#### 步骤 1：clearStaleNodes() - 清除过期渲染节点
+
+[AppRoot.ts#L340-L369](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/lib/src/render-tree/AppRoot.ts#L340-L369)
+
+```typescript
+public clearStaleNodes(currentScriptRunId, fragmentIdsThisRun?): AppRoot {
+    const visitor = new ClearStaleNodeVisitor(
+        currentScriptRunId,
+        fragmentIdsThisRun
+    )
+    const newChildren = this.root.children.map(node =>
+        this.ensureBlockNode(node.accept(visitor))
+    )
+    return new AppRoot(..., new BlockNode(..., newChildren, ...))
+}
+```
+
+**ClearStaleNodeVisitor 的清理规则：**
+
+| 运行模式 | 节点类型 | 清理条件 |
+|----------|---------|----------|
+| **全量运行** | BlockNode | `node.scriptRunId !== currentScriptRunId` → 删除 |
+| **全量运行** | ElementNode | `node.scriptRunId !== currentScriptRunId` → 删除 |
+| **Fragment 运行** | BlockNode (属于 fragment) | 父 fragment 被修改但自己不是当前 run → 删除 |
+| **Fragment 运行** | BlockNode (不属于任何 fragment) | 保留，不会被清除 |
+| **Fragment 运行** | ElementNode (不属于 fragment) | 保留，不会被清除 |
+
+Fragment 模式的精细清理示例：
+```
+AppRoot
+├─ BlockNode(fragmentId="A", scriptRunId=NEW) ← 当前 fragment, 保留
+│  └─ ElementNode(scriptRunId=OLD)             ← 父 fragment 被修改，删除
+├─ BlockNode(fragmentId="B", scriptRunId=OLD) ← 不在本次 fragment，保留（可能以后用）
+└─ ElementNode(no fragmentId, scriptRunId=OLD) ← 不属于 fragment，保留
+```
+
+#### 步骤 2：removeInactiveWidgetState() - 清理 Widget 状态
+
+[App.tsx#L1696-L1705](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/app/src/App.tsx#L1696-L1705)
+
+```typescript
+private removeInactiveWidgetState(): void {
+    // 1. 遍历渲染树，收集所有活跃的元素 ID 和块 ID
+    const { elements, blockIds } = this.state.elements.getActiveIds()
+    const activeIds = new Set([
+        ...elements.map(e => getElementId(e)).filter(notUndefined),
+        ...blockIds,
+    ])
+    // 2. 删除 WidgetStateManager 中不在 activeIds 中的条目
+    this.widgetMgr.removeInactive(activeIds)
+}
+```
+
+这确保了：
+- 不再渲染的 Widget（如用户删除了某个 `st.slider`）的用户输入值被清除
+- 保留仍然存在的 Widget 的用户输入
+
+#### 步骤 3：incrementMessageCacheRunCount() - 清理消息缓存
+
+[App.tsx#L1635-L1656](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/app/src/App.tsx#L1635-L1656)
+
+```typescript
+if (status !== FINISHED_EARLY_FOR_RERUN && this.hasReceivedNewSession) {
+    this.connectionManager.incrementMessageCacheRunCount(
+        maxCachedMessageAge,
+        fragmentIdsThisRun
+    )
+}
+```
+
+作用：移除超过缓存寿命的 ForwardMsg 引用，释放浏览器内存。
+
+### 9.3 完整清理时序
+
+```
+FINISHED_SUCCESSFULLY 消息到达
+    │
+    ├─→ 微任务队列（Promise.resolve().then）
+    │      └─→ 执行所有 scriptFinishedHandlers 回调
+    │           (组件订阅的结束事件)
+    │
+    └─→ setState() 触发 React 更新
+           │
+           ├─→ clearStaleNodes() 同步执行
+           │      ├─→ ClearStaleNodeVisitor 遍历渲染树
+           │      │   ├─→ visitBlockNode() 检查每个块
+           │      │   ├─→ visitElementNode() 检查每个元素
+           │      │   └─→ visitTransientNode() 检查瞬态节点
+           │      └─→ 构建新的 AppRoot（不包含过期节点）
+           │
+           ├─→ React 提交新的 AppRoot 到 DOM
+           │      └─→ 用户看到页面更新（旧节点消失）
+           │
+           └─→ setState callback 中
+                  └─→ removeInactiveWidgetState()
+                         ├─→ ElementsSetVisitor 收集活跃 IDs
+                         └─→ WidgetStateManager.removeInactive()
+    │
+    └─→ incrementMessageCacheRunCount() （独立调用，非 React 内）
+```
+
+---
+
+## 10. 异步反馈原理总结
+
+### 10.1 核心机制
 
 Streamlit 的状态提示组件实现异步反馈依赖以下几个关键机制的协同工作：
 
@@ -493,7 +860,7 @@ Streamlit 的状态提示组件实现异步反馈依赖以下几个关键机制�
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 7.2 各层职责
+### 10.2 各层职责
 
 | 层级 | 组件 | 职责 |
 |------|------|------|
@@ -505,7 +872,7 @@ Streamlit 的状态提示组件实现异步反馈依赖以下几个关键机制�
 | 前端连接层 | `ConnectionManager` | WebSocket 连接管理 |
 | 前端渲染层 | `AppRoot` / `Block` / `Expander` | 渲染树管理、增量更新 |
 
-### 7.3 为什么不需要刷新整个页面
+### 10.3 为什么不需要刷新整个页面
 
 状态提示组件的更新是**增量式**的，这是 Streamlit 高效性的重要体现：
 
@@ -517,7 +884,7 @@ Streamlit 的状态提示组件实现异步反馈依赖以下几个关键机制�
 
 ---
 
-## 8. 相关文件索引
+## 11. 相关文件索引
 
 ### 后端核心文件
 - [mutable_status_container.py](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/lib/streamlit/elements/lib/mutable_status_container.py) - StatusContainer 实现
@@ -528,13 +895,18 @@ Streamlit 的状态提示组件实现异步反馈依赖以下几个关键机制�
 - [script_run_context.py](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/lib/streamlit/runtime/scriptrunner_utils/script_run_context.py) - 脚本运行上下文
 
 ### 前端核心文件
-- [App.tsx](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/app/src/App.tsx) - 主应用组件、消息处理
+- [App.tsx](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/app/src/App.tsx) - 主应用组件、消息处理、清理调度
 - [AppRoot.ts](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/lib/src/render-tree/AppRoot.ts) - 渲染树根节点
+- [BlockNode.ts](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/lib/src/render-tree/BlockNode.ts) - 块节点（含 scriptRunId）
 - [Block.tsx](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/lib/src/components/core/Block/Block.tsx) - 块渲染组件
 - [Expander.tsx](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/lib/src/components/elements/Expander/Expander.tsx) - 可展开容器
 - [StatusWidget.tsx](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/app/src/components/StatusWidget/StatusWidget.tsx) - 顶部状态栏
 - [ScriptRunState.ts](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/lib/src/ScriptRunState.ts) - 脚本运行状态枚举
 - [ScriptRunContext.tsx](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/lib/src/components/core/ScriptRunContext.tsx) - 脚本运行状态上下文
+- [ClearStaleNodeVisitor.ts](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/lib/src/render-tree/visitors/ClearStaleNodeVisitor.ts) - 过期节点清理访问者
+- [ClearTransientNodesVisitor.ts](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/lib/src/render-tree/visitors/ClearTransientNodesVisitor.ts) - 瞬态节点清理
+- [SetNodeByDeltaPathVisitor.ts](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/lib/src/render-tree/visitors/SetNodeByDeltaPathVisitor.ts) - 按路径设置节点
+- [FilterMainScriptElementsVisitor.ts](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/frontend/lib/src/render-tree/visitors/FilterMainScriptElementsVisitor.ts) - 主脚本元素过滤
 
 ### 测试/示例文件
 - [st_status.py](file:///d:/fz/0601/solo-dogfeeding/code/237-streamlit/e2e_playwright/st_status.py) - 状态组件测试页面
