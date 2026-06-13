@@ -60,10 +60,10 @@ def create_streamlit_routes(runtime: Runtime) -> list[BaseRoute]:
 | 序号 | 资源类型 | 创建函数 | 路径前缀 | 处理的资源 |
 |---|---|---|---|---|
 | 1 | 核心前端资产 | `create_streamlit_static_assets_routes()` | `/` 或 `/{base_url}` | JS/CSS/HTML/字体等前端构建产物 |
-| 2 | 媒体文件 | `create_media_routes()` | `/media/{file_id}` | st.image / st.audio / st.video / st.download_button |
-| 3 | 自定义组件 v1 | `create_component_routes()` | `/component/{name}/{path}` | 第三方自定义组件的 HTML/JS/CSS |
-| 4 | 自定义组件 v2 | `create_bidi_component_routes()` | `/_stcore/bidi-components/{name}/{path}` | 新一代双向组件资源 |
-| 5 | App 用户静态文件 | `create_app_static_serving_routes()` | `/app/static/{path}` | 应用目录 `static/` 下的用户文件 |
+| 2 | 媒体文件 | `create_media_routes()` | `/media/{file_id:path}` | st.image / st.audio / st.video / st.download_button |
+| 3 | 自定义组件 v1 | `create_component_routes()` | `/component/{name}/{path:path}` | 第三方自定义组件的 HTML/JS/CSS |
+| 4 | 自定义组件 v2 | `create_bidi_component_routes()` | `/_stcore/bidi-components/{component_name}/{path:path}` | 新一代双向组件资源 |
+| 5 | App 用户静态文件 | `create_app_static_serving_routes()` | `/app/static/{path:path}` | 应用目录 `static/` 下的用户文件 |
 | 6 | 文件上传 | `create_upload_routes()` | `/_stcore/upload_file/{session_id}/{file_id}` | st.file_uploader 上传的文件（PUT/DELETE） |
 
 ### 1.2 为什么要拆成多个工厂函数
@@ -818,19 +818,33 @@ switch (this.state) {
         /_stcore/health            → 后端健康检查
         /_stcore/host-config       → 后端主机配置
         /_stcore/stream            → WebSocket 连接（ws: true 代理）
-        /_stcore/upload_file/...   → 文件上传（PUT/DELETE）
+        /_stcore/upload_file/{session_id}/{file_id}  → 文件上传（PUT/DELETE）
         /_stcore/metrics           → 指标采集
-        /_stcore/bidi-components/  → 双向组件
-        /media/xxx.png             → 媒体文件（排除 /static/media/）
-        /component/...             → 自定义组件
-        /app/static/...            → App 用户静态文件
+        /_stcore/bidi-components/{component_name}/{path:path}  → 双向组件
+        /media/{file_id:path}      → 媒体文件（排除 /static/media/）
+        /component/{name}/{path:path}  → 自定义组件
+        /app/static/{path:path}    → App 用户静态文件
         /auth/...                  → 认证路由
         /oauth2callback            → OAuth 回调
 ```
 
 ### 7.2 生产模式的代码分流路径
 
-生产模式下，`global.developmentMode=False`，所有资源统一由 Python 后端提供：
+生产模式下，`global.developmentMode=False`，所有资源统一由 Python 后端提供。路由通过 `_with_base()` 函数统一处理 `server.baseUrlPath` 前缀：
+
+```python
+# [starlette_routes.py#L67-L89] 路由常量定义
+BASE_ROUTE_CORE: Final = "_stcore"
+BASE_ROUTE_MEDIA: Final = "media"                            # 没有 _stcore 前缀！
+BASE_ROUTE_COMPONENT: Final = "component"                    # 没有 _stcore 前缀！
+BASE_ROUTE_APP_STATIC_SERVING: Final = "app/static"          # 没有 _stcore 前缀！
+BASE_ROUTE_BIDI_COMPONENTS: Final = "_stcore/bidi-components"  # 有 _stcore 前缀
+BASE_ROUTE_UPLOAD_FILE: Final = "_stcore/upload_file"          # 有 _stcore 前缀
+
+_ROUTE_MEDIA: Final = f"{BASE_ROUTE_MEDIA}/{{file_id:path}}"   # path 类型允许包含斜杠
+```
+
+**生产模式完整链路图**（路径精确对应代码常量）：
 
 ```
 浏览器访问 https://app.example.com
@@ -839,17 +853,20 @@ switch (this.state) {
     │   ├─ /static/js/xxx.js   → 带哈希，immutable 缓存
     │   └─ /index.html         → SPA fallback, no-cache
     │
-    ├─ /_stcore/*              → Starlette Route 精确匹配
+    ├─ /_stcore/*              → Starlette Route 精确匹配（BASE_ROUTE_CORE 下）
     │   ├─ /_stcore/health
     │   ├─ /_stcore/host-config
-    │   ├─ /_stcore/media
-    │   ├─ /_stcore/upload_file
-    │   └─ /_stcore/stream (WebSocket)
+    │   ├─ /_stcore/metrics
+    │   ├─ /_stcore/stream (WebSocket)
+    │   ├─ /_stcore/bidi-components/{component_name}/{path:path}
+    │   └─ /_stcore/upload_file/{session_id}/{file_id}  → PUT/DELETE
     │
-    ├─ /media/*                → MediaFileManager
-    ├─ /component/*            → ComponentRegistry
-    └─ /app/static/*           → 用户 static/ 目录
+    ├─ /media/{file_id:path}   → MediaFileManager (独立路由，不在 _stcore 下！)
+    ├─ /component/{name}/{path:path}  → ComponentRegistry (自定义组件 v1，不在 _stcore 下！)
+    └─ /app/static/{path:path} → 用户 static/ 目录 (需启用 server.enableStaticServing，不在 _stcore 下！)
 ```
+
+**关键事实**：`media`、`component`、`app/static` 这三类路由**不在 `/_stcore` 前缀下**，它们的 `BASE_ROUTE_*` 常量直接就是 `"media"`、`"component"`、`"app/static"`，没有 `_stcore/` 前缀。只有 `bidi-components` 和 `upload_file` 在 `_stcore/` 下。
 
 ### 7.3 分流判断的代码位置
 
@@ -1029,52 +1046,145 @@ async def _set_upload_headers(request: Request, response: Response) -> None:
 - `Vary: Origin` 确保不同 Origin 的响应不被缓存混淆
 - 只允许 `X-Xsrftoken` 和 `Content-Type` 两个请求头
 
-### 8.7 前端配合的安全措施
+### 8.7 前端配合的安全措施：三层调用链 + XSRF 注入
 
-前端上传使用 **axios**（非 `fetch`），通过 `csrfRequest()` 封装方法统一处理 XSRF 和凭证：
+前端上传不是直接调用 endpoints，而是经过**三层封装**：UI 组件层 → 业务封装层（FileUploadClient）→ 协议层（csrfRequest + axios）。
+
+#### 8.7.1 调用链路全景
+
+```
+UI 组件层（4 处调用）：
+  ├─ FileUploader.tsx     （st.file_uploader）
+  ├─ ChatInput.tsx        （st.chat_input 带文件）
+  ├─ CameraInput.tsx      （st.camera_input）
+  └─ createFileUploadHandler.ts / uploadFiles.ts
+        │
+        ▼ 调用 uploadClient.uploadFile()
+业务封装层：FileUploadClient
+  ├─ uploadFile()         （追踪表单 pending 计数）
+  │      └─ endpoints.uploadFileUploaderFile()
+  ├─ deleteFile()         （调用 endpoints.deleteFileAtURL）
+  └─ fetchFileURLs()      （通过 WebSocket 请求上传/删除 URL）
+        │
+        ▼
+协议层：DefaultStreamlitEndpoints
+  ├─ uploadFileUploaderFile()  （构造 FormData → csrfRequest）
+  ├─ deleteFileAtURL()         （构造 payload → csrfRequest）
+  └─ csrfRequest()             （核心：注入 X-Xsrftoken + withCredentials → axios）
+```
+
+#### 8.7.2 业务封装层（FileUploadClient）
+
+[FileUploadClient](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/lib/src/FileUploadClient.ts#L47-L214) 负责追踪表单的 pending 请求计数，让 UI 组件知道表单是否还有正在上传的文件：
+
+```typescript
+// [FileUploadClient.ts#L102-L132]
+public async uploadFile(
+    widget: WidgetInfo,         // 组件的 id 和 formId
+    fileUploadUrl: string,
+    file: File,
+    onUploadProgress?: ...,
+    signal?: AbortSignal
+): Promise<void> {
+    // 先把表单 pending 计数 +1
+    this.offsetPendingRequestCount(widget.formId, 1)
+    return this.endpoints
+      .uploadFileUploaderFile(   // 调用协议层
+          fileUploadUrl,
+          file,
+          this.sessionInfo.current.sessionId,
+          onUploadProgress,
+          signal
+      )
+      .finally(() => this.offsetPendingRequestCount(widget.formId, -1))
+}
+
+public deleteFile(fileUrl: string): Promise<void> {
+    return this.endpoints.deleteFileAtURL
+        ? this.endpoints.deleteFileAtURL(fileUrl, this.sessionInfo.current.sessionId)
+        : Promise.resolve()
+}
+```
+
+`fetchFileURLs()` 方法用于先通过 WebSocket 向后端请求上传/删除 URL（避免前端硬编码路径）：
+
+```typescript
+// [FileUploadClient.ts#L144-L156]
+public fetchFileURLs(files: File[]): Promise<IFileURLs[]> {
+    const resolver = Promise.withResolvers<IFileURLs[]>()
+    const requestId = uuidv4()
+    this.pendingFileURLsRequests.set(requestId, resolver)
+    this.requestFileURLs(requestId, files)  // 发送 BackMsg 到 WebSocket
+    return resolver.promise
+}
+```
+
+#### 8.7.3 协议层（DefaultStreamlitEndpoints）
+
+协议层负责构造 HTTP 请求并注入 XSRF。
+
+**上传函数真实代码**（变量名精确对应）：
 
 ```typescript
 // [DefaultStreamlitEndpoints.ts#L269-L310]
 public async uploadFileUploaderFile(
     fileUploadUrl: string,
     file: File,
-    _sessionId: string,
+    _sessionId: string,          // 注意：形参是 _sessionId（未使用，FileUploadClient 传入了 sessionId）
     onUploadProgress?: (progressEvent: AxiosProgressEvent) => void,
     signal?: AbortSignal
 ): Promise<void> {
     const form = new FormData()
+    const { name, webkitRelativePath } = file
+    // 目录上传时使用 webkitRelativePath 保留目录结构
+    const fileName = webkitRelativePath || name
     form.append(name, file, fileName)
 
     const headers: Record<string, string> = this.getAdditionalHeaders()
     const uploadUrl = this.buildFileUploadURL(fileUploadUrl)
 
-    // 通过 csrfRequest 发送，自动注入 XSRF 头
-    await this.csrfRequest<number>(uploadUrl, {
-        signal,
-        method: "PUT",
-        data: form,
-        responseType: "text",
-        headers,
-        onUploadProgress,
-    })
+    try {
+        await this.csrfRequest<number>(uploadUrl, {
+            signal,
+            method: "PUT",
+            data: form,
+            responseType: "text",
+            headers,
+            onUploadProgress,
+        })
+    } catch (error: unknown) {
+        // 失败时发送 ClientError 到 Host
+        const message = error instanceof Error ? error.message : "Unknown Error"
+        this.sendClientErrorToHost("File Uploader", "Error uploading file", message, uploadUrl)
+        throw error
+    }
 }
+```
 
+**删除函数真实代码**：
+
+```typescript
 // [DefaultStreamlitEndpoints.ts#L327-L355]
 public async deleteFileAtURL(
     fileUrl: string,
-    sessionId: string
+    sessionId: string            // DELETE 的 sessionId 放在请求体中（非路径参数）
 ): Promise<void> {
     const headers: Record<string, string> = this.getAdditionalHeaders()
     const deleteUrl = this.buildFileUploadURL(fileUrl)
 
-    // DELETE 同样通过 csrfRequest
     await this.csrfRequest<number>(deleteUrl, {
         method: "DELETE",
-        data: { sessionId },
+        data: { sessionId },     // sessionId 在 body 中，不在 URL 路径
         headers,
     })
 }
 ```
+
+注意两处代码事实：
+1. 上传 URL 中的 `session_id` 是路径参数（`/_stcore/upload_file/{session_id}/{file_id}`），由后端生成并通过 WebSocket 下发给前端
+2. DELETE 的 `sessionId` 额外放在请求体中（后端 DELETE 处理器不校验会话）
+
+#### 8.7.4 csrfRequest：XSRF 核心封装
 
 **`csrfRequest()` 是核心封装**（[DefaultStreamlitEndpoints.ts#L382-L402](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/DefaultStreamlitEndpoints.ts#L382-L402)）：
 
@@ -1087,9 +1197,9 @@ private async csrfRequest<T = unknown, R = AxiosResponse<T>>(
 
     if (this.csrfEnabled) {
         // 1. 从 Cookie 读取 _streamlit_xsrf 的值
-        const xsrfCookie = getCookie("_streamlit_xsrf")  // 使用 document.cookie 正则匹配
+        const xsrfCookie = getCookie("_streamlit_xsrf")  // document.cookie 正则匹配
         if (notNullOrUndefined(xsrfCookie)) {
-            // 2. 注入 X-Xsrftoken Header
+            // 2. 注入 X-Xsrftoken Header（Cookie 名和 Header 名需与后端匹配）
             params.headers = {
                 "X-Xsrftoken": xsrfCookie,
                 ...params.headers,
@@ -1110,15 +1220,10 @@ private async csrfRequest<T = unknown, R = AxiosResponse<T>>(
 - **XSRF Cookie 名**：`_streamlit_xsrf`（与后端 `XSRF_COOKIE_NAME` 一致）
 - **Header 名**：`X-Xsrftoken`（与后端 `request.headers.get("X-Xsrftoken")` 一致）
 - **凭证模式**：`withCredentials: true`（axios 语法，等价于 `fetch` 的 `credentials: "include"`，**不是** `"same-origin"`）
-- **`csrfEnabled` 标志**：在 [App.tsx](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/app/src/App.tsx#L432-L434) 中硬编码为 `true`：
-  ```typescript
-  this.endpoints = new DefaultStreamlitEndpoints({
-      csrfEnabled: true,  // 始终启用
-      // ...
-  })
-  ```
+- **`csrfEnabled` 标志**：在 [App.tsx](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/app/src/App.tsx#L432-L434) 中硬编码为 `true`
 - **`getCookie()` 实现**：通过 `document.cookie` 正则匹配读取（[browser/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/utils/src/browser/index.ts#L20-L23)）
 - **额外 Headers**：如果 `fileUploadClientConfig` 存在（外部上传服务场景），会合并额外的 headers
+- **错误上报**：上传失败时调用 `sendClientErrorToHost()` 将错误信息通过 WebSocket 上报
 
 ### 8.8 安全边界总结
 
@@ -1138,8 +1243,8 @@ private async csrfRequest<T = unknown, R = AxiosResponse<T>>(
 | 资源类型 | 路径映射方式 | 访问控制 | 缓存策略 |
 |---|---|---|---|
 | 核心前端资产 | `Mount` 独立挂载到 `/`，继承 StaticFiles | `_StreamlitStaticFiles.__call__` 内双斜杠 + `is_unsafe_path_pattern` 检查 | HTML: `no-cache`；带哈希资源: `immutable + max-age=1年` |
-| 媒体文件 | `Route` 精确匹配 `/media/{file_id}` | CORS + `Content-Disposition` 处理 | *(未设置)* |
-| 自定义组件 v1/v2 | `Route` 匹配 `/component/{name}/{path:path}` | `build_safe_abspath` 做路径规范化 + 根目录校验 | HTML: `no-cache`；其他: `public` |
+| 媒体文件 | `Route` 精确匹配 `/media/{file_id:path}` | CORS + `Content-Disposition` 处理 | *(未设置)* |
+| 自定义组件 v1/v2 | `Route` 匹配 `/component/{name}/{path:path}` 和 `/_stcore/bidi-components/{component_name}/{path:path}` | `build_safe_abspath` 做路径规范化 + 根目录校验 | HTML: `no-cache`；其他: `public` |
 | App 用户静态文件 | `Route` 匹配 `/app/static/{path:path}` | `build_safe_abspath` + 文件大小限制 200MB + `X-Content-Type-Options: nosniff` | *(未设置)* |
 | 文件上传 | `Route` 匹配 `/_stcore/upload_file/{session_id}/{file_id}` | 快速路径跳过 `is_unsafe_path_pattern` + 五层安全边界（UNC+XSRF+会话+大小+CORS），前端通过 axios `csrfRequest()` 自动注入 `X-Xsrftoken` 头并设置 `withCredentials: true` | *(未设置)* |
 
@@ -1153,7 +1258,7 @@ private async csrfRequest<T = unknown, R = AxiosResponse<T>>(
 | CORS 跨域控制 | [server_util.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/server_util.py) | `allow_all_cross_origin_requests`, `is_allowed_origin` |
 | XSRF 防护 | [starlette_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_routes.py) | `_ensure_xsrf_cookie`, `_check_xsrf` |
 | 选择性 GZip | [starlette_gzip_middleware.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_gzip_middleware.py) | `SelectiveGZipMiddleware.__call__` |
-| 前端 URL 构建 | [DefaultStreamlitEndpoints.ts](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/DefaultStreamlitEndpoints.ts) | `buildMediaURL`, `buildStaticUrl`, `buildDownloadUrl`, `uploadFile` |
+| 前端 URL 构建 | [DefaultStreamlitEndpoints.ts](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/DefaultStreamlitEndpoints.ts) | `buildMediaURL`, `buildStaticUrl`, `buildDownloadUrl`, `uploadFileUploaderFile` |
 | 静态部署模式 | [StaticConnection.tsx](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/StaticConnection.tsx) | `establishStaticConnection`, `getStaticConfig` |
 | 连接状态管理 | [ConnectionManager.ts](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/ConnectionManager.ts) | `connect`, `setConnectionState` |
 | WebSocket 状态机 | [WebsocketConnection.tsx](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/WebsocketConnection.tsx) | `stepFsm`, `setFsmState` |
