@@ -5,6 +5,10 @@
 2. **核心静态资源的独立挂载** — 为何使用 `Mount` 独立挂载，具体如何实现
 3. **上传路由跳过全量路径校验的原因** — 为何 `/_stcore/upload_file/*` 可以安全绕过 `is_unsafe_path_pattern()`
 4. **静态部署时外部静态源改写** — Static Connection 模式下如何将资源 URL 改写为外部静态源（如 S3）
+5. **dev/prod 静态资源入口差异** — 开发态与生产态在后端路由、CORS 策略、前端代理上的不同
+6. **静态资源连接状态切换时序** — ConnectionState 状态机的完整转移路径和触发条件
+7. **dev/prod 资源入口分流情况** — 代码层面如何判断开发模式并分流路由
+8. **上传路由依赖的安全边界** — 上传路由的五层安全防御体系（除路径校验外的其他防线）
 
 ---
 
@@ -454,9 +458,567 @@ export const StreamlitConfig = {
 
 ---
 
-## 5. 整体架构回顾：路径映射、访问控制、缓存的边界
+## 5. dev/prod 静态资源入口差异
 
-### 5.1 路径映射 × 访问控制 × 缓存 的交互矩阵
+### 5.1 开发态 vs 生产态的核心差异矩阵
+
+| 维度 | 开发态 (developmentMode=True) | 生产态 (developmentMode=False) |
+|---|---|---|
+| 核心前端资产来源 | Vite Dev Server 提供（端口 5173） | 后端 Python 通过 `Mount` 挂载 `static/` 目录 |
+| 路由存在性 | `create_streamlit_static_assets_routes()` 不添加 | `create_streamlit_static_assets_routes()` 被调用，挂载到 `/` |
+| CORS 策略 | 允许所有跨域请求（`*`），因为 Vite 和后端端口不同 | 根据 `server.enableCORS` 和 `server.corsAllowedOrigins` 严格控制 |
+| Host Config | 自动添加 `http://localhost` 到 `allowedOrigins` | 仅使用配置的 `client.allowedOrigins` |
+| 前端代理 | Vite dev server 配置代理规则，将 `/_stcore/*`、`/media/*` 等转发到后端 | 无代理，浏览器直接请求同一域名 |
+| XSRF 开关 | `server.enableXsrfProtection` 默认 True，开发态下仍执行除非显式关闭 | 同左 |
+
+### 5.2 开发态判断的代码位置
+
+开发态由 `global.developmentMode` 配置项控制，在三处关键代码中影响路由分流：
+
+#### 5.2.1 后端路由分流（最关键）
+
+在 [create_streamlit_routes()](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_app.py#L125-L149)：
+
+```python
+def create_streamlit_routes(runtime: Runtime) -> list[BaseRoute]:
+    routes: list[Any] = []
+
+    # ... 其他路由始终添加 ...
+
+    # 10. App 用户静态文件（需启用配置，与 dev_mode 无关）
+    if config.get_option("server.enableStaticServing"):
+        routes.extend(create_app_static_serving_routes(main_script_path, base_url))
+
+    # 11. 脚本健康检查（可选）
+    if config.get_option("server.scriptHealthCheckEnabled"):
+        routes.extend(create_script_health_routes(runtime, base_url))
+
+    # 12. 核心前端资产：仅生产模式添加！
+    dev_mode = bool(config.get_option("global.developmentMode"))
+    if not dev_mode:
+        routes.extend(create_streamlit_static_assets_routes(base_url=base_url))
+
+    return routes
+```
+
+**关键结论**：开发模式下，后端不提供核心前端资产路由，完全由 Vite Dev Server 负责。
+
+#### 5.2.2 CORS 策略差异
+
+在 [allow_all_cross_origin_requests()](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/server_util.py#L41-L50)：
+
+```python
+def allow_all_cross_origin_requests() -> bool:
+    """True if cross-origin requests from any origin are allowed.
+
+    We allow ALL cross-origin requests when CORS protection has been disabled
+    with server.enableCORS=False or when in dev mode (where the Vite dev server
+    and backend use different ports, counting as two origins).
+    """
+    return not config.get_option("server.enableCORS") or config.get_option(
+        "global.developmentMode"
+    )
+```
+
+开发模式下，Vite Dev Server（默认 5173 端口）和 Python 后端（默认 8501 端口）是两个不同的源，浏览器会对跨域请求执行预检，因此需要放开 CORS 限制。
+
+#### 5.2.3 Host Config 差异
+
+在 [create_host_config_routes()](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_routes.py#L456-L462)：
+
+```python
+async def _host_config_endpoint(request: Request) -> JSONResponse:
+    allowed: list[str] = list(config.get_option("client.allowedOrigins"))
+    if (
+        config.get_option("global.developmentMode")
+        and "http://localhost" not in allowed
+    ):
+        allowed.append("http://localhost")  # 开发模式自动添加 localhost
+```
+
+### 5.3 前端 Vite 代理配置（开发态特有）
+
+开发模式下，Vite Dev Server 配置了代理规则，将非前端资源的请求转发到 Python 后端（默认 `localhost:8501`）：
+
+```javascript
+// [vite.config.ts#L156-L191]
+const proxy: ProxyOptions = {
+    target: `http://localhost:${backEndPort}`,
+    ws: true,  // WebSocket 也代理
+    changeOrigin: true,
+    xfwd: true,
+}
+
+server: {
+    proxy: {
+        // 1. 内部 API 全部代理
+        "^.*/_stcore/.*": proxy,
+        // 2. 媒体文件代理（排除 Vite 自己的 static/media）
+        "^(?!.*/static/media).*/media/.*": proxy,
+        // 3. 自定义组件代理
+        "^.*/component/.*": proxy,
+        // 4. App 静态文件代理
+        "^.*/app/static/.*": proxy,
+        // 5. 认证路由代理
+        "^.*/auth/.*": proxy,
+    },
+}
+```
+
+代理规则使用正则表达式，巧妙地将 Vite 自己的 `static/media` 路径排除，避免冲突。
+
+### 5.4 入口切换逻辑
+
+前端入口通过 `ConnectionManager` 在运行时动态判断连接类型，不直接区分 dev/prod。但由于：
+- 开发态：`window.location` 指向 Vite 端口（5173），代理透明转发
+- 生产态：`window.location` 指向后端服务端口，直接请求后端
+
+因此前端代码不需要做显式的 dev/prod 判断，完全由后端的配置和 Vite 的代理机制透明处理。
+
+---
+
+## 6. 静态资源连接状态切换时序
+
+### 6.1 ConnectionState 状态枚举
+
+前端连接状态由 [ConnectionState](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/ConnectionState.ts#L17-L25) 枚举定义，共 7 个状态：
+
+```typescript
+export enum ConnectionState {
+  CONNECTED = "CONNECTED",              // 已连接到后端 WebSocket
+  DISCONNECTED_FOREVER = "DISCONNECTED_FOREVER",  // 永久断开（无法重连）
+  INITIAL = "INITIAL",                  // 初始状态，未连接
+  PINGING_SERVER = "PINGING_SERVER",    // 正在 ping 服务器检测可用性
+  CONNECTING = "CONNECTING",            // 正在建立 WebSocket 连接
+  STATIC_CONNECTING = "STATIC_CONNECTING",  // 静态模式正在加载
+  STATIC_CONNECTED = "STATIC_CONNECTED",     // 静态模式加载完成
+}
+```
+
+### 6.2 连接类型选择：WebSocket vs Static
+
+[ConnectionManager.connect()](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/ConnectionManager.ts#L181-L216) 是连接入口，根据 URL 参数 `staticAppId` 选择连接类型：
+
+```typescript
+private async connect(): Promise<void> {
+    const staticAppId = this.checkStaticConnection()  // 检查 URL ?staticAppId=xxx
+
+    if (staticAppId) {
+        // 静态连接分支
+        establishStaticConnection(
+            staticAppId,
+            this.setConnectionState,
+            this.props.onMessage,
+            this.props.onConnectionError,
+            this.props.endpoints
+        )
+        this.websocketConnection = null  // 静态模式不需要 WebSocket
+    } else {
+        // WebSocket 连接分支
+        try {
+            this.websocketConnection = await this.connectToRunningServer()
+        } catch (e) {
+            this.setConnectionState(ConnectionState.DISCONNECTED_FOREVER, {
+                message: err.message,
+            })
+        }
+    }
+}
+```
+
+### 6.3 WebSocket 连接时序（正常模式）
+
+[WebsocketConnection](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/WebsocketConnection.tsx#L330-L399) 使用**有限状态机（FSM）**管理连接生命周期。
+
+#### 6.3.1 标准时序（非 Bypass 模式）
+
+```
+INITIAL
+   │ INITIALIZED 事件
+   ▼
+PINGING_SERVER
+   │ doInitPings() 循环 ping /_stcore/health
+   │ 直到服务器返回 200，同时获取 /_stcore/host-config
+   │ SERVER_PING_SUCCEEDED 事件
+   ▼
+CONNECTING
+   │ 尝试建立 WebSocket 连接
+   │ CONNECTION_SUCCEEDED 事件
+   ▼
+CONNECTED  ←───────────────────┐
+   │                            │
+   │ CONNECTION_CLOSED 或      │ 重连成功
+   │ CONNECTION_ERROR 事件     │ CONNECTION_SUCCEEDED
+   ▼                            │
+PINGING_SERVER  ───────────────┘
+   │ SERVER_PING_SUCCEEDED
+   ▼
+CONNECTING
+```
+
+#### 6.3.2 Bypass 模式时序（优化延迟）
+
+如果 `isHostConfigBypassEnabled()` 返回 true（通过 `window.__streamlit` 预配置了足够的信息），可以并行执行 ping 和 WebSocket 连接，降低首屏延迟：
+
+```
+INITIAL
+   │ INITIALIZED 事件（enableBypass=true）
+   ├──────────────────────────────────┐
+   │ CONNECTING 状态转移               │ pingServerInBackground()
+   │ WebSocket 连接尝试                 │ 同时在后台执行 ping
+   ▼                                  ▼
+CONNECTED                      后台 ping 完成
+   │ (WebSocket 先就绪)               │ (不触发状态转移)
+   │ CONNECTION_CLOSED
+   ▼
+PINGING_SERVER  →  CONNECTING  →  CONNECTED
+```
+
+Bypass 模式的判断条件在 [isHostConfigBypassEnabled()](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/utils.ts#L39-L59)：
+
+```typescript
+export function isHostConfigBypassEnabled(): boolean {
+    const initialHostConfig = StreamlitConfig.HOST_CONFIG
+    if (!initialHostConfig) return false
+
+    const { allowedOrigins, useExternalAuthToken } = initialHostConfig
+    return (
+        Boolean(StreamlitConfig.BACKEND_BASE_URL) &&          // 后端地址已知
+        isValidAllowedOrigins(allowedOrigins) &&              // 允许的来源有效
+        typeof useExternalAuthToken === "boolean"             // 外部认证 token 标志位已设置
+    )
+}
+```
+
+#### 6.3.3 重连时序
+
+当连接意外断开时（如网络波动），FSM 会自动进入 PINGING_SERVER 状态尝试重连。额外支持**心跳超时重连**：
+
+```typescript
+// [ConnectionManager.ts#L231-L251]
+public onHeartbeatSent(ackTimeoutMilliseconds: number): void {
+    this.heartbeatAckTimeoutId = setTimeout(() => {
+        if (this.isConnected()) {  // 只有 CONNECTED 状态下才重连
+            this.reconnect()       // 关闭当前连接，进入 PINGING_SERVER
+        }
+    }, ackTimeoutMilliseconds)
+}
+```
+
+### 6.4 静态连接时序
+
+静态连接的状态转移简单直接，无重连逻辑：
+
+```
+INITIAL
+   │ connect() 检测到 staticAppId
+   ▼
+STATIC_CONNECTING
+   │ getStaticConfig() 获取 S3 地址
+   │ dispatchAppForwardMessages() 加载 protobuf
+   │ STATIC_CONNECTED 事件
+   ▼
+STATIC_CONNECTED
+```
+
+时序代码在 [establishStaticConnection()](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/StaticConnection.tsx#L125-L150)：
+
+```typescript
+export async function establishStaticConnection(...): Promise<void> {
+    onConnectionStateChange(ConnectionState.STATIC_CONNECTING)
+
+    // Step 1: 获取静态配置（S3 地址）
+    const staticConfigUrl = await getStaticConfig()
+    endpoints.setStaticConfigUrl(staticConfigUrl)
+
+    // Step 2: 加载并分发 protobuf 消息
+    dispatchAppForwardMessages(staticAppId, staticConfigUrl, onMessage, onConnectionError)
+
+    onConnectionStateChange(ConnectionState.STATIC_CONNECTED)
+}
+```
+
+### 6.5 状态转移的安全边界
+
+状态机的设计严格防止非法转移，[WebsocketConnection.stepFsm()](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/WebsocketConnection.tsx#L330-L399) 中只允许预定义的转移：
+
+```typescript
+switch (this.state) {
+  case ConnectionState.INITIAL:
+    if (event === "INITIALIZED") { ... }  // 唯一合法事件
+    break
+  case ConnectionState.CONNECTING:
+    if (event === "CONNECTION_SUCCEEDED") { ... }
+    if (event === "CONNECTION_TIMED_OUT" ||
+        event === "CONNECTION_ERROR" ||
+        event === "CONNECTION_CLOSED") { ... }
+    break
+  // ... 其他状态的合法转移
+  default:
+    throw new Error("Unsupported state transition")
+}
+```
+
+---
+
+## 7. dev/prod 资源入口分流情况
+
+### 7.1 开发模式的代码分流路径
+
+开发模式下，`global.developmentMode=True`，核心前端资产由 Vite 提供，后端不提供。完整的分流链路：
+
+```
+浏览器访问 http://localhost:5173
+    │
+    ├─ /static/js/index.xxx.js (Vite 直接提供，带 HMR)
+    ├─ /node_modules/... (Vite 直接提供)
+    │
+    └─ /_stcore/health  ──┐
+       /media/xxx.png     │ Vite 代理转发
+       /component/...     │ 到 Python 后端
+       /app/static/...    │ http://localhost:8501
+       /_stcore/upload    │
+       /_stcore/stream    │ (WebSocket 也代理)
+                        ──┘
+```
+
+### 7.2 生产模式的代码分流路径
+
+生产模式下，`global.developmentMode=False`，所有资源统一由 Python 后端提供：
+
+```
+浏览器访问 https://app.example.com
+    │
+    ├─ /                       → Mount 挂载的 _StreamlitStaticFiles
+    │   ├─ /static/js/xxx.js   → 带哈希，immutable 缓存
+    │   └─ /index.html         → SPA fallback, no-cache
+    │
+    ├─ /_stcore/*              → Starlette Route 精确匹配
+    │   ├─ /_stcore/health
+    │   ├─ /_stcore/host-config
+    │   ├─ /_stcore/media
+    │   ├─ /_stcore/upload_file
+    │   └─ /_stcore/stream (WebSocket)
+    │
+    ├─ /media/*                → MediaFileManager
+    ├─ /component/*            → ComponentRegistry
+    └─ /app/static/*           → 用户 static/ 目录
+```
+
+### 7.3 分流判断的代码位置
+
+核心分流逻辑位于 [starlette_app.py#L125-L149](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_app.py#L125-L149)：
+
+```python
+dev_mode = bool(config.get_option("global.developmentMode"))
+
+# 核心前端资产：仅生产模式添加
+if not dev_mode:
+    routes.extend(create_streamlit_static_assets_routes(base_url=base_url))
+```
+
+这个简单的 `if` 判断是整个 dev/prod 分流的**唯一控制开关**，它直接决定了：
+- 是否将 `_StreamlitStaticFiles` 挂载到根路径
+- 404 请求是否会回退到 `index.html`
+- JS/CSS/HTML 等核心资产是否由 Python 提供
+
+### 7.4 与 Base URL 的交互
+
+当配置了 `server.baseUrlPath`（如 `"/myapp"`）时，分流仍然生效，只是所有路由都加上了前缀：
+
+```python
+# 生产模式下挂载点变为 "/myapp"
+mount_path = make_url_path(base_url or "", "").rstrip("/") or "/"
+# 结果：Mount("/myapp", app=static_assets)
+
+# 上传路径变为 "/myapp/_stcore/upload_file/*"
+safe_path_prefix = make_url_path(base_url_path, _SAFE_ROUTE_UPLOAD_PREFIX)
+```
+
+### 7.5 构建产物的配合
+
+Vite 构建时会在 `output` 配置中为文件名添加内容哈希，配合生产模式的 `immutable + max-age=1年` 缓存策略：
+
+```javascript
+// [vite.config.ts#L192-L233]
+build: {
+    rollupOptions: {
+        output: {
+            manualChunks: {
+                react: ["react", "react-dom"],
+                // ... 其他 chunk 配置
+            },
+        },
+    },
+}
+```
+
+Vite 自动为 JS/CSS 文件名添加 `.[hash]` 后缀（如 `index.abc123.js`），确保内容变化时 URL 变化，从而安全使用长时缓存。
+
+---
+
+## 8. 上传路由依赖的安全边界
+
+上传路由虽然跳过了 `is_unsafe_path_pattern()` 的全量路径校验，但依赖**五层独立的安全边界**确保安全性。每层边界独立工作，某层失效不影响其他层。
+
+### 8.1 五层安全防御体系
+
+| 层级 | 防御机制 | 代码位置 | 检查时机 |
+|---|---|---|---|
+| **L1** | UNC 双斜杠检查 | [starlette_path_security_middleware.py#L137-L139](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_path_security_middleware.py#L137-L139) | 中间件最外层，所有请求 |
+| **L2** | XSRF 跨站请求伪造防护 | [starlette_routes.py#L598-L634](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_routes.py#L598-L634) | PUT/DELETE 处理函数入口 |
+| **L3** | 活跃会话校验 | [starlette_routes.py#L664-L665](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_routes.py#L664-L665) | PUT 入口 |
+| **L4** | 文件大小限制 | [starlette_routes.py#L667-L700](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_routes.py#L667-L700) | PUT 内容读取前后 |
+| **L5** | CORS 跨域策略 | [starlette_routes.py#L636-L649](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_routes.py#L636-L649) | 所有响应设置 Header |
+
+### 8.2 L1: UNC 双斜杠检查（所有请求强制执行）
+
+即使是上传路由快速路径，UNC 检查仍然执行：
+
+```python
+# [starlette_path_security_middleware.py#L137-L139]
+# Step 1: UNC 双斜杠检查（对所有请求强制执行，包括上传路径）
+if path.startswith(("//", "\\\\")):
+    return 400
+```
+
+防止 Windows UNC 路径攻击（如 `//server/share/file`），这类攻击可能触发 SMB 连接导致 NTLM 哈希泄露或 SSRF。
+
+### 8.3 L2: XSRF 跨站请求伪造防护
+
+上传是**非安全方法**（PUT/DELETE），必须通过 XSRF 检查。[`_check_xsrf()`](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_routes.py#L598-L634) 在 PUT 和 DELETE 入口第一行执行：
+
+```python
+def _check_xsrf(request: Request) -> None:
+    """Check XSRF token for non-safe requests."""
+    if not is_xsrf_enabled():
+        return
+
+    # 比较 Header 中的 X-Xsrftoken 和 Cookie 中的 xsrf token
+    xsrf_header = request.headers.get("X-Xsrftoken")
+    xsrf_cookie = request.cookies.get(XSRF_COOKIE_NAME)
+
+    if not validate_xsrf_token(xsrf_header, xsrf_cookie):
+        raise HTTPException(status_code=403, detail="XSRF token missing or invalid")
+
+async def _upload_put(request: Request) -> Response:
+    _check_xsrf(request)  # 第一行就执行
+    session_id = request.path_params["session_id"]
+    # ...
+
+async def _upload_delete(request: Request) -> Response:
+    _check_xsrf(request)  // 第一行就执行
+    session_id = request.path_params["session_id"]
+    # ...
+```
+
+XSRF 采用 Double-Submit Cookie 模式：
+1. Cookie 值格式：`2|mask|token|timestamp`
+2. JavaScript 从 Cookie 读取值，放入 `X-Xsrftoken` Header
+3. 后端比较两者是否一致
+
+XSRF Cookie 由健康检查接口设置（`_ensure_xsrf_cookie`），不设 `HttpOnly` 标志（JS 需要读取）。
+
+### 8.4 L3: 活跃会话校验
+
+PUT 请求需要验证 `session_id` 是活跃会话：
+
+```python
+# [starlette_routes.py#L664-L665]
+session_id = request.path_params["session_id"]
+if not runtime.is_active_session(session_id):
+    raise HTTPException(status_code=400, detail="Invalid session_id")
+```
+
+这确保了：
+- 攻击者不能构造任意 `session_id` 上传文件
+- 只有真实运行的应用才能接收上传
+- 会话过期后自动拒绝上传
+
+注意：DELETE 请求**不做**会话校验，因为文件上传完成后可能会话已过期但仍需清理资源。
+
+### 8.5 L4: 文件大小限制（双重检查）
+
+采用**双重检查**确保不超过 `server.maxUploadSize` 限制（单位 MB）：
+
+```python
+# [starlette_routes.py#L667-L700]
+max_size_bytes = config.get_option("server.maxUploadSize") * 1024 * 1024
+
+# 1. Header 快速失败（Content-Length 存在时）
+content_length = request.headers.get("content-length")
+if content_length:
+    if int(content_length) > max_size_bytes:
+        raise HTTPException(status_code=413, detail="File too large")
+
+# 2. 实际读取后二次检查（防止客户端伪造 Content-Length）
+data = await upload.read()
+if len(data) > max_size_bytes:
+    raise HTTPException(status_code=413, detail="File too large")
+```
+
+### 8.6 L5: CORS 跨域策略（XSRF 启用时更严格）
+
+当 XSRF 启用时，上传路由的 CORS 策略比普通路由更严格：
+
+```python
+# [starlette_routes.py#L636-L649]
+async def _set_upload_headers(request: Request, response: Response) -> None:
+    response.headers["Access-Control-Allow-Methods"] = "PUT, OPTIONS, DELETE"
+    if is_xsrf_enabled():
+        # 严格模式：仅允许特定 Origin，允许凭证，设置 Vary
+        response.headers["Access-Control-Allow-Origin"] = get_url(
+            config.get_option("browser.serverAddress")
+        )
+        response.headers["Access-Control-Allow-Headers"] = "X-Xsrftoken, Content-Type"
+        response.headers["Vary"] = "Origin"
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+    else:
+        # 宽松模式：使用通用 CORS 策略
+        await _set_cors_headers(request, response)
+```
+
+严格模式的关键点：
+- `Access-Control-Allow-Credentials: true` 允许跨域请求携带 Cookie（XSRF Cookie 需要）
+- `Vary: Origin` 确保不同 Origin 的响应不被缓存混淆
+- 只允许 `X-Xsrftoken` 和 `Content-Type` 两个请求头
+
+### 8.7 前端配合的安全措施
+
+前端发送上传请求时也会注入 XSRF Header：
+
+```typescript
+// [DefaultStreamlitEndpoints.ts#L382-L402]
+public async uploadFile(...): Promise<Response> {
+    const xsrfToken = this.getXsrfToken()  // 从 Cookie 读取
+    const headers: Record<string, string> = {}
+    if (xsrfToken) {
+        headers["X-Xsrftoken"] = xsrfToken  // 注入 Header
+    }
+
+    return await fetch(url, {
+        method: "PUT",
+        headers,
+        body: formData,
+        credentials: "same-origin",  // 发送 Cookie
+    })
+}
+```
+
+### 8.8 安全边界总结
+
+上传路由的安全设计体现了"纵深防御"思想：
+- 即使快速路径跳过了路径校验，UNC 检查仍在（L1）
+- 即使 UNC 检查被绕过，XSRF 仍阻止跨站伪造（L2）
+- 即使 XSRF 被绕过，会话校验仍阻止非法 session_id（L3）
+- 即使会话校验被绕过，文件大小限制仍防止内存耗尽（L4）
+- 即使以上都失效，CORS 策略仍限制跨域访问（L5）
+
+---
+
+## 9. 整体架构回顾：路径映射、访问控制、缓存的边界
+
+### 9.1 路径映射 × 访问控制 × 缓存 的交互矩阵
 
 | 资源类型 | 路径映射方式 | 访问控制 | 缓存策略 |
 |---|---|---|---|
@@ -464,9 +1026,9 @@ export const StreamlitConfig = {
 | 媒体文件 | `Route` 精确匹配 `/media/{file_id}` | CORS + `Content-Disposition` 处理 | *(未设置)* |
 | 自定义组件 v1/v2 | `Route` 匹配 `/component/{name}/{path:path}` | `build_safe_abspath` 做路径规范化 + 根目录校验 | HTML: `no-cache`；其他: `public` |
 | App 用户静态文件 | `Route` 匹配 `/app/static/{path:path}` | `build_safe_abspath` + 文件大小限制 200MB + `X-Content-Type-Options: nosniff` | *(未设置)* |
-| 文件上传 | `Route` 匹配 `/_stcore/upload_file/{session_id}/{file_id}` | 快速路径跳过 `is_unsafe_path_pattern`（因为是字典键）+ XSRF + 会话校验 | *(未设置)* |
+| 文件上传 | `Route` 匹配 `/_stcore/upload_file/{session_id}/{file_id}` | 快速路径跳过 `is_unsafe_path_pattern` + 五层安全边界（UNC+XSRF+会话+大小+CORS） | *(未设置)* |
 
-### 5.2 关键安全边界的代码定位
+### 9.2 关键安全边界的代码定位
 
 | 安全机制 | 所在文件 | 关键函数 |
 |---|---|---|
@@ -476,26 +1038,33 @@ export const StreamlitConfig = {
 | CORS 跨域控制 | [server_util.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/server_util.py) | `allow_all_cross_origin_requests`, `is_allowed_origin` |
 | XSRF 防护 | [starlette_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_routes.py) | `_ensure_xsrf_cookie`, `_check_xsrf` |
 | 选择性 GZip | [starlette_gzip_middleware.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_gzip_middleware.py) | `SelectiveGZipMiddleware.__call__` |
-| 前端 URL 构建 | [DefaultStreamlitEndpoints.ts](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/DefaultStreamlitEndpoints.ts) | `buildMediaURL`, `buildStaticUrl`, `buildDownloadUrl` |
+| 前端 URL 构建 | [DefaultStreamlitEndpoints.ts](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/DefaultStreamlitEndpoints.ts) | `buildMediaURL`, `buildStaticUrl`, `buildDownloadUrl`, `uploadFile` |
 | 静态部署模式 | [StaticConnection.tsx](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/StaticConnection.tsx) | `establishStaticConnection`, `getStaticConfig` |
+| 连接状态管理 | [ConnectionManager.ts](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/ConnectionManager.ts) | `connect`, `setConnectionState` |
+| WebSocket 状态机 | [WebsocketConnection.tsx](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/WebsocketConnection.tsx) | `stepFsm`, `setFsmState` |
 
 ---
 
-## 6. 关键文件索引
+## 10. 关键文件索引
 
 | 文件 | 职责 |
 |---|---|
-| [starlette_app.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_app.py) | 应用组装、中间件顺序、6类路由分流编排 |
-| [starlette_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_routes.py) | 各业务路由工厂函数（媒体、组件、上传、App静态等） |
+| [starlette_app.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_app.py) | 应用组装、中间件顺序、6类路由分流编排、dev/prod 分流开关 |
+| [starlette_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_routes.py) | 各业务路由工厂函数、XSRF 防护、上传五层安全边界 |
 | [starlette_static_routes.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_static_routes.py) | 核心前端资产的独立 Mount 挂载、_StreamlitStaticFiles 自定义处理器 |
-| [starlette_path_security_middleware.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_path_security_middleware.py) | 全局路径安全中间件、快速路径绕过逻辑 |
+| [starlette_path_security_middleware.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_path_security_middleware.py) | 全局路径安全中间件、快速路径绕过逻辑、UNC 检查 |
 | [path_security.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/path_security.py) | is_unsafe_path_pattern 核心算法（UNC、盘符、穿越检测） |
 | [component_file_utils.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/component_file_utils.py) | build_safe_abspath 安全路径构建 |
 | [memory_uploaded_file_manager.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/runtime/memory_uploaded_file_manager.py) | 上传文件仅做字典存储的证据（无文件系统操作） |
 | [starlette_gzip_middleware.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_gzip_middleware.py) | 选择性 GZip 压缩（跳过静态路径和音视频） |
-| [server_util.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/server_util.py) | CORS 策略、XSRF 开关 |
+| [server_util.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/server_util.py) | CORS 策略（dev 模式放开）、XSRF 开关 |
 | [starlette_server_config.py](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/lib/streamlit/web/server/starlette/starlette_server_config.py) | STATIC_ASSET_CACHE_MAX_AGE_SECONDS 等配置常量 |
-| [DefaultStreamlitEndpoints.ts](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/DefaultStreamlitEndpoints.ts) | 前端 URL 构建、静态部署 URL 改写、XSRF 头注入 |
+| [DefaultStreamlitEndpoints.ts](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/DefaultStreamlitEndpoints.ts) | 前端 URL 构建、静态部署 URL 改写、XSRF Header 注入 |
 | [StaticConnection.tsx](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/StaticConnection.tsx) | 静态部署模式建立、S3 配置获取、Protobuf 消息加载 |
+| [ConnectionManager.ts](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/ConnectionManager.ts) | 连接类型选择（WebSocket vs Static）、心跳超时重连 |
+| [WebsocketConnection.tsx](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/WebsocketConnection.tsx) | WebSocket 状态机、Bypass 模式并行连接 |
+| [ConnectionState.ts](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/ConnectionState.ts) | 7 种连接状态枚举定义 |
+| [DoInitPings.tsx](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/DoInitPings.tsx) | 初始服务器 ping 循环、host-config 获取 |
 | [config/index.ts](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/utils/src/config/index.ts) | StreamlitConfig 捕获与冻结（含 DOWNLOAD_ASSETS_BASE_URL） |
-| [vite.config.ts](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/app/vite.config.ts) | 构建产物哈希命名（支持强缓存）、开发代理 |
+| [utils.ts](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/connection/src/utils.ts) | Host Config Bypass 判断、URL 解析工具 |
+| [vite.config.ts](file:///d:/fz/0601/solo-dogfeeding/code/236-streamlit/frontend/app/vite.config.ts) | 构建产物哈希命名（支持强缓存）、开发代理配置 |
